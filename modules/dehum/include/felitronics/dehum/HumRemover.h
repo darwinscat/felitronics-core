@@ -102,9 +102,10 @@ namespace felitronics::dehum
 // is off by Δ_k = k·r·T, and the canceller (still adapting at the playing width) leaves it at
 // 10·log10(Δ²/(Δ² + (BW/2)²)) re uncancelled. Worked: r = 1 mHz/s for 60 s (0.06 Hz, a large excursion) leaves
 // k = 1 at −12.6 dB, k = 4 at −3.2 dB, k = 10 at −0.7 dB — the upper harmonics are back. The first quiet gap
-// re-locks it: once one 0.5 s window is clear (0.5–0.75 s after the playing stops) the FLL closes at up to
-// 0.05 Hz/s, so 0.06 Hz takes about 1.2 s of quiet; the coarse estimate is taken once per arm, so a drift
-// accumulated while playing is closed by the FLL alone.
+// re-locks it: once two clear windows give a stable coarse estimate the model agrees with, f̂ glides to it at
+// ≤ 0.05 Hz/s and the FLL takes over — measured 0.8–1.05 s after the playing ends for a 0.06 Hz drift. The FLL
+// itself runs only while the canceller explains the input (residual 15 dB under it), so it needs the hum at
+// least 15 dB over the broadband noise; under that the frequency holds where it was.
 //
 // LEARN (beginLearn / learnStatus / endLearn): a short, deliberate quiet — the player mutes the strings and
 // asks the stage to learn. The model is snapshotted, ramped out, zeroed, and relearnt at the learn width
@@ -279,9 +280,6 @@ public:
         holdSamples_   = (int) std::llround (kHoldSeconds * fs_);
         settlePeriods_ = (int) std::llround (3.0 * kSmoothSeconds * fs_ / (double) kPeriod) + 1;
         pkDecay64_     = core::det::exp2 (-2.0 * (double) kPeriod / (0.040 * fs_));   // peak reference: -6 dB per 40 ms
-        for (int i = 0; i <= kBlackRun; ++i)                  // the black fade: a raised cosine over 64 samples
-            blackFade_[i] = 0.5 - 0.5 * core::det::cos (core::kPi * (double) i / (double) kBlackRun);
-        blackFade_[0] = 0.0; blackFade_[kBlackRun] = 1.0;
         for (int b = 0; b < 4; ++b) binInc_[b] = incFor (kBinHz[b]);
         prepared_ = true;
         reset();
@@ -300,7 +298,7 @@ public:
         grid_.reset();
         anchorPhase_ = 0;
         for (int b = 0; b < 4; ++b) binAnchor_[b] = 0;
-        for (int c = 0; c < core::kMaxChannels; ++c) { zeros_[c] = 0; blackGain_[c] = kBlackRun; }
+        for (int c = 0; c < core::kMaxChannels; ++c) { zeros_[c] = 0; bpos_[c] = (double) kBlackRun; bvel_[c] = 0.0; }
         learning_ = false; swapPhase_ = 0; learnFamily_ = 0; bkLive_ = false; freqPending_ = false;
         binsValid_ = false; binStep_ = 0;                      // every lazily-anchored phasor re-anchors (law 11a)
         resetDetector();
@@ -340,8 +338,10 @@ public:
         // Law 11a: every plane at index >= nch stopped for these n samples and is receiving digital silence.
         for (int c = nch; c < maxCh_; ++c)
         {
-            zeros_[c]     = (n >= kBlackRun - zeros_[c]) ? kBlackRun : zeros_[c] + n;
-            blackGain_[c] = (n >= blackGain_[c]) ? 0 : blackGain_[c] - n;    // its correction faded with the zeros
+            const int z0 = zeros_[c];                                         // its correction fades with the zeros
+            for (int i = 0; i < n && (bpos_[c] > 0.0 || bvel_[c] < 0.0 || bvel_[c] > 0.0); ++i)
+                stepBlack (c, false, z0 + i + 1 < kBlackRun ? z0 + i + 1 : kBlackRun);
+            zeros_[c] = (n >= kBlackRun - zeros_[c]) ? kBlackRun : zeros_[c] + n;
         }
 
         for (int done = 0; done < n;)
@@ -412,7 +412,7 @@ public:
             // a cancelled learn is still ramping out to its restore: the snapshot it would restore IS the model
             // from before any learn, so keep it, and let the pending swap zero for this learn instead
             learning_ = true; learnStatus_ = LearnStatus::Running; learnElapsed_ = 0; learnFamily_ = 0;
-            learnArmAt_ = -1; peakOut_ = 0.0; streak_ = 0; streakFamily_ = 0; lwMin_ = kNone;
+            learnArmAt_ = -1; peakOut_ = 0.0; streak_ = 0; streakFamily_ = 0; lwMin_ = kNone; lwFirst_ = kNone; lwHops_ = 0;
             swapAction_ = 0;
             return;
         }
@@ -422,7 +422,7 @@ public:
         bkLocked_ = lockedPeriods_; bkHz_ = fHat_; bkActive_ = nActive_;
         bkInc_ = inc_; bkAnchor_ = anchorPhase_; bkLive_ = true;   // the frame the snapshot's weights belong to
         learning_ = true; learnStatus_ = LearnStatus::Running; learnElapsed_ = 0; learnFamily_ = 0;
-        learnArmAt_ = -1; peakOut_ = 0.0; streak_ = 0; streakFamily_ = 0; lwMin_ = kNone;
+        learnArmAt_ = -1; peakOut_ = 0.0; streak_ = 0; streakFamily_ = 0; lwMin_ = kNone; lwFirst_ = kNone; lwHops_ = 0;
         if (running_ && ramp_.getCurrentValue() > 0.0f) { swapPhase_ = 1; swapAction_ = 0; ramp_.setTargetValue (0.0f); }
         else zeroForLearn();
     }
@@ -508,7 +508,7 @@ private:
     int activeFor (int family) const noexcept
     {
         if (family <= 0) return 0;
-        const double f0  = (double) family + params_.lockRangeHz;   // the cut-off holds wherever the tracker goes
+        const double f0  = (double) family + kMaxLockRangeHz;   // the cut-off holds at any lock range: a lockRange tweak never re-arms (R6)
         const double top = params_.maxHz < 0.45 * fs_ ? params_.maxHz : 0.45 * fs_;
         const double fit = std::floor (top / f0);
         const int    k   = fit < (double) params_.harmonics ? (int) fit : params_.harmonics;
@@ -526,6 +526,7 @@ private:
         muSlow_    = 2.0 * core::kPi * params_.bandwidthHz / fs_;
         muFast_    = 2.0 * core::kPi * params_.learnBandwidthHz / fs_;
         fllGainT_  = 0.5 * core::kPi * params_.learnBandwidthHz * periodSec_;   // K·T, K·τ_learn = 1/2
+        fllGainSlowT_ = 0.5 * core::kPi * params_.bandwidthHz * periodSec_;     // the same damping at the playing width (R7)
         slewT_     = kSlewHzPerSec * periodSec_;
     }
 
@@ -657,6 +658,39 @@ private:
         for (int c = 0; c < core::kMaxChannels; ++c) { pkE_[c] = kHitRatio * ps_; pkCur_[c] = 0.0; }   // the residual IS the input now
     }
 
+    // The black fade: a position 0..64 mapped through a raised cosine. From rest at either end it moves at full
+    // speed at once (the cosine is flat there); a fade that TURNS mid-way decelerates at 1/8 per sample instead
+    // of reversing in one sample (R4: a 32-zero gap made a −56 dBFS cusp); on the way down it speeds up when
+    // needed so that it is at 0 by zero #64, where the counter mutes bit-exactly anyway.
+    void stepBlack (int c, bool up, int z) noexcept
+    {
+        const double p = bpos_[c];
+        double target = 1.0;
+        if (! up)
+        {
+            const int    left = kBlackRun - 4 - z;
+            const double need = p / (double) (left > 1 ? left : 1);
+            target = -(need > 1.0 ? need : 1.0);
+        }
+        double& v = bvel_[c];
+        const bool atRest = ! (v < 0.0 || v > 0.0) && (p <= 0.0 || p >= (double) kBlackRun);
+        if (atRest || ((v < 0.0) == (target < 0.0) && std::fabs (target) >= std::fabs (v))) v = target;
+        else
+        {
+            double dv = target - v;
+            if (dv > 0.125) dv = 0.125; else if (dv < -0.125) dv = -0.125;
+            v += dv;
+        }
+        double np = p + v;
+        if (np <= 0.0) { np = 0.0; v = 0.0; }
+        else if (np >= (double) kBlackRun) { np = (double) kBlackRun; v = 0.0; }
+        bpos_[c] = np;
+    }
+    double blackGain (int c) const noexcept
+    {
+        return bpos_[c] >= (double) kBlackRun ? 1.0 : 0.5 - 0.5 * core::det::cos (core::kPi * bpos_[c] / (double) kBlackRun);
+    }
+
     void resetResidualFloor() noexcept { rfCount_ = 0; rfPos_ = 0; rfValid_ = false; rf_ = 0.0; hopMinE_ = kNone; }
 
     void resetDetector() noexcept
@@ -776,19 +810,19 @@ private:
                 if (zero)
                 {
                     if (zeros_[c] < kBlackRun) ++zeros_[c];
-                    if (blackGain_[c] > 0) --blackGain_[c];           // the correction fades out over the run...
+                    stepBlack (c, false, zeros_[c]);                  // the correction fades out over the run...
                     if (zeros_[c] >= kBlackRun) continue;             // ...and from zero #64: muted, bit-exact
                 }
                 else
                 {
                     zeros_[c] = 0;
                     if (! std::isfinite (x)) continue;               // passes untouched, adapts nothing
-                    if (blackGain_[c] < kBlackRun) ++blackGain_[c];   // back from (partial) black: fades in
+                    stepBlack (c, true, 0);                           // back from (partial) black: fades in
                 }
 
                 syncRefs (p0 + i);
                 const double corr = correction (c);
-                const double gb   = g * blackFade_[blackGain_[c]];
+                const double gb   = g * blackGain (c);
                 const double gc   = gb * corr;
                 s = (core::Sample) ((double) x - gc);
                 if (floorWindow) { const double a = std::fabs ((double) s); if (a > peakOut_) peakOut_ = a; }
@@ -880,6 +914,7 @@ private:
         // ...and the canceller explains the input: the residual 15 dB under it (a note, being residual, holds
         // the FLL; the FLL's own lag and a hiss 20 dB down do not)
         const bool explained = ! (psEValid_ && psValid_) || psE_ <= 0.0316 * ps_;
+        fllFast_ = learning_ || (quietPeriod_ && ! hit_);      // the width this period ran at: the FLL's gain follows it
         const bool   wasQuiet = quietWin_ && floorValid_ && hitHold_ <= 0 && ! hit_ && coarseOk_ && fllHold_ <= 0 && explained;
         if (fllHold_ > 0) fllHold_ -= kPeriod;
         const double sum      = periodSum_;
@@ -956,7 +991,7 @@ private:
         if (! (den > 1e-16)) return;
         const double delta = num / (2.0 * core::kPi * periodSec_ * den);
         lockedPeriods_ = std::fabs (delta) < 0.005 ? (lockedPeriods_ < hopPeriods_ ? lockedPeriods_ + 1 : lockedPeriods_) : 0;
-        double step = fllGainT_ * delta;
+        double step = (fllFast_ ? fllGainT_ : fllGainSlowT_) * delta;
         if (step >  slewT_) step =  slewT_;
         if (step < -slewT_) step = -slewT_;
         setFrequency (clampToLock (fHat_ + step));
@@ -1094,6 +1129,10 @@ private:
             const double lo = floorValid_ ? 1e-6 * floor_ : 0.0;
             if (lwMin_ < kNone && hopMinE_ > 4.0 * (lwMin_ > lo ? lwMin_ : lo)) learnStatus_ = LearnStatus::Disturbed;
             if (hopMinE_ < lwMin_) lwMin_ = hopMinE_;
+            // R5: nor a floor that FALLS steadily — a string still ringing when LEARN was pressed: three hops on,
+            // a hop 6 dB under the window's first (both above the −60 dB-re-input bound)
+            if (lwFirst_ >= kNone) lwFirst_ = hopMinE_;
+            else if (++lwHops_ >= 3 && lwFirst_ > lo && lwFirst_ > 4.0 * (hopMinE_ > lo ? hopMinE_ : lo)) learnStatus_ = LearnStatus::Disturbed;
         }
         if (hopMinE_ < kNone)                                  // the residual floor: same, its rise capped per hop
         {
@@ -1133,13 +1172,14 @@ private:
     double rRe_[MaxHarmonics] {}, rIm_[MaxHarmonics] {};
     double rotRe_[MaxHarmonics] {}, rotIm_[MaxHarmonics] {};
     int    zeros_[core::kMaxChannels] {};
-    int    blackGain_[core::kMaxChannels] {};   // 0..kBlackRun: the black fade's position per channel
+    double bpos_[core::kMaxChannels] {};        // 0..kBlackRun: the black fade's position per channel...
+    double bvel_[core::kMaxChannels] {};        // ...and its velocity (a turn mid-fade decelerates: no cusp)
     bool   chanLive_[core::kMaxChannels] {};    // adapted during this grid period (the FLL sums only these)
     double pkE_[core::kMaxChannels] {};         // the residual's peak follower, per channel
     double pkCur_[core::kMaxChannels] {};       // this period's residual peak
-    double pkDecay64_ = 1.0, glideTarget_ = 0.0, lastCoarse_ = 0.0, prevModel_ = 0.0;
+    double pkDecay64_ = 1.0, glideTarget_ = 0.0, lastCoarse_ = 0.0, prevModel_ = 0.0, lwFirst_ = kNone;
+    int    lwHops_ = 0;
     bool   glide_ = false, lastCoarseValid_ = false;
-    double blackFade_[kBlackRun + 1] {};
 
     // ---- detector ----
     double hopRe_[core::kMaxChannels][4] {}, hopIm_[core::kMaxChannels][4] {};
@@ -1186,7 +1226,8 @@ private:
     double               periodSec_   = 64.0 / 48000.0;
     double               hopSec_      = 0.25;
     double               smoothA_     = 0.0;
-    double               muSlow_      = 0.0, muFast_ = 0.0, fllGainT_ = 0.0, slewT_ = 0.0;
+    double               muSlow_      = 0.0, muFast_ = 0.0, fllGainT_ = 0.0, fllGainSlowT_ = 0.0, slewT_ = 0.0;
+    bool                 fllFast_     = false;
     double               fHat_        = 0.0;
     int                  family_      = 0;   // 0 (dry), 50 or 60 — what the canceller runs
     int                  nActive_     = 0;

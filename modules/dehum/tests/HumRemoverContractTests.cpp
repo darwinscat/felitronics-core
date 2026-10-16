@@ -230,9 +230,9 @@ static void testPrepareAndAlloc()
         ok (h.activeHarmonics() == 64, "8 kHz, 64 asked, maxHz 5000: 0.9·Nyquist allows 72, the cap is 64 ("
                                         + std::to_string (h.activeHarmonics()) + ")");
         p.maxHz = 2000.0; h.setParams (p); felitronics::test::run (h.prepare (8000.0, 64, 1));
-        ok (h.activeHarmonics() == 39, "maxHz 2000 at 50 Hz, lock 1 Hz: 39 harmonics — 39·51 <= 2000 (" + std::to_string (h.activeHarmonics()) + ")");
+        ok (h.activeHarmonics() == 38, "maxHz 2000 at 50 Hz: 38 harmonics — 38·52 <= 2000 at the widest lock range (" + std::to_string (h.activeHarmonics()) + ")");
         p.mains = dh::Mains::Hz60; p.harmonics = 64; p.maxHz = 5000.0; h.setParams (p); felitronics::test::run (h.prepare (8000.0, 64, 1));
-        ok (h.activeHarmonics() == 59, "F: 60 Hz at 8 kHz, lock 1 Hz: 59 harmonics, so 59·61 stays under 0.9·Nyquist = 3600 wherever the tracker goes ("
+        ok (h.activeHarmonics() == 58, "F/R6: 60 Hz at 8 kHz: 58 harmonics, so 58·62 stays under 0.9·Nyquist = 3600 at any lock range ("
                                         + std::to_string (h.activeHarmonics()) + ")");
         p.harmonics = 24; p.maxHz = 2000.0;
         p.mains = dh::Mains::Hz60; h.setParams (p); felitronics::test::run (h.prepare (8000.0, 64, 1));
@@ -644,6 +644,41 @@ static void testBlackEdges()
 
 // T6: SUBNORMAL INPUT (FTZ off on the deb row): a second of ±1e-40 samples after a hum — finite output, the
 // state never in the subnormal band, and the hum cancelled again after it. Its cost is the input's own.
+// R4: a black fade that turns mid-way (gaps of 1..63 exact zeros) leaves no cusp; R6: a lockRange tweak
+// between calls keeps the model (no re-arm).
+static void testBlackTurnsAndLockTweak()
+{
+    group ("R4: gaps of 1..63 zeros leave no cusp; R6: a lockRange tweak keeps the model");
+    HR h; h.setParams (params (dh::Mains::Hz50, 3.0)); felitronics::test::run (h.prepare (kFs, 512, 1));
+    Hum hum; hum.seed (95u);
+    const int gaps[] = { 1, 2, 3, 5, 8, 13, 21, 32, 40, 50, 63 };
+    const int N = 2 * 48000 + 11 * 12000;
+    std::vector<float> x ((std::size_t) N);
+    for (int i = 0; i < N; ++i) x[(std::size_t) i] = (float) hum.at (i);
+    for (int j = 0; j < 11; ++j) { const int a = 2 * 48000 + 12000 * j + 7 * j; for (int i = 0; i < gaps[j]; ++i) x[(std::size_t) (a + i)] = 0.0f; }
+    const std::vector<float> in = x;
+    feed64 (h, x);
+    double worst = 0.0;
+    for (int i = 2 * 48000 - 100; i < N; ++i)
+    {
+        const double c0 = (double) in[(std::size_t) i] - x[(std::size_t) i], c1 = (double) in[(std::size_t) i - 1] - x[(std::size_t) i - 1], c2 = (double) in[(std::size_t) i - 2] - x[(std::size_t) i - 2];
+        worst = std::max (worst, std::fabs (c0 - 2.0 * c1 + c2));
+    }
+    std::printf ("      gaps of 1..63 zeros: max second difference of the correction %.1f dBFS\n", dbOf (worst));
+    ok (dbOf (worst) <= -60.0, "R4: no cusp when an unfinished fade turns (" + std::to_string (dbOf (worst)) + " dBFS)");
+
+    HR g; dh::HumRemoverParams p = params (dh::Mains::Hz50, 3.0); p.harmonics = 64; g.setParams (p); felitronics::test::run (g.prepare (kFs, 512, 1));
+    std::vector<float> y ((std::size_t) 96000); for (int i = 0; i < 96000; ++i) y[(std::size_t) i] = (float) hum.at (i);
+    feed64 (g, y);
+    const auto w0 = g.weight (0, 1); const int k0 = g.activeHarmonics();
+    p.lockRangeHz = 0.0; g.setParams (p);
+    std::vector<float> z ((std::size_t) 4800); for (int i = 0; i < 4800; ++i) z[(std::size_t) i] = (float) hum.at (96000 + i);
+    feed64 (g, z);
+    const auto w1 = g.weight (0, 1);
+    ok (g.activeHarmonics() == k0 && std::hypot (w1.re - w0.re, w1.im - w0.im) < 0.01 * std::hypot (w0.re, w0.im),
+        "R6: lockRange 1 -> 0 keeps the harmonic set (" + std::to_string (g.activeHarmonics()) + ") and the model (no re-arm)");
+}
+
 static void testSubnormalInput()
 {
     group ("subnormal input samples: finite, no subnormal state, the hum cancelled after");
@@ -679,5 +714,6 @@ int main()
     testFrequencyChangeOnTheGrid();
     testBlackEdges();
     testSubnormalInput();
+    testBlackTurnsAndLockTweak();
     return felitronics::test::report();
 }

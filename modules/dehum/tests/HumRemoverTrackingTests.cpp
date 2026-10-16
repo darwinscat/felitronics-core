@@ -1092,6 +1092,34 @@ static void testHandsProbe()
     }
 }
 
+// R5: a LEARN pressed while a string still rings (F4 −40 dBFS, τ 1.5 s) is Disturbed; R9: the shared 300 Hz
+// line (6th of 50, 5th of 60) alone leaves Auto abstaining.
+static void testRingingLearnAndSharedLine()
+{
+    group ("R5: LEARN while a string still rings is Disturbed; R9: a lone 300 Hz line leaves Auto abstaining");
+    const double fs = 48000.0;
+    {
+        std::vector<float> x ((std::size_t) (6.0 * fs), 0.0f);
+        HumSpec hs; hs.f0 = 50.0; hs.a1 = 0.0316; hs.seed = 86u; addHum (x, hs, fs);
+        Note n; n.f0 = 349.228; n.partials = 1; n.amp = 0.01; n.start = 2.5; n.dur = 3.5; n.tau = 1.5; n.attack = 0.001; addNote (x, n, fs);
+        HR h; h.setParams (params (dh::Mains::Auto, 0.5, 3.0)); felitronics::test::run (h.prepare (fs, 512, 1));
+        std::int64_t o = 0;
+        block64 (h, x, o, (std::int64_t) (3.0 * fs));
+        h.beginLearn(); block64 (h, x, o, (std::int64_t) (5.5 * fs));
+        const auto r = h.endLearn (true);
+        std::printf ("      LEARN with F4 still ringing: verdict %d, floor %.1f dBFS\n", (int) r.verdict, r.floorAfterDb);
+        ok (r.verdict == HR::LearnVerdict::Disturbed, "R5: a floor window that falls steadily (a ringing string) is not a floor: Disturbed");
+    }
+    {
+        std::vector<float> x ((std::size_t) (4.0 * fs), 0.0f);
+        Note n; n.f0 = 300.0; n.B = 0.0; n.partials = 1; n.amp = 0.0316; n.start = 0.0; n.dur = 4.0; addNote (x, n, fs);
+        Tel tel;
+        processed (x, params (dh::Mains::Auto, 0.5, 3.0), fs, &tel);
+        bool abstain = true; for (std::size_t i = 0; i < tel.det.size(); ++i) abstain = abstain && tel.det[i] == 0 && tel.run[i] == 0;
+        ok (abstain, "R9: a 300 Hz line alone (6th of 50, 5th of 60) — Auto abstains, dry");
+    }
+}
+
 int main()
 {
     std::printf ("felitronics::dehum — HumRemover knowing the mains\n");
@@ -1118,5 +1146,6 @@ int main()
     testAlignedBuzz();
     testHandsOnHandsOff();
     testHandsProbe();
+    testRingingLearnAndSharedLine();
     return felitronics::test::report();
 }
