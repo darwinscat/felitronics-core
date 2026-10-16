@@ -505,9 +505,8 @@ static void testSwitchSteps()
 //------------------------------------------------------------------------------------------------------
 // THE GHOST: a 330 Hz tone (20 Hz below k7 = 350 on 50 Hz mains) held 2 s over locked hum, then stopped.
 // The notch's state rings out at 350 Hz. Bound: it starts at the LTI value A·(BW/2)/sqrt(Δ² + (BW/2)²)
-// (−38.1 dB re the tone) and, with the learn width resuming once the input is quiet, falls below -60 dB re
-// the tone within 1.0 s of the stop; at the playing width alone it takes about 2.5·τ = 1.6 s. The switch
-// back to the learn width is a μ change only: no step.
+// (−38.1 dB re the tone) and falls below -60 dB re the tone at the playing width's pace (2.5·τ = 1.6 s) —
+// quiet does not return while the residual carries it. No step.
 static void ghostRun (const dh::HumRemoverParams& p, double& startDb, double& t60, double& stepDb, double& tQuiet)
 {
     const double fs = 48000.0, stop = 5.0;
@@ -543,8 +542,11 @@ static void testGhost()
                  " Correction second difference over the 2 s after the stop: %.1f / %.1f dBFS\n",
                  theory, q1, s1, t1, s2, t2, st1, st2);
     ok (s1 <= theory + 1.0, "the ghost starts at the LTI value (" + fmt (s1, 1) + " dB, theory " + fmt (theory, 1) + ")");
-    ok (t1 > 0.0 && t1 <= 1.0, "with the learn width resuming it is below -60 dB re the note within 1.0 s (" + fmt (t1, 2) + " s)");
-    ok (t2 > t1 + 0.3, "and that is the learn width's doing: the playing width alone takes " + fmt (t2, 2) + " s");
+    // NOTE SAFETY WINS: quiet now asks the residual to sit at its floor, and the ghost IS residual, so the
+    // learn width does not come back while it rings — it decays at the playing width, like the LTI notch
+    // (2.53·τ = 1.61 s to fall 22 dB). It used to fall below -60 dB in 0.70 s, when quiet admitted it.
+    ok (t1 > 0.0 && t1 <= 2.0, "it falls below -60 dB re the note at the playing width's pace, within 2.0 s (" + fmt (t1, 2) + " s)");
+    ok (std::fabs (t1 - t2) <= 0.2, "the same as with the playing width alone (" + fmt (t2, 2) + " s): the learn width does not chase a ghost");
     ok (st1 <= -60.0, "the switch back to the learn width steps nothing (" + fmt (st1, 1) + " dBFS)");
 }
 
@@ -552,10 +554,12 @@ static void testGhost()
 // LEARN. 64-sample calls on the grid throughout, so a swap that ends on a boundary ends a call.
 static void block64 (HR& h, std::vector<float>& x, std::int64_t& o, std::int64_t until)
 {
-    for (; o < until; o += 64)
+    while (o < until)
     {
+        const int n = (int) std::min<std::int64_t> (64, until - o);
         float* io[1] { x.data() + o };
-        felitronics::test::run (h.process (io, 1, (int) std::min<std::int64_t> (64, until - o)));
+        felitronics::test::run (h.process (io, 1, n));
+        o += n;
     }
 }
 
@@ -661,6 +665,145 @@ static void testLearnNothingHeard()
     }
 }
 
+//------------------------------------------------------------------------------------------------------
+// G2 — WHAT QUIET ADMITS. A note is not quiet, however stationary; a real hum change still is.
+static void testQuietAdmitsNoNote()
+{
+    group ("quiet admits no note: C1 a soft note under the hum, C2 a bass note at a bin, C3 a 60 Hz tone over 50 Hz hum");
+    const double fs = 48000.0;
+    {   // C1: hum -30 dBFS, F4 349.2 Hz (0.77 Hz from k7) held 8 s at -40 dBFS — under the hum
+        std::vector<float> clean ((std::size_t) (12.0 * fs), 0.0f);
+        Note n; n.f0 = 349.228; n.amp = 0.01; n.start = 3.0; n.dur = 8.0; n.partials = 1;
+        addNote (clean, n, fs);
+        std::vector<float> x = clean; HumSpec hs; hs.f0 = 50.0; hs.a1 = 0.0316; hs.seed = 51u; addHum (x, hs, fs);
+        const auto y = processed (x, params (dh::Mains::Auto, 0.5, 3.0), fs), yc = processed (clean, lti (dh::Mains::Hz50, 0.5), fs);
+        const std::int64_t S = (std::int64_t) (7.0 * fs), W = (std::int64_t) (3.5 * fs);
+        const double d = dbOf (fitAmp (y, S, W, n.f0, fs) / fitAmp (yc, S, W, n.f0, fs)), raw = dbOf (fitAmp (y, S, W, n.f0, fs) / fitAmp (clean, S, W, n.f0, fs));
+        std::printf ("      C1: F4 at -40 dBFS under -30 dBFS hum: %.2f dB vs the clean pass, %.2f dB vs the untouched note\n", d, raw);
+        ok (std::fabs (d) <= 0.5, "C1: the soft note is treated as the 0.5 Hz notch treats it (" + fmt (d, 2) + " dB vs the clean pass)");
+    }
+    {   // C2: G1 49.0 Hz held 8 s at -20 dBFS on 50 Hz mains (hum -40 dBFS)
+        std::vector<float> clean ((std::size_t) (12.0 * fs), 0.0f);
+        Note n; n.f0 = 48.999; n.amp = 0.1; n.start = 3.0; n.dur = 8.0;
+        addNote (clean, n, fs);
+        std::vector<float> x = clean; HumSpec hs; hs.f0 = 50.0; hs.a1 = 0.01; hs.seed = 52u; addHum (x, hs, fs);
+        Tel tel;
+        const auto y = processed (x, params (dh::Mains::Auto, 0.5, 3.0), fs, &tel), yc = processed (clean, lti (dh::Mains::Hz50, 0.5), fs);
+        double fOn = 0.0, dev = 0.0;
+        for (std::size_t i = 0; i < tel.f.size(); ++i) { const double t = tOf (tel, i, fs); if (t < 3.0) fOn = tel.f[i]; else dev = std::max (dev, std::fabs (tel.f[i] - fOn)); }
+        const std::int64_t S = (std::int64_t) (7.0 * fs), W = (std::int64_t) (3.5 * fs);
+        const double d = dbOf (fitAmp (y, S, W, n.partialHz (1), fs) / fitAmp (yc, S, W, n.partialHz (1), fs));
+        std::printf ("      C2: G1 49.0 Hz held 8 s: tracker moved %.4f Hz; fundamental %.2f dB vs the clean pass\n", dev, d);
+        ok (dev <= 0.005, "C2: the tracker does not walk to the note (" + fmt (dev, 4) + " Hz)");
+        ok (std::fabs (d) <= 0.5, "C2: the note is not learned at the fast width (" + fmt (d, 2) + " dB)");
+    }
+    {   // C3: locked 50 Hz hum, then an exact 60 + 120 Hz tone for 3 s
+        const double fsx = fs;
+        std::vector<float> x ((std::size_t) (8.0 * fsx), 0.0f);
+        HumSpec hs; hs.f0 = 50.0; hs.a1 = 0.01; hs.seed = 53u; addHum (x, hs, fsx);
+        Note t60; t60.f0 = 60.0; t60.B = 0.0; t60.amp = 0.1; t60.partials = 2; t60.start = 3.0; t60.dur = 3.0;
+        addNote (x, t60, fsx);
+        Tel tel;
+        processed (x, params (dh::Mains::Auto, 0.5, 3.0), fsx, &tel);
+        bool stay = true;
+        for (std::size_t i = 0; i < tel.det.size(); ++i) if (tOf (tel, i, fsx) >= 2.0) stay = stay && tel.det[i] == 50 && tel.run[i] == 1;
+        ok (stay, "C3: a sustained exact 60/120 Hz tone over the 50 Hz hum never flips Auto");
+    }
+}
+
+static void testHumChanges()
+{
+    group ("a real hum change still re-qualifies: +10 dB louder, a 50 -> 60 swap");
+    const double fs = 48000.0;
+    {
+        std::vector<float> x ((std::size_t) (8.0 * fs), 0.0f);
+        HumSpec hs; hs.f0 = 50.1; hs.a1 = 0.01; hs.seed = 54u; addHum (x, hs, fs);
+        const std::int64_t c = std::llround (4.0003 * fs);
+        for (std::size_t i = (std::size_t) c; i < x.size(); ++i) x[i] *= 3.1623f;
+        const std::vector<float> in = x;
+        Tel tel;
+        const auto y = processed (x, params (dh::Mains::Auto, 0.5, 3.0), fs, &tel);
+        double back = 0.0;   // the last moment, within 3 s of the change, at which it was not quiet
+        for (std::size_t i = 0; i < tel.quiet.size(); ++i)
+        {
+            const double t = tOf (tel, i, fs);
+            if (t > 4.0003 && t < 7.0 && ! tel.quiet[i]) back = t - 4.0003;
+        }
+        const double nul = worstNull (y, in, (std::int64_t) (6.5 * fs), (std::int64_t) fs, 50.1, fs);
+        std::printf ("      +10 dB louder hum: quiet again %.2f s after the change; null 2.5 s after %.1f dB\n", back, nul);
+        ok (back <= 1.0, "+10 dB: quiet re-qualifies within 1.0 s (" + fmt (back, 2) + " s)");
+        ok (nul <= -50.0, "+10 dB: and the new hum is nulled (" + fmt (nul, 1) + " dB)");
+    }
+    {
+        std::vector<float> x ((std::size_t) (8.0 * fs), 0.0f);
+        HumSpec a; a.f0 = 50.0; a.a1 = 0.01; a.seed = 55u; a.until = 4.0003; addHum (x, a, fs);
+        HumSpec b = a; b.f0 = 60.0; b.until = 1e9; addHum (x, b, fs, std::llround (4.0003 * fs));
+        Tel tel;
+        processed (x, params (dh::Mains::Auto, 0.5, 3.0), fs, &tel);
+        double t60 = -1.0;
+        for (std::size_t i = 0; i < tel.det.size(); ++i) if (tel.det[i] == 60 && t60 < 0.0) t60 = tOf (tel, i, fs) - 4.0003;
+        std::printf ("      50 -> 60 hum swap: Auto re-decided %.2f s after it\n", t60);
+        ok (t60 > 0.0 && t60 <= 1.5, "swap: Auto re-decides 60 within 1.5 s (" + fmt (t60, 2) + " s)");
+    }
+}
+
+static void testLearnAfterChanges()
+{
+    group ("LEARN: C4 pressed while the hum fades back in, after the rig changed, and a slow swell into the floor window");
+    const double fs = 48000.0;
+    auto noise = [] (std::vector<float>& x, std::int64_t from, std::int64_t to, double rms, std::uint32_t seed)
+    {
+        Lcg r { seed };
+        for (std::int64_t i = from; i < to; ++i) x[(std::size_t) i] += (float) (rms * std::sqrt (3.0)) * r.bipolar();
+    };
+    for (int sc = 0; sc < 3; ++sc)
+    {
+        const char* name[] = { "C4: pressed 0.2 s after the hum faded back in (floor still low)", "after the rig changed (noise +15 dB, hum +6 dB)",
+                               "a slow swell (0.3 s attack, -50 dBFS) into the floor window" };
+        std::vector<float> x ((std::size_t) (10.0 * fs), 0.0f);
+        HumSpec hs; hs.f0 = 50.0; hs.a1 = 0.0316; hs.seed = 56u; addHum (x, hs, fs);
+        double learnAt = 3.0;
+        if (sc == 0)
+        {
+            learnAt = 6.7;   // the fade-in itself is an onset; LEARN is pressed once it is done, the floor still old
+            for (std::size_t i = 0; i < x.size(); ++i)
+            {
+                const double t = (double) i / fs;
+                const double g = t < 3.0 ? 1.0 : (t < 6.0 ? 0.0 : std::min (1.0, (t - 6.0) / 0.5));
+                x[i] *= (float) g;
+            }
+            noise (x, 0, (std::int64_t) x.size(), 3.16e-5, 7u);
+        }
+        else if (sc == 1)
+        {
+            noise (x, 0, (std::int64_t) (3.0 * fs), 3.16e-5, 8u);
+            for (std::size_t i = (std::size_t) (3.0 * fs); i < x.size(); ++i) x[i] *= 2.0f;
+            noise (x, (std::int64_t) (3.0 * fs), (std::int64_t) x.size(), 1.78e-4, 9u);
+            learnAt = 3.3;
+        }
+        else
+        {
+            Note sw; sw.f0 = 329.628; sw.partials = 1; sw.amp = 0.00316; sw.attack = 0.3; sw.start = 3.0 + 0.9; sw.dur = 3.0;
+            addNote (x, sw, fs);
+        }
+        HR h; h.setParams (params (dh::Mains::Auto, 0.5, 3.0)); felitronics::test::run (h.prepare (fs, 512, 1));
+        std::int64_t o = 0;
+        block64 (h, x, o, (std::int64_t) (learnAt * fs));
+        h.beginLearn();
+        block64 (h, x, o, (std::int64_t) ((learnAt + 0.98) * fs));
+        const auto stEarly = h.learnStatus();
+        block64 (h, x, o, (std::int64_t) ((learnAt + 2.5) * fs));
+        const auto r = h.endLearn (true);
+        std::printf ("      %-58s status at 0.98 s %d, verdict %d, %.4f Hz, floor %.1f dBFS\n", name[sc], (int) stEarly, (int) r.verdict, r.hz, r.floorAfterDb);
+        if (sc < 2) ok (r.verdict == HR::LearnVerdict::Learned && std::fabs (r.hz - 50.0) < 0.02, std::string (name[sc]) + ": Learned, not Disturbed");
+        else
+        {
+            ok (stEarly == HR::LearnStatus::Running, std::string (name[sc]) + ": no per-sample trigger caught it (Running at 0.98 s)");
+            ok (r.verdict == HR::LearnVerdict::Disturbed, std::string (name[sc]) + ": Disturbed by the floor-window rule, not committed");
+        }
+    }
+}
+
 int main()
 {
     std::printf ("felitronics::dehum — HumRemover knowing the mains\n");
@@ -678,5 +821,8 @@ int main()
     testLearnHumOnly();
     testLearnDisturbedAndRestore();
     testLearnNothingHeard();
+    testQuietAdmitsNoNote();
+    testHumChanges();
+    testLearnAfterChanges();
     return felitronics::test::report();
 }

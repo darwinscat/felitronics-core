@@ -40,26 +40,40 @@ namespace felitronics::dehum
 // switch; only the rate of learning changes. QUIET is three conditions together:
 //   (a) the last 0.5 s window was hum: its broadband power is within 12 dB of the strongest hum family's
 //       Goertzel power (bins {50, 100} and {60, 120} Hz, summed over channels as POWERS);
-//   (b) the 20 ms-smoothed broadband power is within 12 dB of the FLOOR — the minimum of that smoothed power
-//       over the last 4 s (sixteen 0.25 s hops);
+//   (b) the canceller's RESIDUAL (20 ms-smoothed) is within 12 dB of the RESIDUAL FLOOR — the minimum of
+//       that power over the last 4 s (sixteen 0.25 s hop minima), which may RISE by at most 0.5 dB per hop
+//       (2 dB/s) and restarts on every re-arm, zeroing or restore. After cancellation true quiet is the
+//       noise floor; a note is not, however stationary — a −40 dBFS note over a −90 dB residual floor is
+//       not quiet for ≈ 19 s. A LOUDER HUM is told apart from a note: the running family's bins up 3 dB in a
+//       quiet, trigger-free window AND the coarse estimate within 0.05 Hz of ours → the residual floor
+//       restarts and quiet returns (measured: 0.51 s after a +10 dB step). The input floor no longer gates
+//       quiet; it keeps active() and the trigger used before the canceller runs. Smoothed powers are seeded
+//       from a settled level, never from one 64-sample period (a waveform trough there set every trigger off);
 //   (c) no per-sample trigger in the last 50 ms: a sample 12 dB over the floor's sine peak (x² > 32·floor),
 //       or — while the canceller runs — a RESIDUAL sample 12 dB over the residual's own 20 ms-smoothed level
 //       (e² > 32·max(smoothed e², 1e-4·floor)). The residual is what a pluck shows in first (the hum is
 //       already gone from it), so quiet ends on the first few samples of an attack and an attack is never
 //       learned at the fast width; a stationary residual (an unconverged model, a ringing ghost) never
-//       trips it. The 50 ms latch covers the smoothed power's lag. (a) keeps a held note from becoming
-//       "the floor" after 4 s; (b) and (c) react within a period. ACTIVE (a pluck, reported by active()) is the brief's: the 64-sample
+//       trips it. The 50 ms latch covers the smoothed power's lag, and a trigger also voids the last window's
+//       verdict at once (a window that held a trigger is never quiet). (a) needs hum in the k1/k2 bins — a hum
+//       without them never qualifies; (b) keeps a note from becoming quiet; (c) reacts within a period. ACTIVE (a pluck, reported by active()) is the brief's: the 64-sample
 //       power above floor + 12 dB for at least 20 ms.
 //
 // KNOWING THE MAINS. Off / Hz50 / Hz60 / Auto.
 //   * AUTO decides the family from the bins on rectangular 0.5 s windows hopped every 0.25 s on the grid: a
 //     family must win by more than 6 dB in 3 consecutive QUIET windows (≈ 1 s of hum). Ambiguous → abstain
-//     (dry). Decided only in quiet, so it is sticky while playing; re-decided by the same rule.
+//     (dry). Decided only in quiet, so it is sticky while playing. To move OFF a decided family, that family
+//     must also have LOST (its bins 10 dB under their level when last confirmed) and the windows must be
+//     free of triggers: a 60/120 Hz tone over a 50 Hz hum that is still there flips nothing; a real swap
+//     re-decides (measured 1.26 s after it).
 //   * COARSE frequency: the winning family's stronger bin, phase advance between windows one hop apart
 //     (±2 Hz unambiguous), taken only between two quiet windows and only for a family that wins by 6 dB. Auto starts the canceller at it; a fixed
 //     mode jumps to it once, the first time it exists ("acquisition").
 //   * FINE (an FLL, only in quiet, and only while the running family is the one the last window's bins
-//     heard win — a fixed mode on the other family's hum would otherwise chase beats): the weights' own rotation, Δf = Σ k·Im(w_k·conj w_k') / (2πT·Σ k²|w_k|²)
+//     heard win, while its coarse estimate agrees with ours within 0.05 Hz — a note at a bin drags the coarse
+//     estimate off and so holds the FLL — and not in the first hop after fresh weights; NOT gated by the
+//     residual floor, since a residual grown by the FLL's own lag must not hold the FLL that cures it; a
+//     fixed mode on the other family's hum would otherwise chase beats): the weights' own rotation, Δf = Σ k·Im(w_k·conj w_k') / (2πT·Σ k²|w_k|²)
 //     over each grid period T, weighted by k·|w_k|² so a weak fundamental does not matter. Gain
 //     K = (π/2)·learnBandwidthHz per second: the weights follow the hum's phase through the LMS loop's own
 //     lag τ, so the frequency loop is second order, and K·τ = 1/2 is a damping of 0.707. A gain of 0.1 per
@@ -73,13 +87,12 @@ namespace felitronics::dehum
 //
 // THE GHOST A NOTE LEAVES. While a note sounds Δ Hz from harmonic k, the notch's state carries the note's
 // beat: amplitude A·(BW/2)/√(Δ² + (BW/2)²) in w_k. When the note stops, that state rings out as a tone at the
-// harmonic, decaying with τ — an LTI fact of any notch of this width, not a defect of the learner. With the
-// two widths it decays at τ 0.64 s until the input is quiet again (the first clear 0.5 s window, 0.5–0.75 s
-// after the note), then at τ 0.11 s. Measured (48 kHz, a 330 Hz tone 20 Hz from k7 = 350): it starts at
-// −38.7 dB re the tone (the LTI value is −38.1), the input is quiet again 0.51 s after the stop, and the ghost
-// is below −60 dB re the tone 0.70 s after the stop — against 1.69 s at the playing width alone. The switch
-// back to the learn width is a μ change only: the correction's second difference stays at −83 dBFS through
-// it, the same as without the switch (HumRemoverTrackingTests).
+// harmonic, decaying with τ — an LTI fact of any notch of this width, not a defect of the learner. The ghost
+// is RESIDUAL, so quiet (b) does not return while it rings, and it decays at the playing width's τ 0.64 s:
+// NOTE SAFETY WINS over a faster clean-up (a ghost and a soft note's own tail look the same to the stage).
+// Measured (48 kHz, a 330 Hz tone 20 Hz from k7 = 350): it starts at −38.7 dB re the tone (the LTI value is
+// −38.1) and is below −60 dB re the tone 1.56 s after the stop (1.62 s with one width) — it was 0.70 s when
+// quiet admitted the ghost, and with it every soft note (HumRemoverTrackingTests).
 //
 // WHILE PLAYING THE FREQUENCY IS HELD. The FLL runs only in quiet, so a long stretch of playing with no quiet
 // gap runs at the frequency it had when the playing began. If the mains drifts at r Hz/s for T s, harmonic k
@@ -98,8 +111,12 @@ namespace felitronics::dehum
 // −61 dB of the initial error; a cold start arms at ≈ 1.0 s, so its window opens at ≈ 1.75 s. The report's
 // floorAfterDb is the peak |out| over the window — what a gate threshold should sit above. 2 s is the
 // useful minimum. Anything a per-sample
-// trigger or the floor test calls playing makes it DISTURBED and freezes adaptation from that sample; a
-// learn that decided no family, or learned a hum below kNothingDb (−90 dB), is NOTHING HEARD. Only a
+// trigger makes it DISTURBED and freezes adaptation from that sample — and so does a floor window that is not
+// a floor: a hop whose lowest residual is 6 dB over the lowest hop of the window (a swell, a note creeping in
+// under every trigger). A LEARN pressed after the rig changed (more noise, louder hum) is not Disturbed: the
+// rule compares the window with itself, not with the stage's past. A note ringing through the whole learn
+// that falls (decays) is not refused; floorAfterDb, the window's peak, reports it — high, so a gate set from
+// it errs safe. A learn that decided no family, or learned a hum below kNothingDb (−90 dB), is NOTHING HEARD. Only a
 // committed, Learned learn is kept; anything else restores the snapshot bit for bit through a ramp.
 //
 // TELEMETRY (process thread): detected(), mainsHz(), oscillatorHz(), locked() (the FLL's last steps under
@@ -200,6 +217,7 @@ public:
     static constexpr double kActiveSeconds  = 0.020;    // above floor + 12 dB this long = active
     static constexpr double kHoldSeconds    = 0.050;    // a trigger keeps the playing width at least this long
     static constexpr double kSlewHzPerSec   = 0.05;     // the tracker's slew bound
+    static constexpr double kResidualRise   = 1.1220184543019633;   // the residual floor rises <= 0.5 dB per hop (2 dB/s)
 
     struct Weight { double re, im; };
 
@@ -240,6 +258,7 @@ public:
         hopSec_        = (double) (hopPeriods_ * kPeriod) / fs_;
         activeSamples_ = (int) std::llround (kActiveSeconds * fs_);
         holdSamples_   = (int) std::llround (kHoldSeconds * fs_);
+        settlePeriods_ = (int) std::llround (3.0 * kSmoothSeconds * fs_ / (double) kPeriod) + 1;
         for (int b = 0; b < 4; ++b) binInc_[b] = incFor (kBinHz[b]);
         prepared_ = true;
         reset();
@@ -368,7 +387,7 @@ public:
         bkLocked_ = lockedPeriods_; bkHz_ = fHat_; bkActive_ = nActive_;
         bkInc_ = inc_; bkAnchor_ = anchorPhase_; bkLive_ = true;   // the frame the snapshot's weights belong to
         learning_ = true; learnStatus_ = LearnStatus::Running; learnElapsed_ = 0; learnFamily_ = 0;
-        learnArmAt_ = -1; peakOut_ = 0.0; streak_ = 0; streakFamily_ = 0;
+        learnArmAt_ = -1; peakOut_ = 0.0; streak_ = 0; streakFamily_ = 0; lwMin_ = kNone;
         if (running_ && ramp_.getCurrentValue() > 0.0f) { swapPhase_ = 1; swapAction_ = 0; ramp_.setTargetValue (0.0f); }
         else zeroForLearn();
     }
@@ -526,8 +545,9 @@ private:
             for (int k = 0; k < MaxHarmonics; ++k) { wRe_[c][k] = 0.0; wIm_[c][k] = 0.0; pRe_[c][k] = 0.0; pIm_[c][k] = 0.0; }
         refsValid_ = false;
         pending_   = false;
-        psE_ = 0.0; psEValid_ = false; periodSumE_ = 0.0; thrE2_ = thr2_;
+        periodSumE_ = 0.0; seedResidual();
         lockedPeriods_ = 0;
+        resetResidualFloor();
         if (learning_) learnArmAt_ = running_ ? learnElapsed_ : -1;
         ramp_.setCurrentAndTargetValue (running_ ? 1.0f : 0.0f);
     }
@@ -543,7 +563,8 @@ private:
     {
         for (int c = 0; c < core::kMaxChannels; ++c)
             for (int k = 0; k < MaxHarmonics; ++k) { wRe_[c][k] = 0.0; wIm_[c][k] = 0.0; pRe_[c][k] = 0.0; pIm_[c][k] = 0.0; }
-        psE_ = 0.0; psEValid_ = false; thrE2_ = thr2_; hitHold_ = 0; lockedPeriods_ = 0;
+        seedResidual(); hitHold_ = 0; lockedPeriods_ = 0;
+        resetResidualFloor();
         learnArmAt_ = running_ ? learnElapsed_ : -1;
         swapPhase_ = 0;
         if (running_) ramp_.setCurrentAndTargetValue (1.0f);
@@ -561,13 +582,31 @@ private:
         streak_ = 0; streakFamily_ = 0;                        // Auto re-decides only on windows after the restore
         rotsValid_ = false;
         setIncrement (bkInc_);
-        refsValid_ = false; psE_ = 0.0; psEValid_ = false; thrE2_ = thr2_; pending_ = false;
+        refsValid_ = false; seedResidual(); pending_ = false;
+        resetResidualFloor();
         if (running_) { ramp_.setCurrentAndTargetValue (0.0f); ramp_.setTargetValue (1.0f); swapPhase_ = 2; }
         else          { ramp_.setCurrentAndTargetValue (0.0f); swapPhase_ = 0; retarget(); }
     }
 
+    // After cancellation true quiet is the noise floor; a note is not. Within 12 dB of the residual floor.
+    bool residualQuiet() const noexcept { return ! running_ || ! rfValid_ || ! psEValid_ || ! (psE_ > kQuietRatio * rf_); }
+
+    // With zero (or freshly restored) weights the residual IS the input, so its level starts at the input's
+    // settled level, not at one period's power — a trough there would set every trigger off on the next peak.
+    void seedResidual() noexcept
+    {
+        fllHold_ = hopPeriods_ * kPeriod;   // fresh weights are small and moving: the FLL waits one hop for them
+        psE_ = ps_; psEValid_ = psValid_; psEAge_ = settlePeriods_;
+        if (psEValid_ && floorValid_) { const double lo = 1e-4 * floor_; thrE2_ = kHitRatio * (psE_ > lo ? psE_ : lo); }
+        else thrE2_ = thr2_;
+    }
+
+    void resetResidualFloor() noexcept { rfCount_ = 0; rfPos_ = 0; rfValid_ = false; rf_ = 0.0; hopMinE_ = kNone; }
+
     void resetDetector() noexcept
     {
+        famRef_[0] = famRef_[1] = 0.0; hitInHop_ = false; hitPrevHop_ = false; lwMin_ = kNone; coarseOk_ = false; psAge_ = 0; psEAge_ = 0;
+        resetResidualFloor();
         for (int c = 0; c < core::kMaxChannels; ++c)
             for (int b = 0; b < 4; ++b)
             { hopRe_[c][b] = 0.0; hopIm_[c][b] = 0.0; prevHopRe_[c][b] = 0.0; prevHopIm_[c][b] = 0.0; winRe_[c][b] = 0.0; winIm_[c][b] = 0.0; }
@@ -650,7 +689,7 @@ private:
             const double xd = (double) x;
             const double x2 = xd * xd;
             periodSum_ += x2;
-            if (x2 > thr2_) hit_ = true;
+            if (! running_ && x2 > thr2_) hit_ = true;       // while the canceller runs, the residual's trigger rules
             syncBins (p);
             for (int b = 0; b < 4; ++b)
             {
@@ -761,7 +800,10 @@ private:
 
     void endPeriod() noexcept
     {
-        const bool   wasQuiet = quietPeriod_ && ! hit_;       // the whole period ran at the learn width
+        // the FLL's own gate: the window was hum, no trigger, and the bins' coarse estimate agrees with ours —
+        // not the residual criterion (a residual grown by the FLL's own lag must not hold the FLL that cures it)
+        const bool   wasQuiet = quietWin_ && floorValid_ && hitHold_ <= 0 && ! hit_ && coarseOk_ && fllHold_ <= 0;
+        if (fllHold_ > 0) fllHold_ -= kPeriod;
         const double sum      = periodSum_;
         const double sumE     = periodSumE_;
         periodSum_  = 0.0;
@@ -770,34 +812,37 @@ private:
         if (sum > 0.0)                                         // an all-zero period (black, a pause) holds
         {
             const double p = sum / (double) kPeriod;
-            if (! psValid_) { ps_ = p; psValid_ = true; }
+            if (! psValid_) { ps_ = p; psValid_ = true; psAge_ = 0; }
             else
             {
                 const double d = p - ps_;
                 const double s = smoothA_ * d;
                 ps_ += s;
             }
+            if (psAge_ < settlePeriods_) ++psAge_;             // one period's power is not a level: settle first
             const bool above = floorValid_ && p > kQuietRatio * floor_;
-            if (learning_ && above) learnStatus_ = LearnStatus::Disturbed;
             activeRun_ = above ? (activeRun_ < activeSamples_ ? activeRun_ + kPeriod : activeRun_) : 0;
-            if (ps_ < hopMin_) hopMin_ = ps_;
+            if (psAge_ >= settlePeriods_ && ps_ < hopMin_) hopMin_ = ps_;
             if (running_ && wasQuiet && winner_ == family_ && swapPhase_ == 0 && params_.lockRangeHz > 0.0) trackFrequency();
         }
         if (sumE > 0.0)                                        // the residual's smoothed level (running only)
         {
             const double pe = sumE / (double) kPeriod;
-            if (! psEValid_) { psE_ = pe; psEValid_ = true; }
+            if (! psEValid_) { psE_ = pe; psEValid_ = true; psEAge_ = 0; }
             else
             {
                 const double d = pe - psE_;
                 const double s = smoothA_ * d;
                 psE_ += s;
             }
+            if (psEAge_ < settlePeriods_) ++psEAge_;
+            else if (psE_ < hopMinE_) hopMinE_ = psE_;
         }
+        if (hit_) { hitInHop_ = true; quietWin_ = false; }   // a trigger voids the last window's verdict at once
         if (++hopCount_ >= hopPeriods_) endHop();
         if (hit_) hitHold_ = holdSamples_;
         else if (hitHold_ > 0) hitHold_ -= kPeriod;
-        quietPeriod_ = quietWin_ && floorValid_ && ! (ps_ > kQuietRatio * floor_) && hitHold_ <= 0;
+        quietPeriod_ = quietWin_ && floorValid_ && hitHold_ <= 0 && residualQuiet();
         hit_  = false;
         thr2_ = floorValid_ ? kHitRatio * floor_ : kNone;
         if (psEValid_ && floorValid_)
@@ -891,8 +936,26 @@ private:
 
             const int winner = wins[0] ? 50 : (wins[1] ? 60 : 0);
             winner_ = winner;
-            if (quiet && winner != 0) { streak_ = winner == streakFamily_ ? streak_ + 1 : 1; streakFamily_ = winner; }
-            else                      { streak_ = 0; streakFamily_ = 0; }
+            // A window counts for a decision only if it was quiet, free of triggers, and — to move off a decided
+            // family — that family has LOST (its bins 10 dB under their level when it was last confirmed): a tone
+            // at 60 Hz over a 50 Hz hum that is still there wins nothing.
+            const bool   trigFree = ! hitInHop_ && ! hitPrevHop_;
+            const double famOf[2] = { fam50, fam60 };
+            const int    decided  = learning_ ? learnFamily_ : autoFamily_;
+            const int    ds       = decided == 60 ? 1 : 0;
+            const bool   lost     = decided != 0 && famRef_[ds] > 0.0 && famOf[ds] < 0.1 * famRef_[ds];
+            if (quiet && winner != 0 && (decided == 0 || winner == decided || (lost && trigFree)))
+                 { streak_ = winner == streakFamily_ ? streak_ + 1 : 1; streakFamily_ = winner; }
+            else { streak_ = 0; streakFamily_ = 0; }
+            // A LOUDER HUM is not a note: the running family's bins up 3 dB, at the frequency we track — the
+            // residual floor restarts, so quiet returns while the canceller re-converges at the learn width.
+            if (running_ && quiet && trigFree && winner == family_)
+            {
+                const int fs2 = family_ == 60 ? 1 : 0;
+                if (famRef_[fs2] > 0.0 && famOf[fs2] > 2.0 * famRef_[fs2] && coarseValid_[fs2] && std::fabs (coarse_[fs2] - fHat_) < 0.05)
+                    resetResidualFloor();
+            }
+            if (quiet && trigFree && winner != 0) famRef_[winner == 60 ? 1 : 0] = famOf[winner == 60 ? 1 : 0];
             if (learning_)                                      // a learn decides with Auto's windows, whatever the mode
             {
                 if (streak_ >= kWinStreak && winner != learnFamily_) { learnFamily_ = winner; retarget(); }
@@ -902,12 +965,17 @@ private:
                 autoFamily_ = winner;
                 if (params_.mains == Mains::Auto) retarget();
             }
+            {
+                const int cs = family_ == 60 ? 1 : 0;
+                coarseOk_ = running_ && coarseValid_[cs] && std::fabs (coarse_[cs] - fHat_) < 0.05;
+            }
             if (running_ && ! acquired_ && params_.lockRangeHz > 0.0 && coarseValid_[family_ == 60 ? 1 : 0])
             {
                 setFrequency (clampToLock (coarse_[family_ == 60 ? 1 : 0]));
                 acquired_ = true;
+                coarseOk_ = true;
             }
-            quietWin_ = quiet;
+            quietWin_ = quiet && trigFree;                     // a window that held a trigger is not quiet
             for (int c = 0; c < maxCh_; ++c)
                 for (int b = 0; b < 4; ++b) { winRe_[c][b] = nowRe_[c][b]; winIm_[c][b] = nowIm_[c][b]; }
             prevWinValid_ = true;
@@ -924,6 +992,29 @@ private:
             floorValid_ = true;
         }
         hopMin_ = kNone;
+        // LEARN's floor window must be a floor: a hop whose LOWEST residual is 6 dB over the lowest hop seen in
+        // the window (a swell, a note creeping in under every trigger) disturbs the learn. Hop minima, so a
+        // spike cannot trip it and a converging (falling) residual never does.
+        if (learning_ && learnArmAt_ >= 0 && learnElapsed_ >= settleStart() && hopMinE_ < kNone)
+        {
+            const double lo = floorValid_ ? 1e-6 * floor_ : 0.0;
+            if (lwMin_ < kNone && hopMinE_ > 4.0 * (lwMin_ > lo ? lwMin_ : lo)) learnStatus_ = LearnStatus::Disturbed;
+            if (hopMinE_ < lwMin_) lwMin_ = hopMinE_;
+        }
+        if (hopMinE_ < kNone)                                  // the residual floor: same, its rise capped per hop
+        {
+            rfRing_[rfPos_] = hopMinE_;
+            rfPos_ = (rfPos_ + 1) % kFloorHops;
+            if (rfCount_ < kFloorHops) ++rfCount_;
+            double m = rfRing_[0];
+            for (int i = 1; i < rfCount_; ++i) if (rfRing_[i] < m) m = rfRing_[i];
+            const double capped = rf_ * kResidualRise;
+            rf_ = (rfValid_ && m > capped) ? capped : m;
+            rfValid_ = true;
+        }
+        hopMinE_ = kNone;
+        hitPrevHop_ = hitInHop_;
+        hitInHop_   = false;
         for (int c = 0; c < maxCh_; ++c)
             for (int b = 0; b < 4; ++b)
             { prevHopRe_[c][b] = hopRe_[c][b]; prevHopIm_[c][b] = hopIm_[c][b]; hopRe_[c][b] = 0.0; hopIm_[c][b] = 0.0; }
@@ -966,6 +1057,11 @@ private:
     int    streak_ = 0, streakFamily_ = 0, autoFamily_ = 0, winner_ = 0;   // winner_: the last window's family
     int    lockedPeriods_ = 0;
     std::uint32_t bkInc_ = 0, bkAnchor_ = 0;
+    double rfRing_[kFloorHops] {}, rf_ = 0.0, hopMinE_ = kNone, famRef_[2] {}, lwMin_ = kNone;
+    int    rfCount_ = 0, rfPos_ = 0, psAge_ = 0, psEAge_ = 0, settlePeriods_ = 46;
+    bool   coarseOk_ = false;
+    int    fllHold_ = 0;
+    bool   rfValid_ = false, hitInHop_ = false, hitPrevHop_ = false;
     bool   bkLive_ = false, freqPending_ = false;
 
     // ---- LEARN ----
