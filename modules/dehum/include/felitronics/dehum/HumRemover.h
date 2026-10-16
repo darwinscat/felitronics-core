@@ -120,9 +120,11 @@ namespace felitronics::dehum
 // trigger makes it DISTURBED and freezes adaptation from that sample — and so does a floor window that is not
 // a floor: a hop whose lowest residual is 6 dB over the lowest hop of the window (a swell, a note creeping in
 // under every trigger). A LEARN pressed after the rig changed (more noise, louder hum) is not Disturbed: the
-// rule compares the window with itself, not with the stage's past. A note ringing through the whole learn
-// that falls (decays) is not refused; floorAfterDb, the window's peak, reports it — high, so a gate set from
-// it errs safe. A learn that decided no family, or learned a hum below kNothingDb (−90 dB), is NOTHING HEARD. Only a
+// rule compares the window with itself, not with the stage's past. A floor window that FALLS steadily (a string
+// still ringing when LEARN was pressed) is Disturbed too — judged above ≈ −34 dB re the input (hop minima
+// against 1e-4 of the input floor), so a slow learn width or an FLL settling never trips it. A fainter ringing
+// string is Learned, with floorAfterDb (the window's peak) at the string's level — high, so a gate set from it
+// errs safe. A learn that decided no family, or learned a hum below kNothingDb (−90 dB), is NOTHING HEARD. Only a
 // committed, Learned learn is kept, and the report says whether it was (kept: false for a learn of the other
 // family in a fixed mode, or in Off); anything else restores the snapshot bit for bit through a ramp. A floor
 // window shorter than kLearnFloorMinSec (one hop) is TooShort. A LEARN begun while a cancelled one still ramps
@@ -593,7 +595,7 @@ private:
         double f  = (double) family_;
         const int s = family_ == 60 ? 1 : 0;
         if (running_ && params_.lockRangeHz > 0.0 && coarseValid_[s]) { f = clampToLock (coarse_[s]); acquired_ = true; }
-        rotsValid_ = false; freqPending_ = false; glide_ = false; lastCoarseValid_ = false; prevModel_ = 0.0;
+        rotsValid_ = false; freqPending_ = false; glide_ = false; lastCoarseValid_ = false; lastCoarse2Valid_ = false; prevModel_ = 0.0;
         setFrequency (running_ ? f : 0.0);
         for (int c = 0; c < core::kMaxChannels; ++c)
             for (int k = 0; k < MaxHarmonics; ++k) { wRe_[c][k] = 0.0; wIm_[c][k] = 0.0; pRe_[c][k] = 0.0; pIm_[c][k] = 0.0; }
@@ -717,7 +719,8 @@ private:
     void resetDetector() noexcept
     {
         famRef_[0] = famRef_[1] = 0.0; hitInHop_ = false; hitPrevHop_ = false; lwMin_ = kNone; coarseOk_ = false; psAge_ = 0; psEAge_ = 0;
-        glide_ = false; lastCoarseValid_ = false; prevModel_ = 0.0;
+        glide_ = false; lastCoarseValid_ = false; lastCoarse2Valid_ = false; prevModel_ = 0.0;
+        for (int c = 0; c < core::kMaxChannels; ++c) { fedHop_[c] = false; fedPrevHop_[c] = false; fedWin_[c] = false; }
         resetResidualFloor();
         for (int c = 0; c < core::kMaxChannels; ++c)
             for (int b = 0; b < 4; ++b)
@@ -963,7 +966,7 @@ private:
             {
                 const double d = glideTarget_ - fHat_;
                 if (std::fabs (d) <= 0.01) glide_ = false;
-                else { setFrequency (clampToLock (fHat_ + (d > slewT_ ? slewT_ : (d < -slewT_ ? -slewT_ : d)))); fllMovedHop_ = true; }
+                else setFrequency (clampToLock (fHat_ + (d > slewT_ ? slewT_ : (d < -slewT_ ? -slewT_ : d))));
             }
             else if (running_ && wasQuiet && winner_ == family_ && swapPhase_ == 0 && params_.lockRangeHz > 0.0) trackFrequency();
         }
@@ -1015,7 +1018,6 @@ private:
         const double delta = num / (2.0 * core::kPi * periodSec_ * den);
         lockedPeriods_ = std::fabs (delta) < 0.005 ? (lockedPeriods_ < hopPeriods_ ? lockedPeriods_ + 1 : lockedPeriods_) : 0;
         double step = (fllFast_ ? fllGainT_ : fllGainSlowT_) * delta;
-        if (std::fabs (step) > 0.1 * slewT_) fllMovedHop_ = true;
         if (step >  slewT_) step =  slewT_;
         if (step < -slewT_) step = -slewT_;
         setFrequency (clampToLock (fHat_ + step));
@@ -1105,11 +1107,19 @@ private:
             if (running_ && quiet && trigFree && winner == family_ && modelRef > 0.0 && famOf[rs] > 2.0 * modelRef
                 && coarseValid_[rs] && std::fabs (coarse_[rs] - fHat_) < 0.05)
                 resetResidualFloor();
-            const bool stable = coarseValid_[rs] && lastCoarseValid_ && std::fabs (coarse_[rs] - lastCoarse_) < 0.01;
+            // F1: THREE consecutive estimates within 0.01 Hz — a faint note beside a bin beats in it, and two
+            // estimates agree by chance far more often than three
+            double cMax = coarse_[rs], cMin = coarse_[rs];
+            if (lastCoarse_ > cMax) cMax = lastCoarse_;
+            if (lastCoarse_ < cMin) cMin = lastCoarse_;
+            if (lastCoarse2_ > cMax) cMax = lastCoarse2_;
+            if (lastCoarse2_ < cMin) cMin = lastCoarse2_;
+            const bool stable = coarseValid_[rs] && lastCoarseValid_ && lastCoarse2Valid_ && cMax - cMin < 0.01;
             glide_ = running_ && quiet && trigFree && stable && std::fabs (coarse_[rs] - fHat_) >= 0.02
                      && model > 0.0 && famOf[rs] < 2.0 * model && famOf[rs] > 0.5 * model;
             if (glide_) glideTarget_ = clampToLock (coarse_[rs]);
-            lastCoarse_ = coarse_[rs]; lastCoarseValid_ = coarseValid_[rs];
+            lastCoarse2_ = lastCoarse_; lastCoarse2Valid_ = lastCoarseValid_;
+            lastCoarse_  = coarse_[rs]; lastCoarseValid_  = coarseValid_[rs];
             if (quiet && trigFree && winner != 0) famRef_[winner == 60 ? 1 : 0] = famOf[winner == 60 ? 1 : 0];
             if (learning_)                                      // a learn decides with Auto's windows, whatever the mode
             {
@@ -1156,7 +1166,8 @@ private:
             if (lwMin_ < kNone && hopMinE_ > 4.0 * (lwMin_ > lo ? lwMin_ : lo)) learnStatus_ = LearnStatus::Disturbed;
             if (hopMinE_ < lwMin_) lwMin_ = hopMinE_;
             // R5: nor a floor that FALLS steadily — a string still ringing when LEARN was pressed: three hops on,
-            // a hop 6 dB under the window's first. S2: judged only above −40 dB re the input — a ringing string
+            // a hop 6 dB under the window's first. S2: judged only where hop minima sit over 1e-4 of the input
+            // floor — ≈ −34 dB re the input in practice (F2) — a ringing string
             // sits 10–20 dB under it, while ordinary convergence (a slow learn width, an FLL settling on a wide
             // detune) has fallen below that by the time the window opens (7 learn-τ)
             const double lo5 = floorValid_ ? 1e-4 * floor_ : 0.0;
@@ -1177,7 +1188,6 @@ private:
         hopMinE_ = kNone;
         hitPrevHop_ = hitInHop_;
         hitInHop_   = false;
-        fllMovedHop_ = false;
         for (int c = 0; c < core::kMaxChannels; ++c) { fedPrevHop_[c] = fedHop_[c]; fedHop_[c] = false; }
         for (int c = 0; c < maxCh_; ++c)
             for (int b = 0; b < 4; ++b)
@@ -1211,7 +1221,8 @@ private:
     double pkCur_[core::kMaxChannels] {};       // this period's residual peak
     double pkDecay64_ = 1.0, glideTarget_ = 0.0, lastCoarse_ = 0.0, prevModel_ = 0.0, lwFirst_ = kNone;
     int    lwHops_ = 0;
-    bool   glide_ = false, lastCoarseValid_ = false;
+    bool   glide_ = false, lastCoarseValid_ = false, lastCoarse2Valid_ = false;
+    double lastCoarse2_ = 0.0;
 
     // ---- detector ----
     double hopRe_[core::kMaxChannels][4] {}, hopIm_[core::kMaxChannels][4] {};
@@ -1259,7 +1270,7 @@ private:
     double               hopSec_      = 0.25;
     double               smoothA_     = 0.0;
     double               muSlow_      = 0.0, muFast_ = 0.0, fllGainT_ = 0.0, fllGainSlowT_ = 0.0, slewT_ = 0.0;
-    bool                 fllFast_     = false, fllMovedHop_ = false;
+    bool                 fllFast_     = false;
     double               fHat_        = 0.0;
     int                  family_      = 0;   // 0 (dry), 50 or 60 — what the canceller runs
     int                  nActive_     = 0;

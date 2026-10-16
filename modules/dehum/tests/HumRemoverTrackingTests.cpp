@@ -1167,6 +1167,24 @@ static void testRound4()
     }
 }
 
+// F1: a held pure 49 Hz note, 0.07x the hum's fundamental, under a locked phase-aligned 50 Hz hum: its 1 Hz beat
+// in the 50 Hz bin must not make the coarse estimate look "stable" off f̂ — the glide must not pull.
+static void testBeatDoesNotGlide()
+{
+    group ("F1: a faint held 49 Hz note under a locked aligned hum does not pull the estimate");
+    const double fs = 48000.0;
+    HumSpec hs; hs.f0 = 50.0; hs.a1 = 0.0316; hs.aligned = true; hs.seed = 91u;
+    std::vector<float> x ((std::size_t) (11.0 * fs), 0.0f);
+    addHum (x, hs, fs);
+    Note n; n.f0 = 49.0; n.B = 0.0; n.partials = 1; n.amp = 0.07 * 0.0316; n.start = 3.0; n.dur = 8.0; addNote (x, n, fs);
+    Tel tel;
+    processed (x, params (dh::Mains::Auto, 0.5, 3.0), fs, &tel);
+    double dev = 0.0;
+    for (std::size_t i = 0; i < tel.f.size(); ++i) if (tOf (tel, i, fs) >= 3.0) dev = std::max (dev, std::fabs (tel.f[i] - 50.0));
+    std::printf ("      49 Hz at 0.07x the fundamental, held 8 s: the estimate moved up to %.4f Hz\n", dev);
+    ok (dev <= 0.005, "F1: the estimate is not pulled by the note's beat (" + fmt (dev, 4) + " Hz)");
+}
+
 int main()
 {
     std::printf ("felitronics::dehum — HumRemover knowing the mains\n");
@@ -1195,5 +1213,6 @@ int main()
     testHandsProbe();
     testRingingLearnAndSharedLine();
     testRound4();
+    testBeatDoesNotGlide();
     return felitronics::test::report();
 }
