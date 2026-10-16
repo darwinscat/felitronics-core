@@ -110,14 +110,25 @@ namespace felitronics::dehum
 //   * A change of the family or of the active harmonic set ramps the correction out over 20 ms, then — at
 //     the next grid boundary — re-arms with zero weights. Zero weights are a zero correction: no step.
 //
-// THE GHOST A NOTE LEAVES. While a note sounds Δ Hz from harmonic k, the notch's state carries the note's
-// beat: amplitude A·(BW/2)/√(Δ² + (BW/2)²) in w_k. When the note stops, that state rings out as a tone at the
-// harmonic, decaying with τ — an LTI fact of any notch of this width, not a defect of the learner. The ghost
-// is RESIDUAL, so quiet (b) does not return while it rings, and it decays at the playing width's τ 0.64 s:
-// NOTE SAFETY WINS over a faster clean-up (a ghost and a soft note's own tail look the same to the stage).
-// Measured (48 kHz, a 330 Hz tone 20 Hz from k7 = 350): it starts at −38.7 dB re the tone (the LTI value is
-// −38.1) and is below −60 dB re the tone 1.56 s after the stop (1.62 s with one width) — it was 0.70 s when
-// quiet admitted the ghost, and with it every soft note (HumRemoverTrackingTests).
+// THE GHOST A NOTE LEAVES — AND ITS RETURN. While a note sounds Δ Hz from harmonic k, the notch's state carries
+// the note's beat: amplitude A·(BW/2)/√(Δ² + (BW/2)²) in w_k. Left alone, that state rings out at the harmonic
+// when the note stops, decaying with the playing width's τ 0.64 s (quiet (b) keeps the learn width away while it
+// rings) — behind high gain, an after-ring like a spring reverb after every palm-muted chug (1.56 s to −60 dB re a
+// 330 Hz tone 20 Hz from k7). So the stage keeps the model the note never touched: an EVENT opens on a trigger
+// with a snapshot of the weights at the last boundary before the attack's period, and the input floor as it
+// stood then; it closes when the input's mean over 16 periods (21 ms, more than a mains cycle) is back within
+// 6 dB of that floor, trigger-free for 50 ms. If the event was a NOTE (10 dB over where it closed) no longer than
+// 3 s, the weights RETURN to the snapshot over 40 ms (a raised cosine, on the sample, adaptation frozen
+// meanwhile; the snapshot first advanced by the turn the weights showed in the last clean hop, since f̂ is never
+// exact and the hum keeps turning in our frame), then carry on adapting. Measured: the 330 Hz ghost is under −60 dB
+// re the tone 0.07 s after the stop; palm-muted chugs (−17 dBFS over a single coil's hum, every 250 ms) leave
+// ≤ −62 dB re the chug 50–90 ms after each end (it was −37); the correction's second difference stays ≈ −90 dBFS.
+// A blip that trips a trigger, a soft note near the hum's level, overlapping notes (whose input never returns to
+// the old floor) and anything longer than 3 s (a snapshot that old is stale: drift, hands on the strings) close
+// with no return and keep the old behaviour. FREEZING adaptation while active instead was measured and rejected:
+// it leaves a louder hum un-nulled while playing (−3 dB), breaks the 0.5 Hz comb's note transfer the note-safety
+// tests pin (−11 dB re the clean pass), and still leaves a ghost after chugs (−54 dB) since the frozen model
+// cannot follow the hum's turn.
 //
 // WHILE PLAYING THE FREQUENCY IS HELD. The FLL runs only in quiet, so a long stretch of playing with no quiet
 // gap runs at the frequency it had when the playing began. If the mains drifts at r Hz/s for T s, harmonic k
@@ -206,7 +217,7 @@ namespace felitronics::dehum
 //
 // RT-safe: no allocation, lock, IO or throw anywhere after construction — there is no heap at all. Footprint
 // sizeof(HumRemover): weights, their previous-period copy, the LEARN snapshot and the hop's weight record (five
-// sums), 11·kMaxChannels·MaxHarmonics doubles (88 KiB at 64, 33 KiB at 24), plus ≈ 9 KiB of detector state (eight
+// sums) and the ghost's snapshot, 13·kMaxChannels·MaxHarmonics doubles (104 KiB at 64, 39 KiB at 24), plus ≈ 9 KiB of detector state (eight
 // bins: the four family bins and two noise neighbours per fundamental) and references. The neighbour bins cost
 // ≈ 0.35 µs per 64-frame mono block (Apple M5 Pro, 24 harmonics: 2.46 → 2.83 µs; at 128 harmonics within the
 // noise of ≈ 11 µs).
@@ -274,7 +285,12 @@ public:
     static constexpr double kSlewHzPerSec   = 0.05;     // the tracker's slew bound
     static constexpr double kResidualRise   = 1.1220184543019633;   // the residual floor rises <= 0.5 dB per hop (2 dB/s)
     static constexpr double kJitterRatio    = 0.1;      // -10 dB: beyond it the lines are lost in their own notches' hiss
-    static constexpr int    kCoarseAvg      = 4;        // coarse estimates averaged for the FLL's agreement gate and acquisition
+    static constexpr int    kCoarseAvg      = 4;
+    static constexpr double kGhostReturnSec = 0.040;    // the weights' return to the pre-note model, raised cosine
+    static constexpr double kGhostMaxSec    = 3.0;      // a longer event's snapshot is stale (drift, hands on): no return
+    static constexpr int    kGhostEndPeriods = 16;      // the input's mean power over this many periods (21 ms, a mains cycle
+    static constexpr double kGhostDrop      = 10.0;     // ...and 10 dB under the event's peak mean
+    static constexpr double kGhostEndRatio  = 4.0;      // and more) within 6 dB of the input floor, trigger-free = the note ended        // coarse estimates averaged for the FLL's agreement gate and acquisition
 
     struct Weight { double re, im; };
 
@@ -316,6 +332,8 @@ public:
         hopPeriods_    = hp < 1 ? 1 : (int) hp;
         hopSec_        = (double) (hopPeriods_ * kPeriod) / fs_;
         activeSamples_ = (int) std::llround (kActiveSeconds * fs_);
+        retLen_ = (int) std::llround (kGhostReturnSec * fs_); if (retLen_ < 1) retLen_ = 1;
+        ghostMax_ = (long long) std::llround (kGhostMaxSec * fs_);
         holdSamples_   = (int) std::llround (kHoldSeconds * fs_);
         settlePeriods_ = (int) std::llround (3.0 * kSmoothSeconds * fs_ / (double) kPeriod) + 1;
         pkDecay64_     = core::det::exp2 (-2.0 * (double) kPeriod / (0.040 * fs_));   // peak reference: -6 dB per 40 ms
@@ -756,6 +774,7 @@ private:
     void seedResidual() noexcept
     {
         fllHold_ = hopPeriods_ * kPeriod;   // fresh weights are small and moving: the FLL waits one hop for them
+        resetGhost();                       // ...and no snapshot of the old ones is returned to
         psE_ = ps_; psEValid_ = psValid_; psEAge_ = settlePeriods_;
         thrE2_ = floorValid_ ? kHitRatio * 1e-4 * floor_ : thr2_;
         for (int c = 0; c < core::kMaxChannels; ++c) { pkE_[c] = kHitRatio * ps_; pkCur_[c] = 0.0; }   // the residual IS the input now
@@ -805,6 +824,7 @@ private:
 
     void resetDetector() noexcept
     {
+        resetGhost();
         famRef_[0] = famRef_[1] = 0.0; hitInHop_ = false; hitPrevHop_ = false; lwMin_ = kNone; coarseOk_ = false; psAge_ = 0; psEAge_ = 0;
         glide_ = false; lastCoarseValid_ = false; lastCoarse2Valid_ = false; prevModel_ = 0.0;
         for (int c = 0; c < core::kMaxChannels; ++c) { fedHop_[c] = false; fedPrevHop_[c] = false; fedWin_[c] = false; }
@@ -914,6 +934,8 @@ private:
         {
             const double g = (double) ramp_.getNextValue();
             const bool   floorWindow = ss >= 0 && learnElapsed_ + i >= ss;
+            const bool   returning = retLeft_ > 0;
+            if (returning) stepReturn();                             // on the sample, before this sample's correction
             if (det) observe (io, nch, off + i, p0 + i);
             for (int c = 0; c < nch; ++c)
             {
@@ -955,7 +977,7 @@ private:
                 }
                 if (learning_ && hit_) learnStatus_ = LearnStatus::Disturbed;   // frozen from this very sample
                 chanLive_[c] = true;
-                const double mu    = swapPhase_ != 0 ? 0.0
+                const double mu    = swapPhase_ != 0 || returning ? 0.0
                                    : learning_ ? (learnStatus_ == LearnStatus::Disturbed ? 0.0 : muFast_)
                                    : ((quietPeriod_ && ! hit_) ? muFast_ : muSlow_);
                 const double muErr = mu * err;
@@ -981,6 +1003,84 @@ private:
     {
         if (ramp_.isSmoothing())
             for (int i = 0; i < seg; ++i) (void) ramp_.getNextValue();
+        for (int i = 0; i < seg && retLeft_ > 0; ++i) stepReturn();   // law 11c: as through zeros
+    }
+
+    // THE GHOST: one sample of the weights' raised-cosine return to the snapshot, w = s + (w − s)·c(n)/c(n−1),
+    // so the deviation (the note the notches absorbed) follows c exactly and is exactly zero at the end.
+    void stepReturn() noexcept
+    {
+        const int    n    = retLen_ - retLeft_ + 1;
+        const double cNew = n >= retLen_ ? 0.0 : 0.5 + 0.5 * core::det::cos (core::kPi * (double) n / (double) retLen_);
+        const double r    = retC_ > 0.0 ? cNew / retC_ : 0.0;
+        retC_ = cNew;
+        --retLeft_;
+        for (int c = 0; c < maxCh_; ++c)
+            for (int k = 0; k < nActive_; ++k)
+            {
+                const double dr = wRe_[c][k] - sRe_[c][k];
+                const double di = wIm_[c][k] - sIm_[c][k];
+                const double er = dr * r;
+                const double ei = di * r;
+                wRe_[c][k] = sRe_[c][k] + er;
+                wIm_[c][k] = sIm_[c][k] + ei;
+            }
+    }
+
+    void resetGhost() noexcept { evOn_ = false; evAge_ = 0; evQuiet_ = 0; retLeft_ = 0; retC_ = 0.0; frameHz_ = 0.0; evHz_ = 0.0; }
+
+    // An EVENT starts with a trigger (the snapshot: the weights at the last boundary, before the attack's
+    // period; the reference: the input floor as it stood then) and ends when the input's mean over the last
+    // kGhostEndPeriods is back within 6 dB of that reference, trigger-free, 50 ms after the last trigger — so
+    // overlapping notes (a floor risen to the playing) never end one;
+    // an event no longer than kGhostMaxSec then returns the weights to the snapshot over kGhostReturnSec.
+    void ghostPeriod (double p) noexcept
+    {
+        if (! running_ || learning_ || swapPhase_ != 0 || pending_ || ! floorValid_) { evOn_ = false; return; }
+        if (! evOn_)
+        {
+            if (! hit_) return;
+            if (retLeft_ == 0)                                     // mid-return the target stays the snapshot
+                for (int c = 0; c < maxCh_; ++c)
+                    for (int k = 0; k < nActive_; ++k) { sRe_[c][k] = pRe_[c][k]; sIm_[c][k] = pIm_[c][k]; }
+            evOn_ = true; evAge_ = 0; evQuiet_ = 0; evSum_ = 0.0; evPeak_ = 0.0; evPos_ = 0; evRef_ = floor_; evHz_ = frameHz_;   // the level BEFORE it
+            for (int i = 0; i < kGhostEndPeriods; ++i) evRing_[i] = 0.0;
+            return;
+        }
+        if (evAge_ <= ghostMax_) evAge_ += kPeriod;
+        // the mean over the last kGhostEndPeriods periods, not one period: a peaky hum (a buzz) has periods
+        // far over its mean, and a mains cycle's mean is its level
+        evSum_ -= evRing_[evPos_]; evRing_[evPos_] = p; evSum_ += p; evPos_ = (evPos_ + 1) % kGhostEndPeriods;
+        if (evSum_ > evPeak_) evPeak_ = evSum_;
+        evQuiet_ = hit_ ? 0 : (evQuiet_ < kGhostEndPeriods ? evQuiet_ + 1 : evQuiet_);
+        if (evQuiet_ < kGhostEndPeriods || hitHold_ > 0 || evSum_ > kGhostEndRatio * (double) kGhostEndPeriods * evRef_) return;
+        evOn_ = false;
+        // returned only if the event was a NOTE: 10 dB over where it ended (a blip that tripped a trigger, or a
+        // soft note near the hum's level, whose ghost is soft too, ends here with no return) and not too old
+        if (evSum_ * kGhostDrop > evPeak_ || evAge_ > ghostMax_) return;
+        // the hum kept turning in our frame while the note sounded (f̂ is never exact): the snapshot is advanced by
+        // the rotation the weights showed in the last quiet hop, to where the hum will be when the return ends
+        if (evHz_ != 0.0)
+        {
+            const double el = (double) (evAge_ + kPeriod + retLen_) / fs_;
+            const double a1 = 2.0 * core::kPi * evHz_ * el;
+            const double c1 = core::det::cos (a1), s1 = core::det::sin (a1);
+            double zr = 1.0, zi = 0.0;
+            for (int k = 0; k < nActive_; ++k)
+            {
+                const double t1 = zr * c1; const double t2 = zi * s1; const double t3 = zr * s1; const double t4 = zi * c1;
+                zr = t1 - t2; zi = t3 + t4;                              // e^{j·(k+1)·a1}
+                for (int c = 0; c < maxCh_; ++c)
+                {
+                    const double a = sRe_[c][k] * zr; const double b = sIm_[c][k] * zi;
+                    const double d = sRe_[c][k] * zi; const double e = sIm_[c][k] * zr;
+                    sRe_[c][k] = a - b; sIm_[c][k] = d + e;
+                }
+            }
+        }
+        retLeft_ = retLen_; retC_ = 1.0;
+        const int hold = retLen_ + hopPeriods_ * kPeriod;           // the FLL and the motion record skip the return
+        if (fllHold_ < hold) fllHold_ = hold;
     }
 
     void atGridBoundary() noexcept
@@ -1095,6 +1195,7 @@ private:
         if (++hopCount_ >= hopPeriods_) endHop();
         if (hit_) hitHold_ = holdSamples_;
         else if (hitHold_ > 0) hitHold_ -= kPeriod;
+        ghostPeriod (sum / (double) kPeriod);
         quietPeriod_ = quietWin_ && floorValid_ && hitHold_ <= 0 && residualQuiet();
         hit_  = false;
         thr2_ = floorValid_ ? kHitRatio * floor_ : (psValid_ && psAge_ >= settlePeriods_ ? kHitRatio * ps_ : kNone);
@@ -1358,6 +1459,8 @@ private:
                 coarseOk_ = true;
             }
             quietWin_ = quiet && trigFree;                     // a window that held a trigger is not quiet
+            if (running_ && quietWin_ && residualQuiet() && rotHz_ < kNone && std::fabs (rotHz_) < 0.05)
+                frameHz_ = rotHz_;                             // the weights' turn in a clean hop: the ghost's return uses it
             updateMotionFloor (running_ && quietWin_ && residualQuiet());
             for (int c = 0; c < maxCh_; ++c)
                 for (int b = 0; b < kBins; ++b) { winRe_[c][b] = nowRe_[c][b]; winIm_[c][b] = nowIm_[c][b]; }
@@ -1449,6 +1552,12 @@ private:
     double jit_ = kNone, rotHz_ = kNone, lkSum_ = 0.0;
     int    lkN_ = 0;
     double cRing_[2][kCoarseAvg] {};
+    double sRe_[core::kMaxChannels][MaxHarmonics] {}, sIm_[core::kMaxChannels][MaxHarmonics] {};   // the pre-event model
+    double retC_ = 0.0, frameHz_ = 0.0, evHz_ = 0.0, evRef_ = 0.0, evPeak_ = 0.0, evSum_ = 0.0, evRing_[kGhostEndPeriods] {};
+    int    evPos_ = 0;
+    long long evAge_ = 0, ghostMax_ = 144000;
+    int    evQuiet_ = 0, retLeft_ = 0, retLen_ = 1920;
+    bool   evOn_ = false;
     int    cRingN_[2] {}, cRingPos_[2] {};
     double jfRing_[kFloorHops] {}, jf_ = 0.0;
     int    jfCount_ = 0, jfPos_ = 0;

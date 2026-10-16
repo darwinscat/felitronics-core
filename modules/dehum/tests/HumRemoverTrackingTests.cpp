@@ -525,7 +525,7 @@ static void testSwitchSteps()
 // The notch's state rings out at 350 Hz. Bound: it starts at the LTI value A·(BW/2)/sqrt(Δ² + (BW/2)²)
 // (−38.1 dB re the tone) and falls below -60 dB re the tone at the playing width's pace (2.5·τ = 1.6 s) —
 // quiet does not return while the residual carries it. No step.
-static void ghostRun (const dh::HumRemoverParams& p, double& startDb, double& t60, double& stepDb, double& tQuiet)
+static void ghostRun (const dh::HumRemoverParams& p, double& startDb, double& t60, double& stepDb, double& tQuiet, bool click = false)
 {
     const double fs = 48000.0, stop = 5.0;
     std::vector<float> x ((std::size_t) (9.0 * fs), 0.0f);
@@ -533,6 +533,7 @@ static void ghostRun (const dh::HumRemoverParams& p, double& startDb, double& t6
     addHum (x, hs, fs);
     Note n; n.f0 = 330.0; n.partials = 1; n.amp = 0.1; n.start = 3.0; n.dur = 2.0;
     addNote (x, n, fs);
+    if (click) x[(std::size_t) (2.0 * fs) + 17] += 0.003f;   // a -50 dBFS click 1 s before the note: it trips a trigger
     Tel tel;
     const auto y = processed (x, p, fs, &tel);
     tQuiet = -1.0;
@@ -560,11 +561,17 @@ static void testGhost()
                  " Correction second difference over the 2 s after the stop: %.1f / %.1f dBFS\n",
                  theory, q1, s1, t1, s2, t2, st1, st2);
     ok (s1 <= theory + 1.0, "the ghost starts at the LTI value (" + fmt (s1, 1) + " dB, theory " + fmt (theory, 1) + ")");
-    // NOTE SAFETY WINS: quiet now asks the residual to sit at its floor, and the ghost IS residual, so the
-    // learn width does not come back while it rings — it decays at the playing width, like the LTI notch
-    // (2.53·τ = 1.61 s to fall 22 dB). It used to fall below -60 dB in 0.70 s, when quiet admitted it.
-    ok (t1 > 0.0 && t1 <= 2.0, "it falls below -60 dB re the note at the playing width's pace, within 2.0 s (" + fmt (t1, 2) + " s)");
-    ok (std::fabs (t1 - t2) <= 0.2, "the same as with the playing width alone (" + fmt (t2, 2) + " s): the learn width does not chase a ghost");
+    // THE RETURN: when the note ends (the input back near its pre-note floor, 10 dB under the note's peak) the
+    // weights go back to the model they held before it, over 40 ms. The ghost was 1.56 s to -60 dB at the
+    // playing width (quiet (b) keeps the learn width away while it rings); now it is gone with the return.
+    ok (t1 > 0.0 && t1 <= 0.10, "it falls below -60 dB re the note within 0.10 s of the stop (" + fmt (t1, 2) + " s; it was 1.56 s)");
+    ok (std::fabs (t1 - t2) <= 0.02, "the same with the playing width alone (" + fmt (t2, 2) + " s): the return, not the learn width, ends it");
+    {   // a click that trips a trigger is an event too, but no note: it ends with no return, and the note's own event
+        // (not one opened 1 s earlier by the click, and so 3 s old at the stop) is the one returned
+        double s3, t3, st3, q3;
+        ghostRun (params (dh::Mains::Auto, 0.5, 3.0), s3, t3, st3, q3, true);
+        ok (t3 > 0.0 && t3 <= 0.10, "with a click 1 s before the note, still below -60 dB within 0.10 s (" + fmt (t3, 2) + " s)");
+    }
     ok (st1 <= -60.0, "the switch back to the learn width steps nothing (" + fmt (st1, 1) + " dBFS)");
 }
 
@@ -1253,6 +1260,73 @@ static std::vector<float> realInput (bool humbucker, double f0, double seconds, 
     return x;
 }
 
+//------------------------------------------------------------------------------------------------------
+// PALM-MUTED CHUGS behind high gain: E5 / A5 power chords (82.4 / 110 Hz families: partials near 150, 250,
+// 350 Hz), 5 ms attack, a 50 ms palm-mute decay, 80–150 ms long, every 250 ms for 4 s, peaking ≈ -20 dBFS,
+// over a single coil's hum (the fitted table, k1 -63 dBFS; hiss -110 so the measure reads the ghost, not the
+// hiss). THE GHOST: the hum harmonics' joint fit in 40 ms windows after each chug's end, re the chug's peak.
+// Before the return it rang at the playing width's τ 0.64 s after every chug.
+static void testPalmMuteGhost()
+{
+    group ("palm-muted chugs: no ghost after each chug's end (<= -60 dB re the chug within 100 ms), no step");
+    const double fs = 48000.0, f0 = 49.9931;
+    std::vector<float> x ((std::size_t) (11.0 * fs), 0.0f);
+    {
+        Lcg r { 11u }; double ph[40]; for (double& p : ph) p = 2.0 * kPi * r.uniform();
+        const double a1 = std::pow (10.0, -63.0 / 20.0);
+        double amp[40]; for (int k = 0; k < 40; ++k) amp[k] = a1 * std::pow (10.0, kSingleCoilDb[k] / 20.0);
+        Lcg w { 5u };
+        for (std::size_t n = 0; n < x.size(); ++n)
+        {
+            const double c = f0 * (double) n / fs;
+            double v = 3.16e-6 * (2.0 * w.uniform() - 1.0);
+            for (int k = 1; k <= 40; ++k) { const double kc = k * c; v += amp[k - 1] * std::sin (2.0 * kPi * (kc - std::floor (kc)) + ph[k - 1]); }
+            x[n] = (float) v;
+        }
+    }
+    const std::vector<float> humOnly = x;
+    std::vector<double> ends;
+    for (int i = 0; i < 16; ++i)
+    {
+        const double t0 = 5.0 + 0.25 * i + (double) ((i * 29) % 64) / fs, d = 0.080 + 0.010 * (i % 8);
+        const bool a5 = (i % 4) >= 2;
+        const double fr[3] = { a5 ? 110.0 : 82.41, a5 ? 164.81 : 123.47, a5 ? 220.0 : 164.81 };
+        for (int st = 0; st < 3; ++st)
+        {
+            Note nt; nt.f0 = fr[st]; nt.amp = 0.04; nt.start = t0 + 0.002 * st; nt.dur = d - 0.002 * st; nt.tau = 0.05;
+            nt.attack = 0.005; nt.release = 0.005; nt.partials = 8; nt.ph0 = 0.7 * i + st;
+            addNote (x, nt, fs);
+        }
+        ends.push_back (t0 + d);
+    }
+    double peak = 0.0;
+    for (std::size_t n = (std::size_t) (5.0 * fs); n < (std::size_t) (9.5 * fs); ++n) peak = std::max (peak, std::fabs ((double) x[n] - (double) humOnly[n]));
+    const std::vector<float> in = x;
+    const auto y = processed (x, params (dh::Mains::Auto, 0.5, 3.0), fs);
+    std::vector<double> fr; for (int k = 1; k <= 24; ++k) fr.push_back (k * f0);
+    // windows: 0-40 and 50-90 ms after every end (the next chug starts 100-170 ms after it), and, after the
+    // last chug only, 160-200 ms and 1.0-1.04 s
+    double worst[4] = { -400.0, -400.0, -400.0, -400.0 };
+    const double at[4] = { 0.0, 0.050, 0.160, 1.0 };
+    std::string each;
+    for (std::size_t i = 0; i < ends.size(); ++i)
+        for (int j = 0; j < 4; ++j)
+        {
+            if (j >= 2 && i + 1 < ends.size()) continue;
+            const auto a = fitAmps (y, (std::int64_t) std::llround ((ends[i] + at[j]) * fs), 1920, fr, fs);
+            double e = 0.0; for (double v : a) e += v * v;
+            worst[j] = std::max (worst[j], dbOf (std::sqrt (e) / peak));
+            if (j == 1) each += " " + fmt (dbOf (std::sqrt (e) / peak), 0);
+        }
+    const double step = dbOf (maxSecondDiff (in, y, (std::int64_t) (4.9 * fs), (std::int64_t) (10.0 * fs)));
+    std::printf ("      16 chugs, peak %.1f dBFS: the ghost re the chug, worst over the chugs, 0-40 / 50-90 ms after each end: %.1f / %.1f dB"
+                 " (each:%s); after the last, 160-200 ms / 1.0 s: %.1f / %.1f dB; correction second difference %.1f dBFS\n",
+                 dbOf (peak), worst[0], worst[1], each.c_str(), worst[2], worst[3], step);
+    ok (worst[1] <= -60.0, "the ghost is <= -60 dB re the chug 50-90 ms after every chug's end (" + fmt (worst[1], 1) + " dB)");
+    ok (std::max (worst[2], worst[3]) <= -60.0, "and stays there after the last (" + fmt (worst[2], 1) + ", " + fmt (worst[3], 1) + " dB)");
+    ok (step <= -60.0, "the return steps nothing: correction second difference <= -60 dBFS (" + fmt (step, 1) + ")");
+}
+
 static void testRealInput()
 {
     group ("a real input: single-coil and humbucker hum over pink hiss lock, null the strong lines, and a chord does not pull f̂");
@@ -1338,5 +1412,6 @@ int main()
     testRound4();
     testBeatDoesNotGlide();
     testRealInput();
+    testPalmMuteGhost();
     return felitronics::test::report();
 }
