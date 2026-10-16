@@ -81,6 +81,31 @@ namespace felitronics::dehum
 // back to the learn width is a μ change only: the correction's second difference stays at −83 dBFS through
 // it, the same as without the switch (HumRemoverTrackingTests).
 //
+// WHILE PLAYING THE FREQUENCY IS HELD. The FLL runs only in quiet, so a long stretch of playing with no quiet
+// gap runs at the frequency it had when the playing began. If the mains drifts at r Hz/s for T s, harmonic k
+// is off by Δ_k = k·r·T, and the canceller (still adapting at the playing width) leaves it at
+// 10·log10(Δ²/(Δ² + (BW/2)²)) re uncancelled. Worked: r = 1 mHz/s for 60 s (0.06 Hz, a large excursion) leaves
+// k = 1 at −12.6 dB, k = 4 at −3.2 dB, k = 10 at −0.7 dB — the upper harmonics are back. The first quiet gap
+// re-locks it: once one 0.5 s window is clear (0.5–0.75 s after the playing stops) the FLL closes at up to
+// 0.05 Hz/s, so 0.06 Hz takes about 1.2 s of quiet; the coarse estimate is taken once per arm, so a drift
+// accumulated while playing is closed by the FLL alone.
+//
+// LEARN (beginLearn / learnStatus / endLearn): a short, deliberate quiet — the player mutes the strings and
+// asks the stage to learn. The model is snapshotted, ramped out, zeroed, and relearnt at the learn width
+// with the family Auto's windows hear (in any mode); the correction stays live. Timeline from beginLearn:
+// the family is decided in 0.5–0.75 s (3 windows; at once if the running family is confirmed), the weights
+// converge, and the FLOOR WINDOW opens at max(1.0 s, arm + 0.75 s) — 0.75 s is 7 τ at the 3 Hz learn width,
+// −61 dB of the initial error; a cold start arms at ≈ 1.0 s, so its window opens at ≈ 1.75 s. The report's
+// floorAfterDb is the peak |out| over the window — what a gate threshold should sit above. 2 s is the
+// useful minimum. Anything a per-sample
+// trigger or the floor test calls playing makes it DISTURBED and freezes adaptation from that sample; a
+// learn that decided no family, or learned a hum below kNothingDb (−90 dB), is NOTHING HEARD. Only a
+// committed, Learned learn is kept; anything else restores the snapshot bit for bit through a ramp.
+//
+// TELEMETRY (process thread): detected(), mainsHz(), oscillatorHz(), locked() (the FLL's last steps under
+// 5 mHz for a hop, or no tracking asked for), humDb() (10·log10 Σ|w_k|², max over channels), harmonicDb(k),
+// quiet(), active().
+//
 // NUMERICS (law 3 carve-out, stated): weights and references in DOUBLE, samples in float. Float weights
 // stall where an increment drops below half an ulp of the weight (the design study read −63 dB re the hum at
 // 48 kHz, −51 at 192 kHz). The mains phase is a uint32 advanced by round(f·2³²/fs); every 64 samples
@@ -111,8 +136,8 @@ namespace felitronics::dehum
 // downstream), harmonics above the active set, or hum whose phase moves faster than τ lets the weights follow.
 //
 // RT-safe: no allocation, lock, IO or throw anywhere after construction — there is no heap at all. Footprint
-// sizeof(HumRemover): weights and their previous-period copy 4·kMaxChannels·MaxHarmonics doubles (32 KiB at
-// 64), plus ≈ 3 KiB of detector state.
+// sizeof(HumRemover): weights, their previous-period copy and the LEARN snapshot, 6·kMaxChannels·MaxHarmonics
+// doubles (48 KiB at 64, 18 KiB at 24), plus ≈ 7 KiB of detector state and references.
 //==============================================================================
 
 enum class Mains { Off, Hz50, Hz60, Auto };
@@ -178,6 +203,24 @@ public:
 
     struct Weight { double re, im; };
 
+    static constexpr double kSilentDb          = -200.0;   // what an empty level reads as
+    static constexpr double kNothingDb         = -90.0;    // a learned hum below this is "nothing heard"
+    static constexpr double kLearnSettleSec    = 1.0;      // the floor window opens no earlier than this...
+    static constexpr double kLearnConvergeSec  = 0.75;     // ...nor earlier than this after the canceller armed (7 τ at 3 Hz)
+
+    enum class LearnStatus  { Idle, Running, Disturbed, NothingHeard };
+    enum class LearnVerdict { Learned, Disturbed, NothingHeard, TooShort };
+    struct LearnReport
+    {
+        Mains        mains        = Mains::Off;   // the family the learn heard (Off: none)
+        double       hz           = 0.0;          // the tracker's estimate at the end
+        double       humDb        = kSilentDb;    // the learned hum: 10·log10 Σ|w_k|², dB re a full-scale sine
+        double       harmonicDb[MaxHarmonics] {}; // each harmonic's amplitude, dBFS (index k-1)
+        double       floorAfterDb = kSilentDb;    // peak |out| over the settled window, dBFS
+        double       settledAtMs  = -1.0;         // when the settled window opened, ms after beginLearn (-1: never)
+        LearnVerdict verdict      = LearnVerdict::NothingHeard;
+    };
+
     // Law 11b: disarm, validate, write. Refuses fs < core::kMinSampleRate (or non-finite), maxBlock < 1 and
     // channels outside [1, core::kMaxChannels]. A prepare is a restart (law 11a): weights, clocks, detector.
     [[nodiscard]] bool prepare (double sampleRate, int maxBlock, int maxChannels) noexcept
@@ -216,6 +259,7 @@ public:
         anchorPhase_ = 0;
         for (int b = 0; b < 4; ++b) binAnchor_[b] = 0;
         for (int c = 0; c < core::kMaxChannels; ++c) zeros_[c] = 0;
+        learning_ = false; swapPhase_ = 0; learnFamily_ = 0;
         resetDetector();
         applyWanted();
     }
@@ -260,6 +304,7 @@ public:
             if (nch > 0 && running_)      runSegment (io, nch, done, seg);
             else if (nch > 0 && detOn())  detectSegment (io, nch, done, seg);
             else                          clockSegment (seg);
+            if (learning_) learnElapsed_ += seg;
             if (grid_.advance (seg)) atGridBoundary();
             done += seg;
         }
@@ -282,6 +327,83 @@ public:
     {
         if (channel < 0 || channel >= core::kMaxChannels || harmonic < 1 || harmonic > MaxHarmonics) return { 0.0, 0.0 };
         return { wRe_[channel][harmonic - 1], wIm_[channel][harmonic - 1] };
+    }
+
+    // Telemetry (process thread). Levels are the model's, max over channels.
+    bool   locked() const noexcept { return running_ && (params_.lockRangeHz <= 0.0 || lockedPeriods_ >= hopPeriods_); }
+    double humDb() const noexcept
+    {
+        double m = 0.0;
+        for (int c = 0; c < maxCh_; ++c)
+        {
+            double sum = 0.0;
+            for (int k = 0; k < nActive_; ++k) { const double a = wRe_[c][k] * wRe_[c][k]; const double b = wIm_[c][k] * wIm_[c][k]; sum += a; sum += b; }
+            if (sum > m) m = sum;
+        }
+        return m > 0.0 ? 10.0 * std::log10 (m) : kSilentDb;
+    }
+    double harmonicDb (int k) const noexcept
+    {
+        if (k < 1 || k > nActive_) return kSilentDb;
+        double m = 0.0;
+        for (int c = 0; c < maxCh_; ++c) { const double a = std::hypot (wRe_[c][k - 1], wIm_[c][k - 1]); if (a > m) m = a; }
+        return m > 0.0 ? 20.0 * std::log10 (m) : kSilentDb;
+    }
+
+    // ---- LEARN ---------------------------------------------------------------------------------------
+    // beginLearn: snapshot the model, ramp the correction out (20 ms, nothing adapts meanwhile), zero the
+    // weights, and learn at the learn width with the family decided by Auto's windows whatever the mode
+    // says; the correction stays live. A per-sample trigger or a period 12 dB over the floor makes it
+    // DISTURBED and freezes adaptation from that sample on. endLearn(commit) reports; it keeps the learned
+    // model only for commit && Learned, otherwise it ramps out, restores the snapshot bit for bit (weights,
+    // frequency, family, Auto's decision) and ramps it back in, adapting nothing until done (swapping()).
+    // In a fixed mode a committed learn of the other family re-arms on the mode's family.
+    void beginLearn() noexcept
+    {
+        if (! prepared_ || learning_) return;
+        for (int c = 0; c < core::kMaxChannels; ++c)
+            for (int k = 0; k < MaxHarmonics; ++k) { bkRe_[c][k] = wRe_[c][k]; bkIm_[c][k] = wIm_[c][k]; }
+        bkFamily_ = family_; bkRunning_ = running_; bkAcquired_ = acquired_; bkAuto_ = autoFamily_;
+        bkLocked_ = lockedPeriods_; bkHz_ = fHat_; bkActive_ = nActive_;
+        learning_ = true; learnStatus_ = LearnStatus::Running; learnElapsed_ = 0; learnFamily_ = 0;
+        learnArmAt_ = -1; peakOut_ = 0.0; streak_ = 0; streakFamily_ = 0;
+        if (running_ && ramp_.getCurrentValue() > 0.0f) { swapPhase_ = 1; swapAction_ = 0; ramp_.setTargetValue (0.0f); }
+        else zeroForLearn();
+    }
+    bool learning() const noexcept { return learning_; }
+    bool swapping() const noexcept { return swapPhase_ != 0; }
+    LearnStatus learnStatus() const noexcept
+    {
+        if (! learning_) return LearnStatus::Idle;
+        if (learnStatus_ == LearnStatus::Disturbed) return LearnStatus::Disturbed;
+        if ((double) learnElapsed_ >= kLearnSettleSec * fs_ && (learnFamily_ == 0 || humDb() < kNothingDb)) return LearnStatus::NothingHeard;
+        return LearnStatus::Running;
+    }
+    LearnReport endLearn (bool commit) noexcept
+    {
+        LearnReport r;
+        if (! learning_) return r;
+        const LearnStatus st = learnStatus();
+        r.mains = learnFamily_ == 50 ? Mains::Hz50 : (learnFamily_ == 60 ? Mains::Hz60 : Mains::Off);
+        r.hz    = running_ ? fHat_ : 0.0;
+        r.humDb = humDb();
+        for (int k = 0; k < MaxHarmonics; ++k) r.harmonicDb[k] = harmonicDb (k + 1);
+        const long long ss = settleStart();
+        const bool seen = learnArmAt_ >= 0 && learnElapsed_ > ss;
+        r.settledAtMs  = seen ? 1000.0 * (double) ss / fs_ : -1.0;
+        r.floorAfterDb = seen && peakOut_ > 0.0 ? 20.0 * std::log10 (peakOut_) : kSilentDb;
+        r.verdict = st == LearnStatus::Disturbed ? LearnVerdict::Disturbed
+                  : (st == LearnStatus::NothingHeard || learnFamily_ == 0 || r.humDb < kNothingDb) ? LearnVerdict::NothingHeard
+                  : ! seen ? LearnVerdict::TooShort : LearnVerdict::Learned;
+        learning_ = false;
+        if (commit && r.verdict == LearnVerdict::Learned)
+        {
+            if (params_.mains == Mains::Auto) autoFamily_ = learnFamily_;
+            if (swapPhase_ == 0) retarget();
+        }
+        else if (running_ && ramp_.getCurrentValue() > 0.0f) { swapPhase_ = 1; swapAction_ = 1; pending_ = false; ramp_.setTargetValue (0.0f); }
+        else restoreBackup();
+        return r;
     }
 
 private:
@@ -309,10 +431,11 @@ private:
 
     std::uint32_t incFor (double hz) const noexcept { return (std::uint32_t) std::llround (hz * 4294967296.0 / fs_); }
     // The detector listens whenever a mode wants it — and while the canceller still runs (a ramp-out to Off).
-    bool detOn() const noexcept { return params_.mains != Mains::Off || running_; }
+    bool detOn() const noexcept { return params_.mains != Mains::Off || running_ || learning_; }
 
     int wantedFamily() const noexcept
     {
+        if (learning_ && learnFamily_ != 0) return learnFamily_;
         switch (params_.mains)
         {
             case Mains::Off:  return 0;
@@ -350,6 +473,7 @@ private:
     // Wanted vs applied: anything structural pending ramps the correction out (or keeps it out).
     void retarget() noexcept
     {
+        if (swapPhase_ != 0) return;                           // a LEARN swap in flight reconciles when it ends
         const int fam = wantedFamily();
         pending_ = ! (fam == family_ && activeFor (fam) == nActive_);
         ramp_.setTargetValue (pending_ || ! running_ ? 0.0f : 1.0f);
@@ -393,8 +517,40 @@ private:
             for (int k = 0; k < MaxHarmonics; ++k) { wRe_[c][k] = 0.0; wIm_[c][k] = 0.0; pRe_[c][k] = 0.0; pIm_[c][k] = 0.0; }
         refsValid_ = false;
         pending_   = false;
-        psE_ = 0.0; psEValid_ = false; periodSumE_ = 0.0;
+        psE_ = 0.0; psEValid_ = false; periodSumE_ = 0.0; thrE2_ = thr2_;
+        lockedPeriods_ = 0;
+        if (learning_) learnArmAt_ = running_ ? learnElapsed_ : -1;
         ramp_.setCurrentAndTargetValue (running_ ? 1.0f : 0.0f);
+    }
+
+    long long settleStart() const noexcept
+    {
+        const long long a = (long long) std::llround (kLearnSettleSec * fs_);
+        const long long b = learnArmAt_ + (long long) std::llround (kLearnConvergeSec * fs_);
+        return a > b ? a : b;
+    }
+
+    void zeroForLearn() noexcept
+    {
+        for (int c = 0; c < core::kMaxChannels; ++c)
+            for (int k = 0; k < MaxHarmonics; ++k) { wRe_[c][k] = 0.0; wIm_[c][k] = 0.0; pRe_[c][k] = 0.0; pIm_[c][k] = 0.0; }
+        psE_ = 0.0; psEValid_ = false; thrE2_ = thr2_; hitHold_ = 0; lockedPeriods_ = 0;
+        learnArmAt_ = running_ ? learnElapsed_ : -1;
+        swapPhase_ = 0;
+        if (running_) ramp_.setCurrentAndTargetValue (1.0f);
+    }
+
+    void restoreBackup() noexcept
+    {
+        for (int c = 0; c < core::kMaxChannels; ++c)
+            for (int k = 0; k < MaxHarmonics; ++k) { wRe_[c][k] = bkRe_[c][k]; wIm_[c][k] = bkIm_[c][k]; pRe_[c][k] = bkRe_[c][k]; pIm_[c][k] = bkIm_[c][k]; }
+        family_ = bkFamily_; nActive_ = bkActive_; running_ = bkRunning_; acquired_ = bkAcquired_; autoFamily_ = bkAuto_;
+        lockedPeriods_ = bkLocked_;
+        rotsValid_ = false;
+        setFrequency (bkHz_);
+        refsValid_ = false; psE_ = 0.0; psEValid_ = false; thrE2_ = thr2_; pending_ = false;
+        if (running_) { ramp_.setCurrentAndTargetValue (0.0f); ramp_.setTargetValue (1.0f); swapPhase_ = 2; }
+        else          { ramp_.setCurrentAndTargetValue (0.0f); swapPhase_ = 0; retarget(); }
     }
 
     void resetDetector() noexcept
@@ -495,11 +651,13 @@ private:
 
     void runSegment (core::Sample* const* io, int nch, int off, int seg) noexcept
     {
-        const int  p0  = grid_.phase();
-        const bool det = detOn();
+        const int       p0  = grid_.phase();
+        const bool      det = detOn();
+        const long long ss  = learning_ && learnArmAt_ >= 0 ? settleStart() : -1;
         for (int i = 0; i < seg; ++i)
         {
             const double g = (double) ramp_.getNextValue();
+            const bool   floorWindow = ss >= 0 && learnElapsed_ + i >= ss;
             if (det) observe (io, nch, off + i, p0 + i);
             for (int c = 0; c < nch; ++c)
             {
@@ -519,6 +677,7 @@ private:
                 const double corr = correction (c);
                 const double gc   = g * corr;
                 s = (core::Sample) ((double) x - gc);
+                if (floorWindow) { const double a = std::fabs ((double) s); if (a > peakOut_) peakOut_ = a; }
                 if (zero) continue;                                  // a zero is no measurement
 
                 const double err = (double) x - corr;
@@ -528,7 +687,10 @@ private:
                     periodSumE_ += e2;
                     if (e2 > thrE2_) hit_ = true;
                 }
-                const double mu    = (quietPeriod_ && ! hit_) ? muFast_ : muSlow_;
+                if (learning_ && hit_) learnStatus_ = LearnStatus::Disturbed;   // frozen from this very sample
+                const double mu    = swapPhase_ != 0 ? 0.0
+                                   : learning_ ? (learnStatus_ == LearnStatus::Disturbed ? 0.0 : muFast_)
+                                   : ((quietPeriod_ && ! hit_) ? muFast_ : muSlow_);
                 const double muErr = mu * err;
                 for (int k = 0; k < nActive_; ++k)
                     detail::adapt (wRe_[c][k], wIm_[c][k], muErr, rRe_[k], rIm_[k]);
@@ -573,7 +735,12 @@ private:
                 pRe_[c][k] = re;
                 pIm_[c][k] = im;
             }
-        if (pending_ && ! ramp_.isSmoothing() && core::exactlyEqual (ramp_.getCurrentValue(), 0.0f))
+        if (swapPhase_ == 1 && ! ramp_.isSmoothing() && core::exactlyEqual (ramp_.getCurrentValue(), 0.0f))
+        {
+            if (swapAction_ == 0) zeroForLearn(); else restoreBackup();
+        }
+        else if (swapPhase_ == 2 && ! ramp_.isSmoothing()) { swapPhase_ = 0; retarget(); }
+        else if (swapPhase_ == 0 && pending_ && ! ramp_.isSmoothing() && core::exactlyEqual (ramp_.getCurrentValue(), 0.0f))
             applyWanted();
     }
 
@@ -596,9 +763,10 @@ private:
                 ps_ += s;
             }
             const bool above = floorValid_ && p > kQuietRatio * floor_;
+            if (learning_ && above) learnStatus_ = LearnStatus::Disturbed;
             activeRun_ = above ? (activeRun_ < activeSamples_ ? activeRun_ + kPeriod : activeRun_) : 0;
             if (ps_ < hopMin_) hopMin_ = ps_;
-            if (running_ && wasQuiet && winner_ == family_ && params_.lockRangeHz > 0.0) trackFrequency();
+            if (running_ && wasQuiet && winner_ == family_ && swapPhase_ == 0 && params_.lockRangeHz > 0.0) trackFrequency();
         }
         if (sumE > 0.0)                                        // the residual's smoothed level (running only)
         {
@@ -647,6 +815,7 @@ private:
             }
         if (! (den > 1e-16)) return;
         const double delta = num / (2.0 * core::kPi * periodSec_ * den);
+        lockedPeriods_ = std::fabs (delta) < 0.005 ? (lockedPeriods_ < hopPeriods_ ? lockedPeriods_ + 1 : lockedPeriods_) : 0;
         double step = fllGainT_ * delta;
         if (step >  slewT_) step =  slewT_;
         if (step < -slewT_) step = -slewT_;
@@ -709,7 +878,11 @@ private:
             winner_ = winner;
             if (quiet && winner != 0) { streak_ = winner == streakFamily_ ? streak_ + 1 : 1; streakFamily_ = winner; }
             else                      { streak_ = 0; streakFamily_ = 0; }
-            if (streak_ >= kWinStreak && winner != autoFamily_)
+            if (learning_)                                      // a learn decides with Auto's windows, whatever the mode
+            {
+                if (streak_ >= kWinStreak && winner != learnFamily_) { learnFamily_ = winner; retarget(); }
+            }
+            else if (streak_ >= kWinStreak && winner != autoFamily_)
             {
                 autoFamily_ = winner;
                 if (params_.mains == Mains::Auto) retarget();
@@ -776,6 +949,16 @@ private:
     int    hopCount_ = 0, hopsSeen_ = 0, hopPeriods_ = 1, binStep_ = 0;
     int    floorCount_ = 0, floorPos_ = 0, activeRun_ = 0, activeSamples_ = 960, hitHold_ = 0, holdSamples_ = 2400;
     int    streak_ = 0, streakFamily_ = 0, autoFamily_ = 0, winner_ = 0;   // winner_: the last window's family
+    int    lockedPeriods_ = 0;
+
+    // ---- LEARN ----
+    double      bkRe_[core::kMaxChannels][MaxHarmonics] {};   // the snapshot endLearn(false) restores
+    double      bkIm_[core::kMaxChannels][MaxHarmonics] {};
+    double      bkHz_ = 0.0, peakOut_ = 0.0;
+    int         bkFamily_ = 0, bkActive_ = 0, bkAuto_ = 0, bkLocked_ = 0, learnFamily_ = 0, swapPhase_ = 0, swapAction_ = 0;
+    bool        bkRunning_ = false, bkAcquired_ = false, learning_ = false;
+    long long   learnElapsed_ = 0, learnArmAt_ = -1;
+    LearnStatus learnStatus_ = LearnStatus::Idle;
     bool   coarseValid_[2] {};
     bool   prevWinValid_ = false, prevWinQuiet_ = false, psValid_ = false, floorValid_ = false, psEValid_ = false;
     bool   hit_ = false, quietWin_ = false, quietPeriod_ = false, binsValid_ = false;

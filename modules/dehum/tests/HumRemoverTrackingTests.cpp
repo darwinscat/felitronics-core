@@ -13,6 +13,7 @@
 #include "dehum_fixtures.h"
 
 #include <cstdio>
+#include <cstring>
 #include <string>
 
 using namespace dehumtest;
@@ -72,7 +73,7 @@ struct Note
 };
 static void addNote (std::vector<float>& x, const Note& nt, double fs)
 {
-    const std::int64_t n0 = std::llround (nt.start * fs), n1 = std::min ((std::int64_t) x.size(), std::llround ((nt.start + nt.dur) * fs));
+    const std::int64_t n0 = (std::int64_t) std::llround (nt.start * fs), n1 = std::min<std::int64_t> ((std::int64_t) x.size(), (std::int64_t) std::llround ((nt.start + nt.dur) * fs));
     double cyc[16] {};
     for (std::int64_t n = n0; n < n1; ++n)
     {
@@ -133,6 +134,16 @@ static double rmsDiffDb (const std::vector<float>& a, const std::vector<float>& 
         r += (double) b[(std::size_t) i] * (double) b[(std::size_t) i];
     }
     return 10.0 * std::log10 (std::max (e, 1e-300) / std::max (r, 1e-300));
+}
+
+static double worstNull (const std::vector<float>& y, const std::vector<float>& x, std::int64_t from, std::int64_t len, double f0, double fs)
+{
+    std::vector<double> fr;
+    for (int k = 1; k <= 24; ++k) fr.push_back (f0 * k);
+    const auto ay = fitAmps (y, from, len, fr, fs), ax = fitAmps (x, from, len, fr, fs);
+    double w = -400.0;
+    for (std::size_t k = 0; k < fr.size(); ++k) w = std::max (w, dbOf (ay[k] / ax[k]));
+    return w;
 }
 
 static std::string fmt (double v, int prec = 3) { char b[32]; std::snprintf (b, sizeof b, "%.*f", prec, v); return b; }
@@ -537,6 +548,119 @@ static void testGhost()
     ok (st1 <= -60.0, "the switch back to the learn width steps nothing (" + fmt (st1, 1) + " dBFS)");
 }
 
+//------------------------------------------------------------------------------------------------------
+// LEARN. 64-sample calls on the grid throughout, so a swap that ends on a boundary ends a call.
+static void block64 (HR& h, std::vector<float>& x, std::int64_t& o, std::int64_t until)
+{
+    for (; o < until; o += 64)
+    {
+        float* io[1] { x.data() + o };
+        felitronics::test::run (h.process (io, 1, (int) std::min<std::int64_t> (64, until - o)));
+    }
+}
+
+static void testLearnHumOnly()
+{
+    group ("LEARN on hum only: mains, hz within 0.02 Hz, floorAfterDb <= hum - 40 dB; cold and warm");
+    const double fs = 48000.0;
+    for (bool warm : { false, true })
+    {
+        HumSpec hs; hs.f0 = 59.8; hs.a1 = 0.0316; hs.seed = 33u;
+        const double pre = warm ? 3.0 : 0.0, len = 2.5;
+        std::vector<float> x ((std::size_t) ((pre + len + 2.0) * fs), 0.0f);
+        addHum (x, hs, fs);
+        const std::vector<float> in = x;
+        HR h; h.setParams (params (dh::Mains::Auto, 0.5, 3.0)); felitronics::test::run (h.prepare (fs, 512, 1));
+        std::int64_t o = 0;
+        block64 (h, x, o, (std::int64_t) (pre * fs));
+        h.beginLearn();
+        block64 (h, x, o, (std::int64_t) ((pre + len) * fs));
+        const auto st = h.learnStatus();
+        const auto r = h.endLearn (true);
+        const std::string tag = warm ? "warm (3 s of hum first)" : "cold (learn from the first sample)";
+        std::printf ("      %s: mains %d, %.4f Hz, hum %.1f dB, k1 %.1f dB, floor %.1f dBFS from %.0f ms, locked %d\n", tag.c_str(),
+                     r.mains == dh::Mains::Hz60 ? 60 : (r.mains == dh::Mains::Hz50 ? 50 : 0), r.hz, r.humDb, r.harmonicDb[0],
+                     r.floorAfterDb, r.settledAtMs, (int) h.locked());
+        ok (st == HR::LearnStatus::Running && r.verdict == HR::LearnVerdict::Learned, tag + ": Learned");
+        ok (r.mains == dh::Mains::Hz60 && std::fabs (r.hz - 59.8) < 0.02, tag + ": 60 Hz family at " + fmt (r.hz, 4) + " Hz");
+        ok (r.floorAfterDb <= -30.0 - 40.0, tag + ": floorAfterDb " + fmt (r.floorAfterDb, 1) + " dBFS <= hum (-30) - 40");
+        ok (std::fabs (r.harmonicDb[0] + 30.0) < 0.5 && std::fabs (r.harmonicDb[9] + 30.0 + 20.0) < 0.5,
+            tag + ": the harmonic levels are the hum's (k1 " + fmt (r.harmonicDb[0], 2) + ", k10 " + fmt (r.harmonicDb[9], 2) + " dB)");
+        if (warm)
+        {
+            const double st = dbOf (maxSecondDiff (in, x, (std::int64_t) (pre * fs) - 4800, (std::int64_t) (pre * fs) + 9600));
+            ok (st <= -60.0, tag + ": beginLearn ramps the old model out — no step (" + fmt (st, 1) + " dBFS)");
+        }
+        block64 (h, x, o, (std::int64_t) x.size());
+        const double nul = worstNull (x, in, (std::int64_t) ((pre + len + 1.0) * fs), (std::int64_t) fs - 2000, 59.8, fs);
+        ok (h.running() && h.detected() == dh::Mains::Hz60 && nul <= -50.0 && h.locked(),
+            tag + ": committed — it keeps cancelling (" + fmt (nul, 1) + " dB) and reports locked");
+    }
+}
+
+static void testLearnDisturbedAndRestore()
+{
+    group ("LEARN disturbed by a pluck at 1.2 s: Disturbed, frozen in that period, nothing committed, restored bit for bit");
+    const double fs = 48000.0;
+    for (bool commit : { false, true })
+    {
+        HumSpec hs; hs.f0 = 50.0; hs.a1 = 0.0316; hs.seed = 35u;
+        std::vector<float> x ((std::size_t) (7.0 * fs), 0.0f);
+        addHum (x, hs, fs);
+        Note n; n.f0 = 329.628; n.amp = 0.1; n.start = 3.0 + 1.2 + 13.0 / fs; n.dur = 1.0; n.tau = 1.0; n.attack = 0.001;
+        addNote (x, n, fs);
+        HR h; h.setParams (params (dh::Mains::Auto, 0.5, 3.0)); felitronics::test::run (h.prepare (fs, 512, 1));
+        std::int64_t o = 0;
+        block64 (h, x, o, (std::int64_t) (3.0 * fs));
+        HR::Weight snap[25]; for (int k = 1; k <= 24; ++k) snap[k] = h.weight (0, k);
+        const double fSnap = h.mainsHz(); const auto dSnap = h.detected();
+        h.beginLearn();
+        const std::int64_t onset = std::llround (n.start * fs), onsetBlockEnd = (onset / 64 + 1) * 64;
+        block64 (h, x, o, onsetBlockEnd - 64);
+        const bool runningBefore = h.learnStatus() == HR::LearnStatus::Running;
+        block64 (h, x, o, onsetBlockEnd);
+        const bool disturbedNow = h.learnStatus() == HR::LearnStatus::Disturbed;
+        HR::Weight w1[25]; for (int k = 1; k <= 24; ++k) w1[k] = h.weight (0, k);
+        block64 (h, x, o, (std::int64_t) (5.5 * fs));
+        bool frozen = true;
+        for (int k = 1; k <= 24; ++k) { const auto w = h.weight (0, k); frozen = frozen && std::memcmp (&w, &w1[k], sizeof w) == 0; }
+        const auto r = h.endLearn (commit);
+        int guard = 0;
+        while (h.swapping() && guard++ < 100) block64 (h, x, o, o + 64);
+        bool restored = ! h.swapping();
+        for (int k = 1; k <= 24; ++k) { const auto w = h.weight (0, k); restored = restored && std::memcmp (&w, &snap[k], sizeof w) == 0; }
+        const double fNow = h.mainsHz();
+        const std::string tag = commit ? "endLearn(true)" : "endLearn(false)";
+        ok (runningBefore && disturbedNow, tag + ": Running up to the pluck, Disturbed in the period that holds its onset");
+        ok (frozen, tag + ": adaptation frozen from the trigger on (weights bit-identical to the end of the learn)");
+        ok (r.verdict == HR::LearnVerdict::Disturbed, tag + ": the report says Disturbed");
+        ok (restored && std::memcmp (&fNow, &fSnap, sizeof fNow) == 0 && h.detected() == dSnap,
+            tag + ": nothing committed — weights, frequency and decision restored bit for bit (" + std::to_string (guard) + " calls of ramp)");
+    }
+}
+
+static void testLearnNothingHeard()
+{
+    group ("LEARN hears nothing: digital silence and -95 dBFS hum");
+    const double fs = 48000.0;
+    for (int which = 0; which < 2; ++which)
+    {
+        std::vector<float> x ((std::size_t) (3.0 * fs), 0.0f);
+        if (which == 1) { HumSpec hs; hs.f0 = 50.0; hs.a1 = 1.778e-5; hs.seed = 36u; addHum (x, hs, fs); }
+        HR h; h.setParams (params (dh::Mains::Auto, 0.5, 3.0)); felitronics::test::run (h.prepare (fs, 512, 1));
+        std::int64_t o = 0;
+        h.beginLearn();
+        block64 (h, x, o, (std::int64_t) (1.5 * fs));
+        const auto st = h.learnStatus();
+        block64 (h, x, o, (std::int64_t) (2.5 * fs));
+        const auto r = h.endLearn (true);
+        const std::string tag = which == 0 ? "digital silence" : "-95 dBFS hum";
+        std::printf ("      %s: mains %d, hum %.1f dB, verdict %d\n", tag.c_str(), r.mains == dh::Mains::Hz50 ? 50 : (r.mains == dh::Mains::Hz60 ? 60 : 0), r.humDb, (int) r.verdict);
+        ok (st == HR::LearnStatus::NothingHeard && r.verdict == HR::LearnVerdict::NothingHeard, tag + ": NothingHeard, during and in the report");
+        ok (h.detected() == dh::Mains::Off, tag + ": and nothing was committed");
+    }
+}
+
 int main()
 {
     std::printf ("felitronics::dehum — HumRemover knowing the mains\n");
@@ -551,5 +675,8 @@ int main()
     testPlucks();
     testSwitchSteps();
     testGhost();
+    testLearnHumOnly();
+    testLearnDisturbedAndRestore();
+    testLearnNothingHeard();
     return felitronics::test::report();
 }
