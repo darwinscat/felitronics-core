@@ -230,8 +230,12 @@ static void testPrepareAndAlloc()
         ok (h.activeHarmonics() == 64, "8 kHz, 64 asked, maxHz 5000: 0.9·Nyquist allows 72, the cap is 64 ("
                                         + std::to_string (h.activeHarmonics()) + ")");
         p.maxHz = 2000.0; h.setParams (p); felitronics::test::run (h.prepare (8000.0, 64, 1));
-        ok (h.activeHarmonics() == 40, "maxHz 2000 at 50 Hz: 40 harmonics (" + std::to_string (h.activeHarmonics()) + ")");
-        p.harmonics = 24; p.mains = dh::Mains::Hz60; h.setParams (p); felitronics::test::run (h.prepare (8000.0, 64, 1));
+        ok (h.activeHarmonics() == 39, "maxHz 2000 at 50 Hz, lock 1 Hz: 39 harmonics — 39·51 <= 2000 (" + std::to_string (h.activeHarmonics()) + ")");
+        p.mains = dh::Mains::Hz60; p.harmonics = 64; p.maxHz = 5000.0; h.setParams (p); felitronics::test::run (h.prepare (8000.0, 64, 1));
+        ok (h.activeHarmonics() == 59, "F: 60 Hz at 8 kHz, lock 1 Hz: 59 harmonics, so 59·61 stays under 0.9·Nyquist = 3600 wherever the tracker goes ("
+                                        + std::to_string (h.activeHarmonics()) + ")");
+        p.harmonics = 24; p.maxHz = 2000.0;
+        p.mains = dh::Mains::Hz60; h.setParams (p); felitronics::test::run (h.prepare (8000.0, 64, 1));
         ok (h.activeHarmonics() == 24 && std::fabs (h.mainsHz() - 60.0) < 1e-5, "default 24 at 60 Hz");
     }
     std::vector<float> l, r;

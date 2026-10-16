@@ -807,6 +807,116 @@ static void testLearnAfterChanges()
     }
 }
 
+//------------------------------------------------------------------------------------------------------
+// G4 — THE LEARN CONTRACT. E1 the report says whether the model was kept; E2 a floor window of a moment is
+// TooShort; E3 a learn begun while a cancelled one still ramps out keeps the ORIGINAL snapshot; E4 honest
+// verdicts off a learn, and a pluck early in a cold learn is Disturbed; I the FLL is not diluted by a
+// stopped channel's held weights.
+static HR warmOn (std::vector<float>& x, std::int64_t& o, dh::Mains m, double until, double fs)
+{
+    HR h; h.setParams (params (m, 0.5, 3.0)); felitronics::test::run (h.prepare (fs, 512, 1));
+    block64 (h, x, o, (std::int64_t) (until * fs));
+    return h;
+}
+
+static void testLearnContract()
+{
+    group ("LEARN contract: kept, TooShort, begin during a restore, NotLearning, a pluck early in a cold learn");
+    const double fs = 48000.0;
+    auto humOf = [&] (double f0, double secs, std::uint32_t seed)
+    {
+        std::vector<float> x ((std::size_t) (secs * fs), 0.0f);
+        HumSpec hs; hs.f0 = f0; hs.a1 = 0.0316; hs.seed = seed; addHum (x, hs, fs);
+        return x;
+    };
+    {   // E1: kept only where the mode keeps the learned family
+        struct C { dh::Mains m; bool kept; const char* name; };
+        for (C c : { C { dh::Mains::Auto, true, "Auto" }, C { dh::Mains::Hz60, true, "60" }, C { dh::Mains::Hz50, false, "50 (hum is 60)" }, C { dh::Mains::Off, false, "Off" } })
+        {
+            auto x = humOf (60.0, 6.0, 71u); std::int64_t o = 0;
+            HR h = warmOn (x, o, c.m, 2.0, fs);
+            h.beginLearn(); block64 (h, x, o, (std::int64_t) (4.5 * fs));
+            const auto r = h.endLearn (true);
+            ok (r.verdict == HR::LearnVerdict::Learned && r.kept == c.kept, std::string ("E1: commit in mode ") + c.name + ": Learned, kept = " + (r.kept ? "true" : "false"));
+        }
+    }
+    {   // E2: ended 10 ms into the floor window -> TooShort; 0.3 s into it -> Learned
+        for (double extra : { 0.01, 0.30 })
+        {
+            auto x = humOf (50.0, 6.0, 72u); std::int64_t o = 0;
+            HR h = warmOn (x, o, dh::Mains::Auto, 3.0, fs);
+            h.beginLearn(); block64 (h, x, o, (std::int64_t) ((3.0 + 1.0 + extra) * fs));
+            const auto r = h.endLearn (true);
+            const bool want = extra > 0.1;
+            ok (want ? r.verdict == HR::LearnVerdict::Learned : r.verdict == HR::LearnVerdict::TooShort,
+                "E2: ended " + fmt (extra, 2) + " s into the floor window: " + (want ? "Learned" : "TooShort") + " (verdict " + std::to_string ((int) r.verdict) + ")");
+        }
+    }
+    {   // E3: begin -> end(false) -> begin at once (the restore still ramping out) -> Disturbed -> end(false)
+        auto x = humOf (50.0, 9.0, 73u); std::int64_t o = 0;
+        Note n; n.f0 = 329.628; n.amp = 0.1; n.start = 3.5 + 1.5; n.dur = 1.0; n.tau = 1.0; n.attack = 0.001; addNote (x, n, fs);
+        HR h = warmOn (x, o, dh::Mains::Auto, 3.0, fs);
+        HR::Weight snap[25]; for (int k = 1; k <= 24; ++k) snap[k] = h.weight (0, k);
+        const double fSnap = h.mainsHz();
+        h.beginLearn(); block64 (h, x, o, (std::int64_t) (3.5 * fs));
+        (void) h.endLearn (false);
+        const bool swappingAtRebegin = h.swapping();
+        h.beginLearn(); block64 (h, x, o, (std::int64_t) (6.0 * fs));
+        const auto r = h.endLearn (false);
+        int guard = 0; while (h.swapping() && guard++ < 100) block64 (h, x, o, o + 64);
+        bool same = ! h.swapping() && r.verdict == HR::LearnVerdict::Disturbed;
+        for (int k = 1; k <= 24; ++k) { const auto w = h.weight (0, k); same = same && std::memcmp (&w, &snap[k], sizeof w) == 0; }
+        const double fNow = h.mainsHz();
+        ok (swappingAtRebegin, "E3: precondition — the second LEARN begins while the first one's restore still ramps");
+        ok (same && std::memcmp (&fNow, &fSnap, sizeof fNow) == 0, "E3: cancelling the second LEARN restores the ORIGINAL model, bit for bit");
+    }
+    {   // E4: honest verdicts off a learn
+        auto x = humOf (50.0, 3.0, 74u); std::int64_t o = 0;
+        HR h = warmOn (x, o, dh::Mains::Auto, 2.0, fs);
+        ok (h.endLearn (true).verdict == HR::LearnVerdict::NotLearning, "E4: endLearn with no learn running says NotLearning");
+        h.beginLearn(); block64 (h, x, o, (std::int64_t) (2.5 * fs));
+        felitronics::test::run (h.prepare (fs, 512, 1));
+        ok (! h.learning() && h.learnStatus() == HR::LearnStatus::Idle && h.endLearn (true).verdict == HR::LearnVerdict::NotLearning,
+            "E4: prepare() during a learn cancels it (a restart): Idle, and endLearn says NotLearning");
+    }
+    {   // E4: a pluck 0.1 s into a COLD learn (no floor yet) is Disturbed
+        auto x = humOf (50.0, 3.0, 75u);
+        Note n; n.f0 = 329.628; n.amp = 0.1; n.start = 0.1; n.dur = 1.0; n.tau = 1.0; n.attack = 0.001; addNote (x, n, fs);
+        HR h; h.setParams (params (dh::Mains::Auto, 0.5, 3.0)); felitronics::test::run (h.prepare (fs, 512, 1));
+        std::int64_t o = 0;
+        h.beginLearn(); block64 (h, x, o, (std::int64_t) (2.5 * fs));
+        const auto r = h.endLearn (true);
+        ok (r.verdict == HR::LearnVerdict::Disturbed, "E4: a pluck 0.1 s into a cold learn makes it Disturbed (verdict " + std::to_string ((int) r.verdict) + ")");
+    }
+}
+
+// I: the FLL with a stopped channel holding its (large) model tracks a mains ramp as a mono stage does.
+static void testFllLiveChannels()
+{
+    group ("FLL: a stopped channel's held weights do not dilute the tracker (ramp tracked as in mono)");
+    const double fs = 48000.0;
+    HumSpec hs; hs.f0 = 50.0; hs.a1 = 0.0316; hs.slope = 0.0025; hs.rampFrom = 3.0; hs.rampTo = 23.0; hs.seed = 76u;
+    std::vector<float> x ((std::size_t) (23.0 * fs), 0.0f);
+    addHum (x, hs, fs);
+    double worst[2] = { 0.0, 0.0 };
+    for (int stereo = 0; stereo < 2; ++stereo)
+    {
+        HR h; h.setParams (params (dh::Mains::Auto, 0.5, 3.0)); felitronics::test::run (h.prepare (fs, 512, 2));
+        std::vector<float> l = x, r = x;
+        for (std::size_t o = 0; o < l.size(); o += 256)
+        {
+            const int n = (int) std::min<std::size_t> (256, l.size() - o);
+            const bool both = stereo == 1 && (double) o / fs < 3.0;
+            float* io[2] { l.data() + o, r.data() + o };
+            felitronics::test::run (h.process (io, both ? 2 : 1, n));
+            const double t = (double) (o + (std::size_t) n) / fs;
+            if (t > 4.0) worst[stereo] = std::max (worst[stereo], std::fabs (h.mainsHz() - humFreq (hs, t)));
+        }
+    }
+    std::printf ("      ramp lag: mono %.5f Hz, stereo with channel 1 stopped after 3 s %.5f Hz\n", worst[0], worst[1]);
+    ok (worst[1] <= 1.1 * worst[0] + 1e-5, "the stopped channel does not slow the tracker (" + fmt (worst[1], 5) + " vs " + fmt (worst[0], 5) + " Hz)");
+}
+
 int main()
 {
     std::printf ("felitronics::dehum — HumRemover knowing the mains\n");
@@ -827,5 +937,7 @@ int main()
     testQuietAdmitsNoNote();
     testHumChanges();
     testLearnAfterChanges();
+    testLearnContract();
+    testFllLiveChannels();
     return felitronics::test::report();
 }
