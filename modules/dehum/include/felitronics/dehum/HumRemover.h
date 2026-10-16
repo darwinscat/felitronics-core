@@ -70,7 +70,8 @@ namespace felitronics::dehum
 //     (±2 Hz unambiguous), taken only between two quiet windows and only for a family that wins by 6 dB. Auto starts the canceller at it; a fixed
 //     mode jumps to it once, the first time it exists ("acquisition").
 //   * FINE (an FLL, only in quiet, and only while the running family is the one the last window's bins
-//     heard win, while its coarse estimate agrees with ours within 0.05 Hz — a note at a bin drags the coarse
+//     heard win, while the canceller explains the input (residual 15 dB under it: a note anywhere holds it),
+//     while its coarse estimate agrees with ours within 0.05 Hz — a note at a bin drags the coarse
 //     estimate off and so holds the FLL — and not in the first hop after fresh weights; NOT gated by the
 //     residual floor, since a residual grown by the FLL's own lag must not hold the FLL that cures it; a
 //     fixed mode on the other family's hum would otherwise chase beats): the weights' own rotation, Δf = Σ k·Im(w_k·conj w_k') / (2πT·Σ k²|w_k|²)
@@ -838,7 +839,10 @@ private:
     {
         // the FLL's own gate: the window was hum, no trigger, and the bins' coarse estimate agrees with ours —
         // not the residual criterion (a residual grown by the FLL's own lag must not hold the FLL that cures it)
-        const bool   wasQuiet = quietWin_ && floorValid_ && hitHold_ <= 0 && ! hit_ && coarseOk_ && fllHold_ <= 0;
+        // ...and the canceller explains the input: the residual 15 dB under it (a note, being residual, holds
+        // the FLL; the FLL's own lag and a hiss 20 dB down do not)
+        const bool explained = ! (psEValid_ && psValid_) || psE_ <= 0.0316 * ps_;
+        const bool   wasQuiet = quietWin_ && floorValid_ && hitHold_ <= 0 && ! hit_ && coarseOk_ && fllHold_ <= 0 && explained;
         if (fllHold_ > 0) fllHold_ -= kPeriod;
         const double sum      = periodSum_;
         const double sumE     = periodSumE_;

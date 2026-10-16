@@ -114,7 +114,7 @@ ADAPT (A_TransientShaper, felitronics::dynamics::TransientShaper, kPrepCh, true,
 
 ADAPT (A_HumRemover, felitronics::dehum::HumRemover<>, kPrepCh, true, true, true,
        { const bool okp = s.prepare (kFs, kMaxBlock, kPrepCh);
-         felitronics::dehum::HumRemoverParams hp;            // the default mode (Auto) is DRY in this version —
+         felitronics::dehum::HumRemoverParams hp;            // Auto would abstain on this hum-free fixture —
          hp.mains = felitronics::dehum::Mains::Hz50;          // run the canceller, at its quiet width so the
          hp.bandwidthHz = 3.0;                                // short fixture moves the weights
          s.setParams (hp); return okp; },

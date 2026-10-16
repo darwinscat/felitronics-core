@@ -69,6 +69,7 @@ struct Note
     double f0 = 0.0, amp = 0.1, B = 1e-4, start = 0.0, dur = 1.0, tau = 0.0, attack = 0.010;
     double vibRate = 0.0, vibDepth = 0.0, bendRatio = 1.0, bendSec = 0.0, release = 0.010;
     int    partials = 6;
+    double ph0 = 0.0;
     double partialHz (int p) const { return p * f0 * std::sqrt (1.0 + B * p * p); }
 };
 static void addNote (std::vector<float>& x, const Note& nt, double fs)
@@ -89,7 +90,7 @@ static void addNote (std::vector<float>& x, const Note& nt, double fs)
         {
             cyc[p] += nt.partialHz (p) * ratio / fs;
             cyc[p] -= std::floor (cyc[p]);
-            v += nt.amp / p * std::sin (2.0 * kPi * cyc[p] + 0.3 * p);
+            v += nt.amp / p * std::sin (2.0 * kPi * cyc[p] + 0.3 * p + nt.ph0);
         }
         x[(std::size_t) n] += (float) (env * v);
     }
@@ -172,7 +173,7 @@ static void testDetuned()
         }
         std::vector<double> fr;
         for (int k = 1; k <= 24; ++k) fr.push_back (k * c.f);
-        const std::int64_t S = (std::int64_t) (11.0 * c.fs), W = (std::int64_t) c.fs - 1000;
+        const std::int64_t S = (std::int64_t) (9.0 * c.fs), W = (std::int64_t) c.fs - 1000;   // the second that ends at 10 s
         const auto ao = fitAmps (y, S, W, fr, c.fs), ai = fitAmps (x, S, W, fr, c.fs);
         double worstNull = -400.0;
         for (std::size_t k = 0; k < fr.size(); ++k) worstNull = std::max (worstNull, dbOf (ao[k] / ai[k]));
@@ -371,7 +372,7 @@ static void testFalseLearning()
                         { "A2 110 Hz, 5th partial 550.7 (50 Hz mains, k11 550)", 50.0, { note (110.0, 0.1) }, true },
                         { "E5 with 5 Hz vibrato +-0.4 % (60 Hz mains)", 60.0, { vib }, false },
                         { "a bend 640 -> 665 Hz through 660 (60 Hz mains)", 60.0, { bend }, false },
-                        { "an E major chord, six notes (60 Hz mains)", 60.0, chord, false } };
+                        { "an E major chord, six notes (60 Hz mains)", 60.0, chord, true } };
     for (const C& c : cases)
     {
         std::vector<float> clean ((std::size_t) (12.0 * fs), 0.0f);
@@ -390,14 +391,23 @@ static void testFalseLearning()
             else if (t < 11.0) dev = std::max (dev, std::fabs (tel.f[i] - fOn));
         }
         const double err = rmsDiffDb (y, yc, (std::int64_t) (3.0 * fs), (std::int64_t) (11.0 * fs));
-        double worstP = 0.0;
+        double worstP = 0.0, worstAbs = 0.0, worstTheory = 0.0;
         if (c.steady)
         {
             std::vector<double> fr;
-            for (int p = 1; p <= 6; ++p) fr.push_back (c.notes[0].partialHz (p));
+            for (const Note& nn : c.notes) for (int p = 1; p <= 6; ++p) fr.push_back (nn.partialHz (p));
             const auto a = fitAmps (y, (std::int64_t) (7.0 * fs), (std::int64_t) (3.5 * fs), fr, fs);
             const auto b = fitAmps (yc, (std::int64_t) (7.0 * fs), (std::int64_t) (3.5 * fs), fr, fs);
-            for (std::size_t p = 0; p < fr.size(); ++p) worstP = std::max (worstP, std::fabs (dbOf (a[p] / b[p])));
+            const auto u = fitAmps (clean, (std::int64_t) (7.0 * fs), (std::int64_t) (3.5 * fs), fr, fs);
+            for (std::size_t p = 0; p < fr.size(); ++p)
+            {
+                worstP = std::max (worstP, std::fabs (dbOf (a[p] / b[p])));
+                // T1, in absolute terms: against the UNTOUCHED note — what a 0.5 Hz comb at the mains must do
+                // (the exact transfer), and never more than 1 dB where that transfer says less than 0.8
+                const double vsNote = dbOf (a[p] / u[p]), th = exactGainDb (fr[p], c.mains, 24, 0.5, fs);
+                worstTheory = std::max (worstTheory, std::fabs (vsNote - th));
+                if (th > -0.8) worstAbs = std::max (worstAbs, -vsNote);
+            }
         }
         std::printf ("      %-52s tracker moved %.5f Hz; out - clean %.1f dB re clean%s\n", c.name, dev, err,
                      c.steady ? (", worst partial " + fmt (worstP, 3) + " dB").c_str() : "");
@@ -405,6 +415,8 @@ static void testFalseLearning()
         ok (dev <= 0.005, std::string (c.name) + ": the tracker held through the note (moved " + fmt (dev, 5) + " Hz, bound 0.005)");
         ok (err <= -40.0, std::string (c.name) + ": output - clean pass " + fmt (err, 1) + " dB re the clean pass");
         if (c.steady) ok (worstP <= 1.0, std::string (c.name) + ": every partial within 1 dB of the clean pass (" + fmt (worstP, 3) + ")");
+        if (c.steady) ok (worstAbs <= 1.0 && worstTheory <= 0.2, std::string (c.name) + ": vs the untouched note, every partial is what the 0.5 Hz comb's transfer says (worst "
+                                                                 + fmt (worstTheory, 3) + " dB off it) and loses <= 1 dB where it should (" + fmt (worstAbs, 3) + ")");
     }
 }
 
@@ -425,7 +437,9 @@ static void testPlucks()
         std::vector<double> onsets;
         for (int i = 0; i < 12; ++i)
         {
-            Note n; n.f0 = fr[i % 4]; n.amp = 0.1; n.start = 3.0 + 0.5 * i; n.tau = 1.0; n.attack = attack; n.release = 0.0; n.partials = partials;
+            Note n; n.f0 = fr[i % 4]; n.start = 3.0 + 0.5 * i + (double) ((i * 37) % 64) / fs;   // T3: off the grid
+            n.amp = 0.1 * (0.3 + 0.7 * (double) ((i * 7) % 5) / 4.0); n.ph0 = 0.9 * i;            // varied levels, phases
+            n.tau = 1.0; n.attack = attack; n.release = 0.0; n.partials = partials;
             n.dur = 10.0 - n.start;
             addNote (clean, n, fs);
             onsets.push_back (n.start);
@@ -585,6 +599,16 @@ static void testLearnHumOnly()
         const auto st = h.learnStatus();
         const auto r = h.endLearn (true);
         const std::string tag = warm ? "warm (3 s of hum first)" : "cold (learn from the first sample)";
+        {   // T2: the report against the test's own measurements
+            const std::int64_t w0 = (std::int64_t) (pre * fs) + std::llround (r.settledAtMs * 1e-3 * fs), w1 = (std::int64_t) ((pre + len) * fs);
+            double pk = 0.0; for (std::int64_t i = w0; i < w1; ++i) pk = std::max (pk, (double) std::fabs (x[(std::size_t) i]));
+            double hp = 0.0; for (int k = 1; k <= 24; ++k) hp += (hs.a1 / k) * (hs.a1 / k);
+            const double hum = 10.0 * std::log10 (hp);
+            ok (std::fabs (dbOf (pk) - r.floorAfterDb) < 0.01, tag + ": floorAfterDb = the peak |out| the test measures over the window (" + fmt (dbOf (pk), 2) + ")");
+            ok (warm ? std::fabs (r.settledAtMs - 1000.0) < 0.5 : (r.settledAtMs > 1700.0 && r.settledAtMs < 1850.0),
+                tag + ": settledAtMs " + fmt (r.settledAtMs, 1) + " ms = the stated timeline (" + (warm ? "1.0 s" : "arm + 0.75 s, the cold arm at ~1.0 s") + ")");
+            ok (std::fabs (r.humDb - hum) < 0.1, tag + ": humDb " + fmt (r.humDb, 2) + " = the fixture's " + fmt (hum, 2) + " dB");
+        }
         std::printf ("      %s: mains %d, %.4f Hz, hum %.1f dB, k1 %.1f dB, floor %.1f dBFS from %.0f ms, locked %d\n", tag.c_str(),
                      r.mains == dh::Mains::Hz60 ? 60 : (r.mains == dh::Mains::Hz50 ? 50 : 0), r.hz, r.humDb, r.harmonicDb[0],
                      r.floorAfterDb, r.settledAtMs, (int) h.locked());
@@ -684,6 +708,7 @@ static void testQuietAdmitsNoNote()
         const double d = dbOf (fitAmp (y, S, W, n.f0, fs) / fitAmp (yc, S, W, n.f0, fs)), raw = dbOf (fitAmp (y, S, W, n.f0, fs) / fitAmp (clean, S, W, n.f0, fs));
         std::printf ("      C1: F4 at -40 dBFS under -30 dBFS hum: %.2f dB vs the clean pass, %.2f dB vs the untouched note\n", d, raw);
         ok (std::fabs (d) <= 0.5, "C1: the soft note is treated as the 0.5 Hz notch treats it (" + fmt (d, 2) + " dB vs the clean pass)");
+        ok (std::fabs (raw) <= 1.0, "C1: and loses <= 1 dB against the untouched note (" + fmt (raw, 2) + " dB)");
     }
     {   // C2: G1 49.0 Hz held 8 s at -20 dBFS on 50 Hz mains (hum -40 dBFS)
         std::vector<float> clean ((std::size_t) (12.0 * fs), 0.0f);

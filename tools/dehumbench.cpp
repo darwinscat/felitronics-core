@@ -3,7 +3,8 @@
 //
 // dehumbench — CPU of dehum::HumRemover<64> per 64-frame block, stereo, 24 harmonics, by path: playing (hum +
 // plucks, the playing width), quiet (hum only: learn width, FLL, detector), learning (a LEARN running),
-// listening (Auto with no hum: the detector alone, output untouched) and digital silence. Target: <= 0.5 %
+// listening (Auto with no hum: the detector alone, output untouched), digital silence, and switching (the
+// mode flips 50 <-> 60 every 0.25 s: ramps and re-arms). Target: <= 0.5 %
 // of a core at 48 kHz. Dev tool (top-level builds only): build Release, run manually; wall-clock numbers,
 // best of five passes over 20 s of audio — read them as orders of magnitude between runs.
 #include <felitronics/dehum/HumRemover.h>
@@ -17,7 +18,7 @@
 
 namespace dh = felitronics::dehum;
 
-enum class Path { Playing, Quiet, Learning, Listening, Silence };
+enum class Path { Playing, Quiet, Learning, Listening, Silence, Switching };
 
 static void fill (std::vector<float>& l, std::vector<float>& r, double fs, Path path)
 {
@@ -59,6 +60,7 @@ static void bench (double fs, Path path, const char* name)
         const auto t0 = std::chrono::steady_clock::now();
         for (int o = 0; o < N; o += B)
         {
+            if (path == Path::Switching && o % 12032 == 0) { p.mains = (o / 12032) % 2 ? dh::Mains::Hz60 : dh::Mains::Hz50; h.setParams (p); }
             float* io[2] { l.data() + o, r.data() + o };
             if (! h.process (io, 2, std::min (B, N - o))) { std::printf ("process refused\n"); return; }
         }
@@ -81,6 +83,7 @@ int main()
         bench (fs, Path::Learning,  "learning");
         bench (fs, Path::Listening, "listening");
         bench (fs, Path::Silence,   "silence");
+        bench (fs, Path::Switching, "switching");
     }
     return 0;
 }

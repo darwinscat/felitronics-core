@@ -266,6 +266,13 @@ static void testImpulseRing()
     ok (dbOf (worstW) <= -80.0, "the impulse moves each harmonic's weight by <= -80 dB (" + std::to_string (dbOf (worstW)) + ")");
     ok (dbOf (worstA) <= -80.0, "the emitted ring per harmonic is <= -80 dB (" + std::to_string (dbOf (worstA)) + ")");
     ok (std::fabs (dbOf (worstW) - dbOf (mu)) < 0.1, "and the kick is mu, as the loop says");
+    {   // T6: the ring decays with tau = 1/(pi·BW): k1's weight perturbation after ~1 s against its kick
+        const auto wa = a.weight (0, 1), wb = b.weight (0, 1);
+        const double end = std::hypot (wb.re - wa.re, wb.im - wa.im) / (double) before;
+        const double t = (double) (L - n0 - 1) / fs, tauMeas = t / std::log (mu / end), tau = 1.0 / (kPi * bw);
+        std::printf ("      ring decay: tau measured %.4f s, 1/(pi·BW) = %.4f s\n", tauMeas, tau);
+        ok (std::fabs (tauMeas / tau - 1.0) <= 0.03, "the ring decays with tau = 1/(pi·BW) within 3 % (" + std::to_string (tauMeas) + " s)");
+    }
 }
 
 int main()

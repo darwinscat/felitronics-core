@@ -404,21 +404,21 @@ static void testModes()
     felitronics::test::run (run2 (a, l2, r2, 0, (int) l2.size()));
     felitronics::test::run (run2 (twin, lt, rt, 0, (int) lt.size()));
 
-    core::LinearSmoother g { 1.0f };
-    g.reset (kFs, HR::kRampSeconds);
-    g.setTargetValue (0.0f);
-    const int ramp = (int) std::floor (HR::kRampSeconds * kFs);
-    double worst = 0.0, corrPeak = 0.0;
+    const int ramp = 960;                                  // T4: 20 ms at 48 kHz, written out — not the production smoother
+    double worst = 0.0, corrPeak = 0.0, lateMax = 0.0;
     for (int i = 0; i < ramp; ++i)
     {
-        const double gi = (double) g.getNextValue();
+        const double gi = 1.0 - (double) (i + 1) / 960.0;  // decrement-then-step: the last of 960 lands on 0
         const double c = (double) in[(std::size_t) i] - (double) l2[(std::size_t) i];
         const double ct = (double) in[(std::size_t) i] - (double) lt[(std::size_t) i];
         worst = std::max (worst, std::fabs (c - gi * ct));
         corrPeak = std::max (corrPeak, std::fabs (ct));
+        if (i >= 900 && i < 959) lateMax = std::max (lateMax, std::fabs (c));
     }
+    const double cEnd = (double) in[(std::size_t) ramp - 1] - (double) l2[(std::size_t) ramp - 1];
+    ok (std::fabs (cEnd) <= 1e-6 && lateMax > 1e-6, "the ramp is 960 samples long: the correction is gone on the 960th, not before");
     ok (corrPeak > 1e-3, "precondition: there was a correction to ramp (" + std::to_string (corrPeak) + ")");
-    ok (worst <= 1e-6, "50 -> Off: the correction is the twin's times the 20 ms linear ramp (max dev " + std::to_string (worst) + ")");
+    ok (worst <= 2e-5, "50 -> Off: the correction is the twin's times the 20 ms linear ramp (max dev " + std::to_string (worst) + ")");
     bool dry = true;
     for (int i = ramp + 64; i < (int) in.size(); ++i) dry = dry && core::sameBits (l2[(std::size_t) i], in[(std::size_t) i]);
     ok (dry && ! a.running(), "after the ramp and the next grid boundary: dry, bit-exact");
@@ -642,6 +642,27 @@ static void testBlackEdges()
     }
 }
 
+// T6: SUBNORMAL INPUT (FTZ off on the deb row): a second of ±1e-40 samples after a hum — finite output, the
+// state never in the subnormal band, and the hum cancelled again after it. Its cost is the input's own.
+static void testSubnormalInput()
+{
+    group ("subnormal input samples: finite, no subnormal state, the hum cancelled after");
+    HR h; h.setParams (params (dh::Mains::Hz50, 3.0)); felitronics::test::run (h.prepare (kFs, 512, 1));
+    Hum hum; hum.seed (91u);
+    const int A = 2 * 48000, B = A + 48000, N = B + 2 * 48000;
+    std::vector<float> x ((std::size_t) N);
+    Lcg r { 5u };
+    for (int i = 0; i < N; ++i) x[(std::size_t) i] = (i >= A && i < B) ? (r.bipolar() > 0.0f ? 1e-40f : -1e-40f) : (float) hum.at (i);
+    const std::vector<float> in = x;
+    feed64 (h, x);
+    bool finite = true; for (float v : x) finite = finite && std::isfinite (v);
+    bool band = true;
+    for (int k = 1; k <= 24; ++k) { const auto w = h.weight (0, k); for (double v : { w.re, w.im }) band = band && (v == 0.0 || std::fabs (v) >= 1e-15) && std::fpclassify (v) != FP_SUBNORMAL; }
+    const double nul = worstNull (x, in, B + 24000, 48000);
+    ok (finite && band, "a second of subnormal input: output finite, every weight 0 or >= 1e-15");
+    ok (nul <= -50.0, "and the hum is cancelled again after it (" + std::to_string (nul) + " dB)");
+}
+
 int main()
 {
     std::printf ("felitronics::dehum — HumRemover as a stage\n");
@@ -657,5 +678,6 @@ int main()
     testCancelledLearnKeepsPhase();
     testFrequencyChangeOnTheGrid();
     testBlackEdges();
+    testSubnormalInput();
     return felitronics::test::report();
 }

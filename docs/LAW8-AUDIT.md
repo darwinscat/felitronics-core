@@ -229,7 +229,11 @@ black holds them — and on `core::StateGrid` every weight is flushed (`|w| < 1e
 call. Measured: 60 s of ±1e-20 noise after a hum leaves every weight at 0 or ≥ 1e-15 after every
 64-aligned call, and removing the flush puts them in the band below. (2) Each increment is a float-rounded
 product added to a double, so with float inputs it cannot be subnormal in double. (3) The smoothed powers
-hold through an all-zero period (black or a pause), so they never decay toward zero on silence. Tested in
+hold through an all-zero period (black or a pause), so they never decay toward zero on silence; the floors
+(input and residual) are minima over hop minima — not recursive — and the black fade is an integer counter.
+A smoothed power is seeded from a settled level, never from one 64-sample period. Subnormal INPUT samples
+cost the input's own arithmetic (measured +52 % per block on `deb` with FTZ off, by the review's probe) and
+leave no subnormal state: a second of ±1e-40 input leaves every weight at 0 or ≥ 1e-15. Tested in
 `modules/dehum/tests/HumRemoverContractTests.cpp` (the minute of black and of quiet, the poison and burst
 cases) with FTZ off on the `deb` row.
 
