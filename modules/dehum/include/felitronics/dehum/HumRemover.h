@@ -137,14 +137,18 @@ namespace felitronics::dehum
 //
 // SILENCE, POISON, STOPPED CHANNELS:
 //   * An exact-zero input sample ADAPTS NOTHING and feeds no detector — digital zero is the absence of a
-//     measurement. After kBlackRun (64) consecutive exact zeros the correction is MUTED too, so digital black
-//     in is bit-exact black out; weights, floor and decisions hold. The first 63 zeros still carry the
-//     correction (the anti-hum of the stream that just stopped), then it cuts.
+//     measurement. Over a run of exact zeros the correction FADES OUT (a raised cosine, one step per zero,
+//     64 steps), so from zero #64 on it is MUTED and digital black in is bit-exact black out; weights, floor
+//     and decisions hold. On the way back it fades in the same way over the first 64 real samples (from
+//     wherever a shorter run left it). Neither edge steps: the correction's second difference stays under
+//     −60 dBFS on a −30 dBFS hum at a region end and a region start, abrupt or faded (measured ≈ −70).
+//     Price: the first 64 samples after black are cancelled only partly.
 //   * A non-finite input sample passes through untouched and adapts / feeds nothing. Law 8/8a: on the grid
 //     each weight is flushed (|w| < 1e-15 → 0), healed (non-finite → 0) and bounded (beyond kWeightCeiling,
 //     +60 dBFS, it is not a hum model → 0); the non-finite half also runs at the end of every call.
 //   * Law 11a: a channel at index >= nch STOPPED for that call. Its weights are a MODEL of the hum on that
-//     input, not audio memory, so they are KEPT; its zero-run counter advances (it is receiving silence).
+//     input, not audio memory, so they are KEPT; its zero-run counter and black fade advance (it is receiving
+//     silence), so it returns faded in, as from any black.
 //   * Law 11c: a clock-only call (nch == 0) is digital silence for every shared clock — the grid, the mains
 //     and bin phases, the hop and window counters, the ramp and a pending re-arm advance exactly as through
 //     n zeros at a live width; weights and detector statistics hold, as they do through zeros.
@@ -259,6 +263,9 @@ public:
         activeSamples_ = (int) std::llround (kActiveSeconds * fs_);
         holdSamples_   = (int) std::llround (kHoldSeconds * fs_);
         settlePeriods_ = (int) std::llround (3.0 * kSmoothSeconds * fs_ / (double) kPeriod) + 1;
+        for (int i = 0; i <= kBlackRun; ++i)                  // the black fade: a raised cosine over 64 samples
+            blackFade_[i] = 0.5 - 0.5 * core::det::cos (core::kPi * (double) i / (double) kBlackRun);
+        blackFade_[0] = 0.0; blackFade_[kBlackRun] = 1.0;
         for (int b = 0; b < 4; ++b) binInc_[b] = incFor (kBinHz[b]);
         prepared_ = true;
         reset();
@@ -277,7 +284,7 @@ public:
         grid_.reset();
         anchorPhase_ = 0;
         for (int b = 0; b < 4; ++b) binAnchor_[b] = 0;
-        for (int c = 0; c < core::kMaxChannels; ++c) zeros_[c] = 0;
+        for (int c = 0; c < core::kMaxChannels; ++c) { zeros_[c] = 0; blackGain_[c] = kBlackRun; }
         learning_ = false; swapPhase_ = 0; learnFamily_ = 0; bkLive_ = false; freqPending_ = false;
         binsValid_ = false; binStep_ = 0;                      // every lazily-anchored phasor re-anchors (law 11a)
         resetDetector();
@@ -316,7 +323,10 @@ public:
 
         // Law 11a: every plane at index >= nch stopped for these n samples and is receiving digital silence.
         for (int c = nch; c < maxCh_; ++c)
-            zeros_[c] = (n >= kBlackRun - zeros_[c]) ? kBlackRun : zeros_[c] + n;
+        {
+            zeros_[c]     = (n >= kBlackRun - zeros_[c]) ? kBlackRun : zeros_[c] + n;
+            blackGain_[c] = (n >= blackGain_[c]) ? 0 : blackGain_[c] - n;    // its correction faded with the zeros
+        }
 
         for (int done = 0; done < n;)
         {
@@ -719,15 +729,20 @@ private:
                 if (zero)
                 {
                     if (zeros_[c] < kBlackRun) ++zeros_[c];
-                    if (zeros_[c] >= kBlackRun) continue;             // digital black: muted, weights hold
+                    if (blackGain_[c] > 0) --blackGain_[c];           // the correction fades out over the run...
+                    if (zeros_[c] >= kBlackRun) continue;             // ...and from zero #64: muted, bit-exact
                 }
                 else
+                {
                     zeros_[c] = 0;
-                if (! std::isfinite (x)) continue;                   // passes untouched, adapts nothing
+                    if (! std::isfinite (x)) continue;               // passes untouched, adapts nothing
+                    if (blackGain_[c] < kBlackRun) ++blackGain_[c];   // back from (partial) black: fades in
+                }
 
                 syncRefs (p0 + i);
                 const double corr = correction (c);
-                const double gc   = g * corr;
+                const double gb   = g * blackFade_[blackGain_[c]];
+                const double gc   = gb * corr;
                 s = (core::Sample) ((double) x - gc);
                 if (floorWindow) { const double a = std::fabs ((double) s); if (a > peakOut_) peakOut_ = a; }
                 if (zero) continue;                                  // a zero is no measurement
@@ -1039,6 +1054,8 @@ private:
     double rRe_[MaxHarmonics] {}, rIm_[MaxHarmonics] {};
     double rotRe_[MaxHarmonics] {}, rotIm_[MaxHarmonics] {};
     int    zeros_[core::kMaxChannels] {};
+    int    blackGain_[core::kMaxChannels] {};   // 0..kBlackRun: the black fade's position per channel
+    double blackFade_[kBlackRun + 1] {};
 
     // ---- detector ----
     double hopRe_[core::kMaxChannels][4] {}, hopIm_[core::kMaxChannels][4] {};

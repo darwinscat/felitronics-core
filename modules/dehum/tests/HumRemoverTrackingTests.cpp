@@ -430,6 +430,9 @@ static void testPlucks()
             addNote (clean, n, fs);
             onsets.push_back (n.start);
         }
+        // a -200 dBFS floor under the clean pass: its input must not be digital black before the first pluck,
+        // or its correction fades in from black there and the reference itself moves (the stage, fed hum, never is)
+        { Lcg r { 3u }; for (float& v : clean) v += 1e-10f * r.bipolar(); }
         std::vector<float> x = clean;
         HumSpec hs; hs.f0 = mains; hs.a1 = 0.01; hs.seed = 14u;
         addHum (x, hs, fs);

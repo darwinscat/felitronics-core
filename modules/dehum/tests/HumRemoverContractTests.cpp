@@ -200,8 +200,8 @@ static void testStoppedChannelKeepsModel()
     for (int i = 0; i < R; ++i) { rl[(std::size_t) i] = (float) h1.at (144000 + i); rr[(std::size_t) i] = rl[(std::size_t) i]; }
     const std::vector<float> rin = rr;
     felitronics::test::run (run2 (h, rl, rr, 0, R));
-    const double nul = worstNull (rr, rin, 0, R);
-    ok (nul <= -50.0, "and on return it cancels from the first sample: worst harmonic " + std::to_string (nul) + " dB over the first 100 ms");
+    const double nul = worstNull (rr, rin, HR::kBlackRun, R - HR::kBlackRun);
+    ok (nul <= -50.0, "and on return it cancels at once (after the 64-sample fade-in from black): worst harmonic " + std::to_string (nul) + " dB over 100 ms");
 }
 
 //------------------------------------------------------------------------------------------------------
@@ -290,8 +290,8 @@ static void testDigitalBlack()
     for (int i = 0; i < 4800; ++i) { bl[(std::size_t) i] = (float) h0.at (6 * 48000 + Z + i); br[(std::size_t) i] = (float) h1.at (6 * 48000 + Z + i); }
     const std::vector<float> bin = bl;
     felitronics::test::run (run2 (h, bl, br, 0, 4800));
-    const double nul = worstNull (bl, bin, 0, 4800);
-    ok (nul <= -50.0, "the hum is cancelled from its first sample back: worst harmonic " + std::to_string (nul) + " dB over 100 ms");
+    const double nul = worstNull (bl, bin, HR::kBlackRun, 4800 - HR::kBlackRun);
+    ok (nul <= -50.0, "the hum is cancelled at once on return (after the 64-sample fade-in): worst harmonic " + std::to_string (nul) + " dB over 100 ms");
 }
 
 //------------------------------------------------------------------------------------------------------
@@ -592,6 +592,52 @@ static void testFrequencyChangeOnTheGrid()
     ok (dbOf (m) <= -80.0, "no step: the correction's second difference stays at " + std::to_string (dbOf (m)) + " dBFS");
 }
 
+//------------------------------------------------------------------------------------------------------
+// G3 — DIGITAL BLACK WITHOUT A STEP. A region that ends (the input cuts to exact zeros) and one that starts
+// again after black, at arbitrary sample offsets, abrupt and faded: the correction (in - out) has no step —
+// its second difference stays under -60 dBFS (the hum's own curvature is ≈ -68 dBFS). Black from zero #64
+// stays bit-exact.
+static void testBlackEdges()
+{
+    group ("digital black without a step: region end and region start at arbitrary offsets");
+    for (int v = 0; v < 4; ++v)
+    {
+        const int end = 3 * 48000 + 37 + 11 * v, start = end + 4800 + 5 * v;
+        const bool fadedEnd = v >= 2, fadedStart = (v % 2) == 1;
+        Hum hum; hum.seed (61u + (std::uint32_t) v);
+        std::vector<float> x ((std::size_t) (start + 9600));
+        for (int i = 0; i < (int) x.size(); ++i)
+        {
+            double g = 1.0;
+            if (i >= end && i < start) g = 0.0;
+            else if (fadedEnd && i < end && i >= end - 480) g = (double) (end - i) / 480.0;          // a 10 ms fade-out
+            else if (fadedStart && i >= start && i < start + 480) g = (double) (i - start) / 480.0;  // a 10 ms fade-in
+            x[(std::size_t) i] = (float) (g * hum.at (i));
+        }
+        const std::vector<float> in = x;
+        HR h; h.setParams (params (dh::Mains::Hz50, 3.0)); felitronics::test::run (h.prepare (kFs, 512, 1));
+        feed64 (h, x);
+        auto stepDb = [&] (int from, int to)
+        {
+            double m = 0.0;
+            for (int i = from; i < to; ++i)
+            {
+                const double c0 = (double) in[(std::size_t) i] - x[(std::size_t) i], c1 = (double) in[(std::size_t) i - 1] - x[(std::size_t) i - 1], c2 = (double) in[(std::size_t) i - 2] - x[(std::size_t) i - 2];
+                m = std::max (m, std::fabs (c0 - 2.0 * c1 + c2));
+            }
+            return dbOf (m);
+        };
+        const double sEnd = stepDb (end - 600, end + 200), sStart = stepDb (start - 100, start + 600);
+        bool black = true;
+        for (int i = end + HR::kBlackRun - 1; i < start; ++i) black = black && core::sameBits (x[(std::size_t) i], in[(std::size_t) i]);
+        const std::string tag = std::string (fadedEnd ? "faded" : "abrupt") + " end at +" + std::to_string (end % 64) + ", "
+                              + (fadedStart ? "faded" : "abrupt") + " start at +" + std::to_string (start % 64);
+        std::printf ("      %s: second difference of the correction %.1f dBFS at the end, %.1f dBFS at the start\n", tag.c_str(), sEnd, sStart);
+        ok (sEnd <= -60.0 && sStart <= -60.0, tag + ": no step at either edge");
+        ok (black, tag + ": black from zero #64 is bit-exact");
+    }
+}
+
 int main()
 {
     std::printf ("felitronics::dehum — HumRemover as a stage\n");
@@ -606,5 +652,6 @@ int main()
     testRestartIsFresh();
     testCancelledLearnKeepsPhase();
     testFrequencyChangeOnTheGrid();
+    testBlackEdges();
     return felitronics::test::report();
 }
