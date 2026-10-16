@@ -35,7 +35,7 @@ Net effect: long-convolution cost is fine at small host blocks but **grows patho
 2048 and larger** — the exact failure OrbitCab's IR cab hit before it was moved off the core convolver
 onto `juce::dsp::Convolution`.
 
-There are therefore **two independent "тормозяки"**, and a real fix needs **both** addressed.
+There are therefore **two independent bottlenecks**, and a real fix needs **both** addressed.
 
 ---
 
@@ -187,7 +187,7 @@ bottleneck — FFT/partitioning would not help (filters are far too short). Opti
 A fix is accepted **only when BOTH hold** — output-match alone is **not** sufficient:
 
 1. **Correctness (necessary, not sufficient).** The existing reference-NULL property tests stay green
-   (ULP-bounded vs a trusted convolver); bit-for-bit behaviour unchanged. *A null match ("совпадение")
+   (ULP-bounded vs a trusted convolver); bit-for-bit behaviour unchanged. *A null match
    proves nothing about speed.*
 
 2. **Comparable performance at scale — the real bar.** Measured RT cost at host blocks **{2048, 4096,
