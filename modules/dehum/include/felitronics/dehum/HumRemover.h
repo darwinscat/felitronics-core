@@ -39,7 +39,13 @@ namespace felitronics::dehum
 // touches it. Switching μ moves no weight — the correction, and so the output, is continuous through the
 // switch; only the rate of learning changes. QUIET is three conditions together:
 //   (a) the last 0.5 s window was hum: its broadband power is within 12 dB of the strongest hum family's
-//       Goertzel power (bins {50, 100} and {60, 120} Hz, summed over channels as POWERS);
+//       Goertzel power (bins {50, 100} and {60, 120} Hz, summed over channels as POWERS) — OR, narrowband, for
+//       hiss that carries most of the broadband power (a humbucker's hum is ≈ 4 dB over its hiss broadband): the
+//       winning family's fundamental is a LINE, its bin 10 dB over the mean of two neighbour bins ±6 Hz (on the
+//       rectangular window's nulls for a line at the bin), AT the mains bin (its phase advance since the last
+//       window within 0.25 Hz of nominal). A held note's partial near a bin is off it (G1 49 Hz, B1 61.7 Hz) or
+//       lights the neighbours too; a note far from the bins leaves the line clean but stays RESIDUAL, so (b), the
+//       FLL's `explained` and the triggers still see it;
 //   (b) the canceller's RESIDUAL (20 ms-smoothed) is within 12 dB of the RESIDUAL FLOOR — the minimum of
 //       that power over the last 4 s (sixteen 0.25 s hop minima), which may RISE by at most 0.5 dB per hop
 //       (2 dB/s) and restarts on every re-arm, zeroing or restore. After cancellation true quiet is the
@@ -74,7 +80,10 @@ namespace felitronics::dehum
 //   * COARSE frequency: the winning family's stronger bin, phase advance between windows one hop apart
 //     (±2 Hz unambiguous), taken only between two quiet windows and only for a family that wins by 6 dB. Auto starts the canceller at
 //     the MEDIAN of the last (up to four) consecutive estimates; a fixed mode jumps to it once, the first time it exists
-//     ("acquisition"). On a real input hiss in the bins scatters single estimates by ±0.02–0.1 Hz.
+//     ("acquisition") — but only from a CLEAN set: two or more in a row agreeing within 0.05 Hz (three standard
+//     errors). On a real input hiss in the bins scatters single estimates by ±0.02–0.1 Hz, and a disturbed
+//     start (a knock, a palm on the strings) throws one off by tenths: such a set is not acquired (the canceller
+//     runs at nominal) until a clean one comes, or the 0.05 Hz agreement gate would hold the FLL off for good.
 //   * FINE (an FLL, only in quiet, and only while the running family is the one the last window's bins
 //     heard win, while the canceller explains the input, and not in the first hop after fresh weights. EXPLAINS:
 //     the broadband residual 15 dB under the input (a note anywhere holds it) — or, where hiss makes that
@@ -197,8 +206,10 @@ namespace felitronics::dehum
 //
 // RT-safe: no allocation, lock, IO or throw anywhere after construction — there is no heap at all. Footprint
 // sizeof(HumRemover): weights, their previous-period copy, the LEARN snapshot and the hop's weight record (five
-// sums), 11·kMaxChannels·MaxHarmonics doubles (88 KiB at 64, 33 KiB at 24), plus ≈ 7 KiB of detector state and
-// references.
+// sums), 11·kMaxChannels·MaxHarmonics doubles (88 KiB at 64, 33 KiB at 24), plus ≈ 9 KiB of detector state (eight
+// bins: the four family bins and two noise neighbours per fundamental) and references. The neighbour bins cost
+// ≈ 0.35 µs per 64-frame mono block (Apple M5 Pro, 24 harmonics: 2.46 → 2.83 µs; at 128 harmonics within the
+// noise of ≈ 11 µs).
 //==============================================================================
 
 enum class Mains { Off, Hz50, Hz60, Auto };
@@ -308,7 +319,7 @@ public:
         holdSamples_   = (int) std::llround (kHoldSeconds * fs_);
         settlePeriods_ = (int) std::llround (3.0 * kSmoothSeconds * fs_ / (double) kPeriod) + 1;
         pkDecay64_     = core::det::exp2 (-2.0 * (double) kPeriod / (0.040 * fs_));   // peak reference: -6 dB per 40 ms
-        for (int b = 0; b < 4; ++b) binInc_[b] = incFor (kBinHz[b]);
+        for (int b = 0; b < kBins; ++b) binInc_[b] = incFor (kBinHz[b]);
         prepared_ = true;
         reset();
         return true;
@@ -325,7 +336,7 @@ public:
     {
         grid_.reset();
         anchorPhase_ = 0;
-        for (int b = 0; b < 4; ++b) binAnchor_[b] = 0;
+        for (int b = 0; b < kBins; ++b) binAnchor_[b] = 0;
         for (int c = 0; c < core::kMaxChannels; ++c) { zeros_[c] = 0; bpos_[c] = (double) kBlackRun; bvel_[c] = 0.0; }
         learning_ = false; swapPhase_ = 0; learnFamily_ = 0; bkLive_ = false; freqPending_ = false;
         binsValid_ = false; binStep_ = 0;                      // every lazily-anchored phasor re-anchors (law 11a)
@@ -508,7 +519,10 @@ public:
 
 private:
     static constexpr int    kPeriod  = core::StateGrid::kPeriod;
-    static constexpr double kBinHz[4] = { 50.0, 100.0, 60.0, 120.0 };
+    static constexpr int    kBins    = 8;   // the family bins, then each fundamental's two noise neighbours
+    static constexpr double kBinHz[kBins] = { 50.0, 100.0, 60.0, 120.0, 44.0, 56.0, 54.0, 66.0 };
+    static constexpr double kLineRatio = 10.0;   // 10 dB: a fundamental's bin over its neighbours' mean is a line
+    static constexpr double kLineHz    = 0.25;   // ...and at the mains bin: its phase advance within this of nominal
     static constexpr double kNone    = std::numeric_limits<double>::max();
 
     static Mains sanitizeMains (Mains m) noexcept
@@ -617,7 +631,7 @@ private:
         acquired_ = false;
         double f  = (double) family_;
         const int s = family_ == 60 ? 1 : 0;
-        if (running_ && params_.lockRangeHz > 0.0 && coarseValid_[s]) { f = clampToLock (coarseAvg (s)); acquired_ = true; }
+        if (running_ && params_.lockRangeHz > 0.0 && coarseValid_[s] && coarseClean (s)) { f = clampToLock (coarseAvg (s)); acquired_ = true; }
         rotsValid_ = false; freqPending_ = false; glide_ = false; lastCoarseValid_ = false; lastCoarse2Valid_ = false; prevModel_ = 0.0;
         setFrequency (running_ ? f : 0.0);
         for (int c = 0; c < core::kMaxChannels; ++c)
@@ -724,6 +738,11 @@ private:
         return t < 0.05 ? 0.05 : (t > 0.25 ? 0.25 : t);
     }
 
+    // Acquisition jumps f̂ only to a CLEAN set of estimates: at least two in a row, agreeing within the base
+    // tolerance (three standard errors under 0.05 Hz). A short or disturbed quiet waits for a clean one; the
+    // canceller runs at nominal meanwhile.
+    bool coarseClean (int s) const noexcept { return cRingN_[s] >= 2 && ! (coarseTolerance (s) > 0.05); }
+
     // After cancellation true quiet is the noise floor; a note is not. Within 12 dB of the residual floor — or
     // 90 dB under the input floor, where the residual is arithmetic, not signal: a noiseless null's floor is
     // whatever dip the arithmetic last made, and the residual then sits 20+ dB over it for good (R2's buzz)
@@ -791,7 +810,7 @@ private:
         for (int c = 0; c < core::kMaxChannels; ++c) { fedHop_[c] = false; fedPrevHop_[c] = false; fedWin_[c] = false; }
         resetResidualFloor();
         for (int c = 0; c < core::kMaxChannels; ++c)
-            for (int b = 0; b < 4; ++b)
+            for (int b = 0; b < kBins; ++b)
             { hopRe_[c][b] = 0.0; hopIm_[c][b] = 0.0; prevHopRe_[c][b] = 0.0; prevHopIm_[c][b] = 0.0; winRe_[c][b] = 0.0; winIm_[c][b] = 0.0; }
         hopPow_ = 0.0; prevHopPow_ = 0.0; periodSum_ = 0.0;
         hopCount_ = 0; hopsSeen_ = 0;
@@ -826,7 +845,7 @@ private:
     {
         if (! binsValid_)
         {
-            for (int b = 0; b < 4; ++b)
+            for (int b = 0; b < kBins; ++b)
             {
                 detail::phasor (binAnchor_[b], bRe_[b], bIm_[b]);
                 detail::phasor (binInc_[b], bRotRe_[b], bRotIm_[b]);
@@ -835,7 +854,7 @@ private:
             binsValid_ = true;
         }
         for (; binStep_ < p; ++binStep_)
-            for (int b = 0; b < 4; ++b)
+            for (int b = 0; b < kBins; ++b)
                 rotate (bRe_[b], bIm_[b], bRotRe_[b], bRotIm_[b]);
     }
 
@@ -876,7 +895,7 @@ private:
             fedHop_[c] = true;                                 // this channel fed the detector in this hop
             if (! running_ && x2 > thr2_) hit_ = true;       // while the canceller runs, the residual's trigger rules
             syncBins (p);
-            for (int b = 0; b < 4; ++b)
+            for (int b = 0; b < kBins; ++b)
             {
                 const double a = xd * bRe_[b];
                 const double s = xd * bIm_[b];
@@ -969,7 +988,7 @@ private:
         const std::uint32_t P = (std::uint32_t) kPeriod;
         anchorPhase_ += P * inc_;                                   // exact, mod 2³²
         if (bkLive_) bkAnchor_ += P * bkInc_;                       // the LEARN snapshot's frame, at its own rate
-        for (int b = 0; b < 4; ++b) binAnchor_[b] += P * binInc_[b];
+        for (int b = 0; b < kBins; ++b) binAnchor_[b] += P * binInc_[b];
         refsValid_ = false;
         binsValid_ = false;
         if (detOn()) endPeriod();
@@ -1192,9 +1211,9 @@ private:
         if (hopsSeen_ >= 1)
         {
             const double nW = 2.0 * (double) (hopPeriods_ * kPeriod);
-            double pw[4] = { 0.0, 0.0, 0.0, 0.0 };
+            double pw[kBins] {};
             for (int c = 0; c < maxCh_; ++c)
-                for (int b = 0; b < 4; ++b)
+                for (int b = 0; b < kBins; ++b)
                 {
                     const double re = prevHopRe_[c][b] + hopRe_[c][b];
                     const double im = prevHopIm_[c][b] + hopIm_[c][b];
@@ -1210,9 +1229,37 @@ private:
             const double fam60 = (pw[2] + pw[3]) * norm;
             const double pm    = (prevHopPow_ + hopPow_) / nW;
             const double hum   = fam50 > fam60 ? fam50 : fam60;
-            const bool   quiet = pm > 0.0 && pm < kQuietRatio * hum;
-
             const bool wins[2] = { fam50 > kWinRatio * fam60, fam60 > kWinRatio * fam50 };
+            // (a) — the window was hum: its broadband power within 12 dB of the family's bins, OR (narrowband: hiss
+            // may carry most of the broadband power) the winning family's fundamental is a LINE — its bin 10 dB over
+            // its two neighbours ±6 Hz (on the rectangular window's nulls for a line at the bin) — AT the mains bin:
+            // its phase advance since the last window within 0.25 Hz of nominal. A note's partial near a bin is
+            // off it (G1 49 Hz, B1 61.7 Hz) or lights the neighbours too; a note elsewhere leaves the line clean but
+            // stays residual, so (b), the FLL's `explained` and the triggers still see it.
+            bool line = false;
+            for (int s = 0; s < 2 && prevWinValid_; ++s)
+            {
+                const double nb = 0.5 * (pw[4 + 2 * s] + pw[5 + 2 * s]);
+                if (! wins[s] || ! (pw[2 * s] > kLineRatio * nb)) continue;
+                double cr = 0.0, ci = 0.0;
+                for (int c = 0; c < maxCh_; ++c)
+                {
+                    const double a = nowRe_[c][2 * s] * winRe_[c][2 * s];
+                    const double d = nowIm_[c][2 * s] * winIm_[c][2 * s];
+                    const double e = nowIm_[c][2 * s] * winRe_[c][2 * s];
+                    const double f = nowRe_[c][2 * s] * winIm_[c][2 * s];
+                    const double r = a + d;
+                    const double q = e - f;
+                    cr += r;
+                    ci += q;
+                }
+                const double c2a = cr * cr;
+                const double c2b = ci * ci;
+                if (! (c2a + c2b > 0.0)) continue;
+                const double off = std::atan2 (ci, cr) / (2.0 * core::kPi * hopSec_);
+                if (std::fabs (off) <= kLineHz) line = true;
+            }
+            const bool   quiet = pm > 0.0 && (pm < kQuietRatio * hum || line);
             for (int s = 0; s < 2; ++s)                        // coarse frequency, per family, only where it is the hum
             {
                 coarseValid_[s] = false;
@@ -1304,7 +1351,7 @@ private:
                 const int cs = family_ == 60 ? 1 : 0;
                 coarseOk_ = running_ && coarseValid_[cs] && std::fabs (coarseAvg (cs) - fHat_) < coarseTolerance (cs);
             }
-            if (running_ && ! acquired_ && params_.lockRangeHz > 0.0 && coarseValid_[family_ == 60 ? 1 : 0])
+            if (running_ && ! acquired_ && params_.lockRangeHz > 0.0 && coarseValid_[family_ == 60 ? 1 : 0] && coarseClean (family_ == 60 ? 1 : 0))
             {
                 setFrequency (clampToLock (coarseAvg (family_ == 60 ? 1 : 0)));
                 acquired_ = true;
@@ -1313,7 +1360,7 @@ private:
             quietWin_ = quiet && trigFree;                     // a window that held a trigger is not quiet
             updateMotionFloor (running_ && quietWin_ && residualQuiet());
             for (int c = 0; c < maxCh_; ++c)
-                for (int b = 0; b < 4; ++b) { winRe_[c][b] = nowRe_[c][b]; winIm_[c][b] = nowIm_[c][b]; }
+                for (int b = 0; b < kBins; ++b) { winRe_[c][b] = nowRe_[c][b]; winIm_[c][b] = nowIm_[c][b]; }
             prevWinValid_ = true;
             prevWinQuiet_ = quiet;
         }
@@ -1361,7 +1408,7 @@ private:
         hitInHop_   = false;
         for (int c = 0; c < core::kMaxChannels; ++c) { fedPrevHop_[c] = fedHop_[c]; fedHop_[c] = false; }
         for (int c = 0; c < maxCh_; ++c)
-            for (int b = 0; b < 4; ++b)
+            for (int b = 0; b < kBins; ++b)
             { prevHopRe_[c][b] = hopRe_[c][b]; prevHopIm_[c][b] = hopIm_[c][b]; hopRe_[c][b] = 0.0; hopIm_[c][b] = 0.0; }
         prevHopPow_ = hopPow_;
         hopPow_     = 0.0;
@@ -1408,12 +1455,12 @@ private:
     bool   jfValid_ = false;
 
     // ---- detector ----
-    double hopRe_[core::kMaxChannels][4] {}, hopIm_[core::kMaxChannels][4] {};
-    double prevHopRe_[core::kMaxChannels][4] {}, prevHopIm_[core::kMaxChannels][4] {};
-    double winRe_[core::kMaxChannels][4] {}, winIm_[core::kMaxChannels][4] {};   // the previous window
-    double nowRe_[core::kMaxChannels][4] {}, nowIm_[core::kMaxChannels][4] {};   // scratch: this window
-    double bRe_[4] {}, bIm_[4] {}, bRotRe_[4] {}, bRotIm_[4] {};
-    std::uint32_t binInc_[4] {}, binAnchor_[4] {};
+    double hopRe_[core::kMaxChannels][kBins] {}, hopIm_[core::kMaxChannels][kBins] {};
+    double prevHopRe_[core::kMaxChannels][kBins] {}, prevHopIm_[core::kMaxChannels][kBins] {};
+    double winRe_[core::kMaxChannels][kBins] {}, winIm_[core::kMaxChannels][kBins] {};   // the previous window
+    double nowRe_[core::kMaxChannels][kBins] {}, nowIm_[core::kMaxChannels][kBins] {};   // scratch: this window
+    double bRe_[kBins] {}, bIm_[kBins] {}, bRotRe_[kBins] {}, bRotIm_[kBins] {};
+    std::uint32_t binInc_[kBins] {}, binAnchor_[kBins] {};
     double floorRing_[kFloorHops] {};
     double hopPow_ = 0.0, prevHopPow_ = 0.0, periodSum_ = 0.0;
     double ps_ = 0.0, hopMin_ = kNone, floor_ = 0.0, thr2_ = kNone;
