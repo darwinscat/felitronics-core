@@ -44,16 +44,18 @@ namespace felitronics::dehum
 //       that power over the last 4 s (sixteen 0.25 s hop minima), which may RISE by at most 0.5 dB per hop
 //       (2 dB/s) and restarts on every re-arm, zeroing or restore. After cancellation true quiet is the
 //       noise floor; a note is not, however stationary — a −40 dBFS note over a −90 dB residual floor is
-//       not quiet for ≈ 19 s. A LOUDER HUM is told apart from a note: the running family's bins up 3 dB in a
-//       quiet, trigger-free window AND the coarse estimate within 0.05 Hz of ours → the residual floor
+//       not quiet for ≈ 19 s. A LOUDER HUM is told apart from a note: the running family's bins 3 dB over what
+//       the MODEL explained a hop ago (the 0.5 s window straddling the step reads it ≈ 2 dB low, so ≈ +5 dB
+//       effective), in a quiet, trigger-free window, AND the coarse estimate within 0.05 Hz of ours → the residual floor
 //       restarts and quiet returns (measured: 0.51 s after a +10 dB step). The input floor no longer gates
 //       quiet; it keeps active() and the trigger used before the canceller runs. (Since review 2 the louder
 //       hum is judged against what the MODEL explains — its k1/k2 a hop ago — not a past window: hands on
 //       the strings and off again re-qualifies within 1 s.) Smoothed powers are seeded
 //       from a settled level, never from one 64-sample period (a waveform trough there set every trigger off);
 //   (c) no per-sample trigger in the last 50 ms: a sample 12 dB over the floor's sine peak (x² > 32·floor),
-//       or — while the canceller runs — a RESIDUAL sample 12 dB over the residual's own 20 ms-smoothed level
-//       (e² > 32·max(smoothed e², 1e-4·floor)). The residual is what a pluck shows in first (the hum is
+//       or — while the canceller runs — a RESIDUAL sample 6 dB over the residual's recent PEAK (the peak of the
+//       last grid periods, released 6 dB per 40 ms, refreshed on the grid), never below 32·1e-4·floor — a
+//       pulse-train residual (a coherent buzz) is stationary to it. The residual is what a pluck shows in first (the hum is
 //       already gone from it), so quiet ends on the first few samples of an attack and an attack is never
 //       learned at the fast width; a stationary residual (an unconverged model, a ringing ghost) never
 //       trips it. The 50 ms latch covers the smoothed power's lag, and a trigger also voids the last window's
@@ -151,7 +153,8 @@ namespace felitronics::dehum
 //     64 steps), so from zero #64 on it is MUTED and digital black in is bit-exact black out; weights, floor
 //     and decisions hold. On the way back it fades in the same way over the first 64 real samples (from
 //     wherever a shorter run left it). Neither edge steps: the correction's second difference stays under
-//     −60 dBFS on a −30 dBFS hum at a region end and a region start, abrupt or faded (measured ≈ −70).
+//     −60 dBFS on a −30 dBFS hum (24 harmonics, 1/k) at a region end and a region start, abrupt or faded
+//     (measured ≈ −70), and when an unfinished fade turns (gaps of 1–63 zeros: ≈ −62).
 //     Price: the first 64 samples after black are cancelled only partly.
 //   * A non-finite input sample passes through untouched and adapts / feeds nothing. Law 8/8a: on the grid
 //     each weight is flushed (|w| < 1e-15 → 0), healed (non-finite → 0) and bounded (beyond kWeightCeiling,
@@ -396,6 +399,19 @@ public:
         return m > 0.0 ? 20.0 * std::log10 (m) : kSilentDb;
     }
 
+    // Inspection for tests (law 8): is any recursive state — weights, smoothed powers, floors, the residual's
+    // peak follower, the black fade — in the subnormal band?
+    bool anySubnormalState() const noexcept
+    {
+        auto sub = [] (double v) { return std::fpclassify (v) == FP_SUBNORMAL; };
+        for (int c = 0; c < maxCh_; ++c)
+        {
+            if (sub (pkE_[c]) || sub (pkCur_[c]) || sub (bpos_[c]) || sub (bvel_[c])) return true;
+            for (int k = 0; k < nActive_; ++k) if (sub (wRe_[c][k]) || sub (wIm_[c][k])) return true;
+        }
+        return sub (psE_) || sub (ps_) || sub (rf_) || sub (floor_);
+    }
+
     // ---- LEARN ---------------------------------------------------------------------------------------
     // beginLearn: snapshot the model, ramp the correction out (20 ms, nothing adapts meanwhile), zero the
     // weights, and learn at the learn width with the family decided by Auto's windows whatever the mode
@@ -593,7 +609,8 @@ private:
     long long settleStart() const noexcept
     {
         const long long a = (long long) std::llround (kLearnSettleSec * fs_);
-        const long long b = learnArmAt_ + (long long) std::llround (kLearnConvergeSec * fs_);
+        const double    conv = 7.0 / (core::kPi * params_.learnBandwidthHz);   // S2: 7 learn-τ, 0.743 s at 3 Hz
+        const long long b = learnArmAt_ + (long long) std::llround ((conv > kLearnConvergeSec ? conv : kLearnConvergeSec) * fs_);
         return a > b ? a : b;
     }
 
@@ -637,7 +654,11 @@ private:
             const double px = core::kPi * x;
             const double sn = std::fabs (px) < 1e-12 ? 1.0 : core::det::sin (px) / px;
             double p = 0.0;
-            for (int c = 0; c < maxCh_; ++c) { const double a = wRe_[c][h - 1] * wRe_[c][h - 1]; const double b = wIm_[c][h - 1] * wIm_[c][h - 1]; p += a; p += b; }
+            for (int c = 0; c < maxCh_; ++c)
+            {
+                if (! fedWin_[c]) continue;                    // a stopped or black channel's kept model heard nothing here
+                const double a = wRe_[c][h - 1] * wRe_[c][h - 1]; const double b = wIm_[c][h - 1] * wIm_[c][h - 1]; p += a; p += b;
+            }
             const double q = 0.5 * p;
             const double r = sn * sn;
             m += q * r;
@@ -780,6 +801,7 @@ private:
             const double xd = (double) x;
             const double x2 = xd * xd;
             periodSum_ += x2;
+            fedHop_[c] = true;                                 // this channel fed the detector in this hop
             if (! running_ && x2 > thr2_) hit_ = true;       // while the canceller runs, the residual's trigger rules
             syncBins (p);
             for (int b = 0; b < 4; ++b)
@@ -884,6 +906,7 @@ private:
             chanLive_[c] = false;
             const double d = pkE_[c] * pkDecay64_;               // the residual's peak reference: last periods' peak,
             pkE_[c] = pkCur_[c] > d ? pkCur_[c] : d;             // released 6 dB per 40 ms (a pause decays it too)
+            core::flushDenormal (pkE_[c]);                       // S3, law 8: it decays geometrically through silence
             pkCur_[c] = 0.0;
         }
         for (int c = 0; c < maxCh_; ++c)
@@ -940,7 +963,7 @@ private:
             {
                 const double d = glideTarget_ - fHat_;
                 if (std::fabs (d) <= 0.01) glide_ = false;
-                else setFrequency (clampToLock (fHat_ + (d > slewT_ ? slewT_ : (d < -slewT_ ? -slewT_ : d))));
+                else { setFrequency (clampToLock (fHat_ + (d > slewT_ ? slewT_ : (d < -slewT_ ? -slewT_ : d)))); fllMovedHop_ = true; }
             }
             else if (running_ && wasQuiet && winner_ == family_ && swapPhase_ == 0 && params_.lockRangeHz > 0.0) trackFrequency();
         }
@@ -992,6 +1015,7 @@ private:
         const double delta = num / (2.0 * core::kPi * periodSec_ * den);
         lockedPeriods_ = std::fabs (delta) < 0.005 ? (lockedPeriods_ < hopPeriods_ ? lockedPeriods_ + 1 : lockedPeriods_) : 0;
         double step = (fllFast_ ? fllGainT_ : fllGainSlowT_) * delta;
+        if (std::fabs (step) > 0.1 * slewT_) fllMovedHop_ = true;
         if (step >  slewT_) step =  slewT_;
         if (step < -slewT_) step = -slewT_;
         setFrequency (clampToLock (fHat_ + step));
@@ -1067,10 +1091,12 @@ private:
             // Both compare the bins with what the MODEL explains (its own k1/k2, at the bins' sinc for f̂), not with
             // a past window: (R3) the family's bins 3 dB OVER the model, at the frequency we track (coarse within
             // 0.05 Hz), is a louder hum — hands off the strings — and the residual floor restarts; (R1) a coarse
-            // estimate stable over two windows but 0.05 Hz or more from f̂, with the bins within 3 dB of the
+            // estimate stable over two windows but 0.02 Hz or more from f̂ (it glides to within 0.01, where the
+            // FLL takes over), with the bins within 3 dB of the
             // model (the hum we model, not a note at a bin), is a drift accumulated while the FLL held — f̂
             // glides to it at the slew bound, then the FLL takes over.
             const int    rs    = family_ == 60 ? 1 : 0;
+            for (int c = 0; c < core::kMaxChannels; ++c) fedWin_[c] = fedHop_[c] || fedPrevHop_[c];   // S1: who fed this window
             const double model = running_ ? modelBinPower() : 0.0;
             // the window averages the last 0.5 s, so it is held against the model as it stood a hop ago (the
             // smaller of the two): a model already climbing toward a louder hum must not hide it
@@ -1080,7 +1106,7 @@ private:
                 && coarseValid_[rs] && std::fabs (coarse_[rs] - fHat_) < 0.05)
                 resetResidualFloor();
             const bool stable = coarseValid_[rs] && lastCoarseValid_ && std::fabs (coarse_[rs] - lastCoarse_) < 0.01;
-            glide_ = running_ && quiet && trigFree && stable && std::fabs (coarse_[rs] - fHat_) >= 0.05
+            glide_ = running_ && quiet && trigFree && stable && std::fabs (coarse_[rs] - fHat_) >= 0.02
                      && model > 0.0 && famOf[rs] < 2.0 * model && famOf[rs] > 0.5 * model;
             if (glide_) glideTarget_ = clampToLock (coarse_[rs]);
             lastCoarse_ = coarse_[rs]; lastCoarseValid_ = coarseValid_[rs];
@@ -1130,9 +1156,12 @@ private:
             if (lwMin_ < kNone && hopMinE_ > 4.0 * (lwMin_ > lo ? lwMin_ : lo)) learnStatus_ = LearnStatus::Disturbed;
             if (hopMinE_ < lwMin_) lwMin_ = hopMinE_;
             // R5: nor a floor that FALLS steadily — a string still ringing when LEARN was pressed: three hops on,
-            // a hop 6 dB under the window's first (both above the −60 dB-re-input bound)
+            // a hop 6 dB under the window's first. S2: judged only above −40 dB re the input — a ringing string
+            // sits 10–20 dB under it, while ordinary convergence (a slow learn width, an FLL settling on a wide
+            // detune) has fallen below that by the time the window opens (7 learn-τ)
+            const double lo5 = floorValid_ ? 1e-4 * floor_ : 0.0;
             if (lwFirst_ >= kNone) lwFirst_ = hopMinE_;
-            else if (++lwHops_ >= 3 && lwFirst_ > lo && lwFirst_ > 4.0 * (hopMinE_ > lo ? hopMinE_ : lo)) learnStatus_ = LearnStatus::Disturbed;
+            else if (++lwHops_ >= 3 && lwFirst_ > lo5 && lwFirst_ > 4.0 * (hopMinE_ > lo5 ? hopMinE_ : lo5)) learnStatus_ = LearnStatus::Disturbed;
         }
         if (hopMinE_ < kNone)                                  // the residual floor: same, its rise capped per hop
         {
@@ -1148,6 +1177,8 @@ private:
         hopMinE_ = kNone;
         hitPrevHop_ = hitInHop_;
         hitInHop_   = false;
+        fllMovedHop_ = false;
+        for (int c = 0; c < core::kMaxChannels; ++c) { fedPrevHop_[c] = fedHop_[c]; fedHop_[c] = false; }
         for (int c = 0; c < maxCh_; ++c)
             for (int b = 0; b < 4; ++b)
             { prevHopRe_[c][b] = hopRe_[c][b]; prevHopIm_[c][b] = hopIm_[c][b]; hopRe_[c][b] = 0.0; hopIm_[c][b] = 0.0; }
@@ -1175,6 +1206,7 @@ private:
     double bpos_[core::kMaxChannels] {};        // 0..kBlackRun: the black fade's position per channel...
     double bvel_[core::kMaxChannels] {};        // ...and its velocity (a turn mid-fade decelerates: no cusp)
     bool   chanLive_[core::kMaxChannels] {};    // adapted during this grid period (the FLL sums only these)
+    bool   fedHop_[core::kMaxChannels] {}, fedPrevHop_[core::kMaxChannels] {}, fedWin_[core::kMaxChannels] {};
     double pkE_[core::kMaxChannels] {};         // the residual's peak follower, per channel
     double pkCur_[core::kMaxChannels] {};       // this period's residual peak
     double pkDecay64_ = 1.0, glideTarget_ = 0.0, lastCoarse_ = 0.0, prevModel_ = 0.0, lwFirst_ = kNone;
@@ -1227,7 +1259,7 @@ private:
     double               hopSec_      = 0.25;
     double               smoothA_     = 0.0;
     double               muSlow_      = 0.0, muFast_ = 0.0, fllGainT_ = 0.0, fllGainSlowT_ = 0.0, slewT_ = 0.0;
-    bool                 fllFast_     = false;
+    bool                 fllFast_     = false, fllMovedHop_ = false;
     double               fHat_        = 0.0;
     int                  family_      = 0;   // 0 (dry), 50 or 60 — what the canceller runs
     int                  nActive_     = 0;

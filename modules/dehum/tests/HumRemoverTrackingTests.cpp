@@ -1120,6 +1120,53 @@ static void testRingingLearnAndSharedLine()
     }
 }
 
+// S1: a channel that learned a LOUDER hum and then stopped (or went black) must not block the re-acquisition
+// of a drift on the channel still playing. S2: a slow learn (1 Hz) and a wide noiseless detune are Learned.
+static void testRound4()
+{
+    group ("S1: a stopped / black louder channel does not block re-acquisition; S2: slow and detuned learns are Learned");
+    const double fs = 48000.0;
+    for (int black = 0; black < 2; ++black)
+    {
+        HumSpec hl; hl.f0 = 50.0; hl.a1 = 0.0316; hl.slope = 0.003; hl.rampFrom = 3.0; hl.rampTo = 23.0; hl.seed = 87u;
+        HumSpec hr = hl; hr.a1 = 0.063; hr.seed = 88u; hr.until = 3.0;
+        std::vector<float> l ((std::size_t) (29.0 * fs), 0.0f), r (l.size(), 0.0f);
+        addHum (l, hl, fs); addHum (r, hr, fs);
+        addPlucks (l, 3.0, 23.0, fs, 0.1);
+        HR h; h.setParams (params (dh::Mains::Auto, 0.5, 3.0)); felitronics::test::run (h.prepare (fs, 512, 2));
+        double back = -1.0;
+        for (std::size_t o = 0; o < l.size(); o += 256)
+        {
+            const int n = (int) std::min<std::size_t> (256, l.size() - o);
+            const double t = (double) (o + (std::size_t) n) / fs;
+            const bool both = t <= 3.0 || black == 1;
+            float* io[2] { l.data() + o, r.data() + o };
+            felitronics::test::run (h.process (io, both ? 2 : 1, n));
+            if (t > 23.0 && std::fabs (h.mainsHz() - humFreq (hl, t)) >= 0.005) back = t - 23.0;
+        }
+        std::printf ("      %s: re-locked %.2f s after the playing ends\n", black ? "right channel digital black" : "right channel stopped", back);
+        ok (back >= 0.0 && back <= 3.0, std::string ("S1, the louder channel ") + (black ? "black" : "stopped") + ": re-acquired within 3 s (" + fmt (back, 2) + " s)");
+    }
+    {   // S2a: learn width 1 Hz, one harmonic, lockRange 0
+        std::vector<float> x ((std::size_t) (7.0 * fs), 0.0f);
+        HumSpec hs; hs.f0 = 50.0; hs.a1 = 0.0316; hs.kmax = 1; hs.seed = 89u; addHum (x, hs, fs);
+        dh::HumRemoverParams p = params (dh::Mains::Hz50, 0.5, 1.0, 0.0); p.harmonics = 1;
+        HR h; h.setParams (p); felitronics::test::run (h.prepare (fs, 512, 1));
+        std::int64_t o = 0; block64 (h, x, o, (std::int64_t) (2.0 * fs));
+        h.beginLearn(); block64 (h, x, o, (std::int64_t) (6.0 * fs));
+        const auto r = h.endLearn (true);
+        ok (r.verdict == HR::LearnVerdict::Learned, "S2: a 1 Hz learn on one harmonic is Learned (verdict " + std::to_string ((int) r.verdict) + ", window from " + fmt (r.settledAtMs, 0) + " ms)");
+    }
+    {   // S2b: a wide noiseless detune, cold learn
+        std::vector<float> x ((std::size_t) (4.0 * fs), 0.0f);
+        HumSpec hs; hs.f0 = 49.6; hs.a1 = 0.0316; hs.seed = 90u; addHum (x, hs, fs);
+        HR h; h.setParams (params (dh::Mains::Auto, 0.5, 3.0)); felitronics::test::run (h.prepare (fs, 512, 1));
+        std::int64_t o = 0; h.beginLearn(); block64 (h, x, o, (std::int64_t) (3.5 * fs));
+        const auto r = h.endLearn (true);
+        ok (r.verdict == HR::LearnVerdict::Learned && std::fabs (r.hz - 49.6) < 0.02, "S2: a noiseless -0.4 Hz detune, cold learn: Learned (verdict " + std::to_string ((int) r.verdict) + ", " + fmt (r.hz, 4) + " Hz)");
+    }
+}
+
 int main()
 {
     std::printf ("felitronics::dehum — HumRemover knowing the mains\n");
@@ -1147,5 +1194,6 @@ int main()
     testHandsOnHandsOff();
     testHandsProbe();
     testRingingLearnAndSharedLine();
+    testRound4();
     return felitronics::test::report();
 }

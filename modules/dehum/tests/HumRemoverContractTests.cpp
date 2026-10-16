@@ -335,6 +335,7 @@ static void testMinuteOfSilence()
         }
         const std::string what = black ? "digital black" : "quiet (1e-20 noise)";
         ok (band, what + ": after every 64-aligned call each weight is 0 or >= 1e-15 (none below, none subnormal)");
+        ok (! h.anySubnormalState(), what + ": no recursive state in the subnormal band, the residual's peak follower included (S3)");
         ok (! subOut, what + ": no output sample is subnormal");
         if (black) ok (zeroOut, what + ": the output is exact zero");
     }

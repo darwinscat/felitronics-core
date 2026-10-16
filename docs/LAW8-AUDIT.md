@@ -233,7 +233,10 @@ hold through an all-zero period (black or a pause), so they never decay toward z
 (input and residual) are minima over hop minima — not recursive — and the black fade is an integer counter.
 A smoothed power is seeded from a settled level, never from one 64-sample period. Subnormal INPUT samples
 cost the input's own arithmetic (measured +52 % per block on `deb` with FTZ off, by the review's probe) and
-leave no subnormal state: a second of ±1e-40 input leaves every weight at 0 or ≥ 1e-15. Tested in
+leave no subnormal state: a second of ±1e-40 input leaves every weight at 0 or ≥ 1e-15. The residual's PEAK
+follower (the trigger's reference) decays geometrically on every grid boundary, silence included, so it is
+flushed there too (`< 1e-15 → 0`); unflushed it reached the subnormal band after ≈ 20 s of black (review 3) —
+the minute-of-silence test now asks `anySubnormalState()`, which covers it with the weights, powers and floors. Tested in
 `modules/dehum/tests/HumRemoverContractTests.cpp` (the minute of black and of quiet, the poison and burst
 cases) with FTZ off on the `deb` row.
 
