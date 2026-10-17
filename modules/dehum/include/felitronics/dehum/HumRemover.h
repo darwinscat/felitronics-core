@@ -138,13 +138,16 @@ namespace felitronics::dehum
 // samples, and if those did better, or the input sits 3 dB under the old floor, the weights go back over 40 ms to
 // where the return found them (a hum turned under the note at the same level): "no worse than without the return",
 // not an absolute test. A trigger cancels a check; a take-back's target is never reused as a note's snapshot.
-// OPEN (reviews 6–7): a SLOW attack within ≈ 100 ms of the previous note may trip no trigger at all — the residual
+// OPEN (reviews 6–8): a SLOW attack within ≈ 100 ms of the previous note may trip no trigger at all — the residual
 // trigger wants 4× the recent peak, still raised by the previous note, and an attack's envelope grows ≤ 6 dB per
 // period after its first, so whether it trips depends on its first period (measured: 2 ms ramps never missed, 10 ms
 // ramps missed 10 of 22 gaps of 55–76 ms) — and then no event opens and that note keeps the old ghost. Opening an
-// event on level as well was tried and parked: on a take whose hum vanished under ringing strings it kept the stale
-// model longer. That case is a limit of its own: a hum that leaves the input while strings ring is still subtracted
-// at its old level until the playing width re-converges (seconds; measured ≈ 4.5 s to the input's level at k11).
+// event on level as well was tried twice and parked: it cures this on synthetic notes, but on a real take it made the
+// ghost of a LONG note last longer (≈ 4.5 → 5.5 s). That ghost is a limit of its own: a note held longer than 3 s gets
+// no return, so a partial of it inside a harmonic's playing notch rings out at τ 0.64 s once the note stops. The A
+// string is the plain case, 5·110 = 11·50 (6·110 = 11·60): on a humbucker take an A held 6.5 s put its 5th partial
+// 0.1 Hz under k11 (549.85 Hz, the hum's k11 at 549.95), and after the mute its ghost took ≈ 4.5 s to come down from
+// +65 dB over the input to the input's level at k11, while the hum there stayed within 3 dB.
 // The snapshot keeps its own time origin, so a new
 // attack mid-return does not turn it twice. LIMITS (V10/V11): the end fires at the first 21 ms mean under 4× the
 // old floor, so with the 10 dB drop the return engages only for notes ≥ ≈ 16 dB over the hum's mean square; and
