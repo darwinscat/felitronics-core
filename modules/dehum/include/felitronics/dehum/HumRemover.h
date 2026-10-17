@@ -11,6 +11,7 @@
 #include <felitronics/core/StateGrid.h>
 
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 
@@ -294,6 +295,7 @@ class HumRemover
 
 public:
     static constexpr int    kMaxHarmonics   = MaxHarmonics;
+    static constexpr std::size_t kHarmonicSlots = static_cast<std::size_t> (MaxHarmonics);   // the arrays' extent
     static constexpr int    kBlackRun       = 64;       // exact zeros in a row that mute the correction
     static constexpr double kRampSeconds    = 0.020;    // correction ramp-out on a family / harmonic-set change
     static constexpr double kMinBandwidthHz = 0.01;
@@ -334,7 +336,7 @@ public:
         Mains        mains        = Mains::Off;   // the family the learn heard (Off: none)
         double       hz           = 0.0;          // the tracker's estimate at the end
         double       humDb        = kSilentDb;    // the learned hum: 10·log10 Σ|w_k|², dB re a full-scale sine
-        double       harmonicDb[MaxHarmonics] {}; // each harmonic's amplitude, dBFS (index k-1)
+        double       harmonicDb[kHarmonicSlots] {}; // each harmonic's amplitude, dBFS (index k-1)
         double       floorAfterDb = kSilentDb;    // peak |out| over the settled window, dBFS
         double       settledAtMs  = -1.0;         // when the settled window opened, ms after beginLearn (-1: never)
         LearnVerdict verdict      = LearnVerdict::NotLearning;
@@ -1133,7 +1135,7 @@ private:
         // the hum kept turning in our frame while the note sounded (f̂ is never exact): the snapshot is advanced by
         // the rotation the weights showed in the last quiet hop, to where the hum will be when the return ends
         const long long target = clock_ + (long long) retLen_;      // where the return ends
-        if (evHz_ != 0.0)
+        if (evHz_ > 0.0 || evHz_ < 0.0)
         {
             const double el = (double) (target - sT_) / fs_;          // from the snapshot's OWN origin (V4)
             const double a1 = 2.0 * core::kPi * evHz_ * el;
@@ -1653,12 +1655,12 @@ private:
 
     // ---- canceller ----
     // Weights per channel, per harmonic (index k-1), and their value at the last grid boundary (the FLL's).
-    double wRe_[core::kMaxChannels][MaxHarmonics] {};
-    double wIm_[core::kMaxChannels][MaxHarmonics] {};
-    double pRe_[core::kMaxChannels][MaxHarmonics] {};
-    double pIm_[core::kMaxChannels][MaxHarmonics] {};
-    double rRe_[MaxHarmonics] {}, rIm_[MaxHarmonics] {};
-    double rotRe_[MaxHarmonics] {}, rotIm_[MaxHarmonics] {};
+    double wRe_[core::kMaxChannels][kHarmonicSlots] {};
+    double wIm_[core::kMaxChannels][kHarmonicSlots] {};
+    double pRe_[core::kMaxChannels][kHarmonicSlots] {};
+    double pIm_[core::kMaxChannels][kHarmonicSlots] {};
+    double rRe_[kHarmonicSlots] {}, rIm_[kHarmonicSlots] {};
+    double rotRe_[kHarmonicSlots] {}, rotIm_[kHarmonicSlots] {};
     int    zeros_[core::kMaxChannels] {};
     double bpos_[core::kMaxChannels] {};        // 0..kBlackRun: the black fade's position per channel...
     double bvel_[core::kMaxChannels] {};        // ...and its velocity (a turn mid-fade decelerates: no cusp)
@@ -1671,15 +1673,15 @@ private:
     bool   glide_ = false, lastCoarseValid_ = false, lastCoarse2Valid_ = false;
     double lastCoarse2_ = 0.0;
     static constexpr int kMotionMax = 1 << 20;
-    double jRe_[core::kMaxChannels][MaxHarmonics] {}, jIm_[core::kMaxChannels][MaxHarmonics] {};   // the hop's weight record:
-    double jTr_[core::kMaxChannels][MaxHarmonics] {}, jTi_[core::kMaxChannels][MaxHarmonics] {};   // Σw, Σt·w, Σ|w|²
-    double jPw_[core::kMaxChannels][MaxHarmonics] {};
+    double jRe_[core::kMaxChannels][kHarmonicSlots] {}, jIm_[core::kMaxChannels][kHarmonicSlots] {};   // the hop's weight record:
+    double jTr_[core::kMaxChannels][kHarmonicSlots] {}, jTi_[core::kMaxChannels][kHarmonicSlots] {};   // Σw, Σt·w, Σ|w|²
+    double jPw_[core::kMaxChannels][kHarmonicSlots] {};
     int    jN_[core::kMaxChannels] {};
     double jit_ = kNone, rotHz_ = kNone, lkSum_ = 0.0;
     int    lkN_ = 0;
     double cRing_[2][kCoarseAvg] {};
-    double sRe_[core::kMaxChannels][MaxHarmonics] {}, sIm_[core::kMaxChannels][MaxHarmonics] {};   // the pre-event model
-    double uRe_[core::kMaxChannels][MaxHarmonics] {}, uIm_[core::kMaxChannels][MaxHarmonics] {};   // where a return found them
+    double sRe_[core::kMaxChannels][kHarmonicSlots] {}, sIm_[core::kMaxChannels][kHarmonicSlots] {};   // the pre-event model
+    double uRe_[core::kMaxChannels][kHarmonicSlots] {}, uIm_[core::kMaxChannels][kHarmonicSlots] {};   // where a return found them
     double rsRing_[kGhostEndPeriods] {}, rsSum_ = 0.0, sF_ = 0.0, chkW_ = 0.0, chkU_ = 0.0;
     bool   snapOk_ = false;
     long long clock_ = 0, sT_ = 0;
@@ -1720,8 +1722,8 @@ private:
     bool   bkLive_ = false, freqPending_ = false;
 
     // ---- LEARN ----
-    double      bkRe_[core::kMaxChannels][MaxHarmonics] {};   // the snapshot endLearn(false) restores
-    double      bkIm_[core::kMaxChannels][MaxHarmonics] {};
+    double      bkRe_[core::kMaxChannels][kHarmonicSlots] {};   // the snapshot endLearn(false) restores
+    double      bkIm_[core::kMaxChannels][kHarmonicSlots] {};
     double      bkHz_ = 0.0, peakOut_ = 0.0;
     int         bkFamily_ = 0, bkActive_ = 0, bkAuto_ = 0, bkLocked_ = 0, learnFamily_ = 0, swapPhase_ = 0, swapAction_ = 0;
     bool        bkRunning_ = false, bkAcquired_ = false, learning_ = false;
