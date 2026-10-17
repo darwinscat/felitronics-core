@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(felitronics_core VERSION 0.59.0 LANGUAGES CXX)
+project(felitronics_core VERSION 0.60.0 LANGUAGES CXX)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)   # so clangd / IDEs parse the headers at the right C++ standard
 
@@ -70,6 +70,7 @@ add_subdirectory(modules/stereo)
 add_subdirectory(modules/multiband)
 add_subdirectory(modules/dynamiceq)
 add_subdirectory(modules/deesser)
+add_subdirectory(modules/dehum)   # mains hum canceller (50/60 Hz + harmonics) — core only
 add_subdirectory(modules/dither)
 add_subdirectory(modules/lineareq)
 add_subdirectory(modules/measurement)   # OFFLINE IR-measurement math (sweep/Farina deconv/gate) — double, message-thread
@@ -107,7 +108,7 @@ if(FELITRONICS_BUILD_TESTS AND (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU"))
         felitronics::convolution felitronics::oversampling felitronics::limiter felitronics::neural
         felitronics::saturation felitronics::stereo felitronics::multiband felitronics::dynamiceq
         felitronics::deesser felitronics::dither felitronics::lineareq felitronics::measurement felitronics::blend
-        felitronics::io felitronics::text felitronics::codecgrid)
+        felitronics::io felitronics::text felitronics::codecgrid felitronics::dehum)
     target_compile_features(felitronics_header_hygiene PRIVATE cxx_std_20)
     target_compile_options(felitronics_header_hygiene PRIVATE ${FELITRONICS_HYGIENE_WARNINGS})
     # When selected, felitronics::convolution propagates the uniform FELITRONICS_WITH_PFFFT definition
@@ -133,7 +134,7 @@ if(FELITRONICS_BUILD_TESTS AND (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU"))
         felitronics::convolution felitronics::oversampling felitronics::limiter felitronics::neural
         felitronics::saturation felitronics::stereo felitronics::multiband felitronics::dynamiceq
         felitronics::deesser felitronics::dither felitronics::lineareq felitronics::measurement felitronics::blend
-        felitronics::io felitronics::text felitronics::codecgrid)
+        felitronics::io felitronics::text felitronics::codecgrid felitronics::dehum)
     target_compile_features(felitronics_no_exceptions_probe PRIVATE cxx_std_20)
     target_compile_options(felitronics_no_exceptions_probe PRIVATE -fno-exceptions -fno-rtti)
 endif()

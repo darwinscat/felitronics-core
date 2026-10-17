@@ -37,6 +37,7 @@
 #include <felitronics/analysis/ReferenceTruePeakMeter.h>
 #include <felitronics/analysis/TruePeakMeter.h>
 #include <felitronics/convolution/CabConvolver.h>
+#include <felitronics/dehum/HumRemover.h>
 #include <felitronics/convolution/ConvolutionEngine.h>
 #include <felitronics/convolution/MatrixConvolver.h>
 #include <felitronics/deesser/DeEsser.h>
@@ -107,6 +108,16 @@ ADAPT (A_TransientShaper, felitronics::dynamics::TransientShaper, kPrepCh, true,
          felitronics::dynamics::TransientShaperParams tp;   // the defaults are INERT — dial it in, or the
          tp.attackDb = 9.0; tp.sustainDb = -6.0;              // chunk comparison compares two copies of the input
          s.setParams (tp); return okp; },
+       { return s.process (io, nch, n); },
+       { (void) s; return 0.0; },
+       { return s.prepare (kFs, kMaxBlock, w); });
+
+ADAPT (A_HumRemover, felitronics::dehum::HumRemover<>, kPrepCh, true, true, true,
+       { const bool okp = s.prepare (kFs, kMaxBlock, kPrepCh);
+         felitronics::dehum::HumRemoverParams hp;            // Auto would abstain on this hum-free fixture —
+         hp.mains = felitronics::dehum::Mains::Hz50;          // run the canceller, at its quiet width so the
+         hp.bandwidthHz = 3.0;                                // short fixture moves the weights
+         s.setParams (hp); return okp; },
        { return s.process (io, nch, n); },
        { (void) s; return 0.0; },
        { return s.prepare (kFs, kMaxBlock, w); });
@@ -805,6 +816,7 @@ int main()
     allProperties<A_TransientShaper>();
     allProperties<A_Dither>();
     allProperties<A_DeEsser>();
+    allProperties<A_HumRemover>();
     allProperties<A_DynamicEqBand>();
     allProperties<A_EqBand>();
     allProperties<A_EqEngine>();

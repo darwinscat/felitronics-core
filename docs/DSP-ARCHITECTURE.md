@@ -631,6 +631,7 @@ its own JUCE-free self-tests.
 | `oversampling`  | polyphase up/down-sampling                                           | compiled if SIMD; for true-peak + nonlinear |
 | `limiter`       | true-peak limiter                                                    | compiled; uses `oversampling` |
 | `neural`        | a thin **inference-object seam** (process-only) + the swap-safe model holder; model *loading* lives in the adapter | header-only, backend-free; a backend (the NAM one is in felitronics-guitar-core) is chosen at build time. NOT a runtime model-swap of one backend for another |
+| `dehum`         | `HumRemover`: mains hum (50/60 Hz + harmonics) removed from an input by a phase-coherent synchronous canceller — exactly a notch comb of constant absolute width (0.5 Hz playing, 3 Hz in quiet), Auto 50/60 from Goertzel bins in quiet, an FLL that holds while playing, LEARN with a floor report | header-only, `core` only; weights in double (law 3 carve-out, stated), zero latency, no heap; ≈ 0.26 % of a core at 48 kHz stereo, 24 harmonics (`tools/dehumbench.cpp`). Cannot remove hum made after its input |
 
 **The FFT seam** (`core/Fft`) — the architecture's keystone, **designed FIRST** (see §6). NOT a bare
 `virtual fft(float*)`: a **plan object created in `prepare`** with explicit scratch ownership,

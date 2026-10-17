@@ -55,6 +55,9 @@ modules/dynamics/include/felitronics/dynamics/NoiseGate.h  [exp*1 pow*3]  retain
 modules/dynamics/include/felitronics/dynamics/RelativeLevel.h  [exp*1 log10*1]  retain-rt  a relative-level detector's coefficient and its dB readout
 modules/dynamics/include/felitronics/dynamics/TransientShaper.h  [dbToGain()*1 exp*1]  retain-rt  the shaper's envelope coefficient
 
+# --- dehum: the mains hum canceller on an input ---
+modules/dehum/include/felitronics/dehum/HumRemover.h  [atan2*2 hypot*1 log10*3]  retain-rt  the two atan2 are the coarse mains estimate (a bin's phase advance, once per 0.25 s hop), which sets the frequency the canceller runs at, so they reach shipped audio: the header states that rows agree within tolerance there, not bit for bit. The hypot and the three log10 are telemetry (humDb, harmonicDb, the LEARN report's floor), read by a UI and never by the audio path
+
 # --- eq: the biggest group, and all of it is coefficient design for shipped filters ---
 modules/eq/include/felitronics/eq/EqBand.h  [abs*1 polar*1 sin*1]  retain-rt  Butterworth Q design and the z^-1 phasor for a band's response. std::polar is cos+sin in disguise, which is why the lint governs it
 modules/eq/include/felitronics/eq/EqEngine.h  [abs*3 log10*2]  retain-rt  the composite magnitude response in dB, for the curve the user sees and for the engine's own fitting
@@ -84,6 +87,7 @@ modules/measurement/include/felitronics/measurement/Sweep.h  [cos*2 exp*2 log*2 
 # --- tools that are not on the parity surface ---
 tools/eqviz/eqviz.cpp  [abs*5 arg*1 cos*1 log*8 log10*1 pow*26 sin*1 sqrt*10]  retain-local  a developer visualiser; it draws curves and nobody diffs its output
 tools/fftbench.cpp  [exp*6]  retain-local  benchmark input generation
+tools/dehumbench.cpp  [exp*1 sin*2]  retain-local  benchmark input generation: a 24-harmonic hum and a decaying note
 
 
 # --- carrier-only files: no direct std:: call, but they reach libm through core::gainToDb /

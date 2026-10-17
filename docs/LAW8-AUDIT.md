@@ -217,6 +217,29 @@ flush once per WHOLE KEY and so carry the whole-file hole into the solver.
 
 ---
 
+### Added with the module: `dehum::HumRemover` — gridded from the start
+
+**Recursive state:** the canceller's weights (double; one complex weight per harmonic per channel), its
+references (re-anchored from an exact uint32 phase every grid period, so nothing decays), the 20 ms one-pole
+of the broadband and residual powers, the floor (a minimum over sixteen hop minima — not recursive) and
+the FLL's estimate (a bounded sum of slewed steps). **Verdict: clean, by three mechanisms.** (1) The weights
+can only decay by adapting to a non-black quiet input — an exact-zero sample adapts nothing, so digital
+black holds them — and on `core::StateGrid` every weight is flushed (`|w| < 1e-15 → 0`), healed
+(non-finite → 0) and bounded (beyond +60 dBFS → 0); the non-finite half also runs at the end of every
+call. Measured: 60 s of ±1e-20 noise after a hum leaves every weight at 0 or ≥ 1e-15 after every
+64-aligned call, and removing the flush puts them in the band below. (2) Each increment is a float-rounded
+product added to a double, so with float inputs it cannot be subnormal in double. (3) The smoothed powers
+hold through an all-zero period (black or a pause), so they never decay toward zero on silence; the floors
+(input and residual) are minima over hop minima — not recursive — and the black fade is an integer counter.
+A smoothed power is seeded from a settled level, never from one 64-sample period. Subnormal INPUT samples
+cost the input's own arithmetic (measured +52 % per block on `deb` with FTZ off, by the review's probe) and
+leave no subnormal state: a second of ±1e-40 input leaves every weight at 0 or ≥ 1e-15. The residual's PEAK
+follower (the trigger's reference) decays geometrically on every grid boundary, silence included, so it is
+flushed there too (`< 1e-15 → 0`); unflushed it reached the subnormal band after ≈ 20 s of black (review 3) —
+the minute-of-silence test now asks `anySubnormalState()`, which covers it with the weights, powers and floors. Tested in
+`modules/dehum/tests/HumRemoverContractTests.cpp` (the minute of black and of quiet, the poison and burst
+cases) with FTZ off on the `deb` row.
+
 ## How these are tested
 
 State tests, in the style of `modules/dynamics/tests/DynamicsTests.cpp:61` — after a long silence the

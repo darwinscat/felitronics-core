@@ -27,6 +27,12 @@ if(FELITRONICS_BENCH_JUCE)
         FELITRONICS_BENCH_JUCE=1 JUCE_USE_CURL=0 JUCE_WEB_BROWSER=0 JUCE_STANDALONE_APPLICATION=1)
 endif()
 
+# dehumbench — CPU of dehum::HumRemover per 64-frame block by path (playing / quiet / learning / listening /
+# silence) at 48, 96 and 192 kHz; target <= 0.5 % of a core at 48 kHz stereo, 24 harmonics.
+add_executable(fcore_dehumbench dehumbench.cpp)
+target_link_libraries(fcore_dehumbench PRIVATE felitronics::dehum)
+target_compile_features(fcore_dehumbench PRIVATE cxx_std_20)
+
 # eqviz — renders PNG "quality pictures" (heatmaps + curve sheets) of every eq filter type against
 # independent analog references. Offline; catches parameter-corner bugs eyes-first (see tools/eqviz).
 add_executable(eqviz eqviz/eqviz.cpp)

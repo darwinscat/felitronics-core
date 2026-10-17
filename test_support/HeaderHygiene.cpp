@@ -52,6 +52,7 @@
 #include <felitronics/core/StateGrid.h>
 #include <felitronics/core/StreamResampler.h>
 #include <felitronics/deesser/DeEsser.h>
+#include <felitronics/dehum/HumRemover.h>
 #include <felitronics/dither/Dither.h>
 #include <felitronics/dynamiceq/DynamicEqBand.h>
 #include <felitronics/dynamiceq/LaneDynamics.h>
@@ -145,6 +146,7 @@ namespace
 
 // Explicit instantiations (shipped defaults) — force every template member body through the compiler.
 template class  felitronics::convolution::PartitionedConvolver<felitronics::core::fft::DefaultRealFft>;
+template class  felitronics::dehum::HumRemover<>;
 template class  felitronics::convolution::ConvolutionEngine<felitronics::core::fft::DefaultRealFft, 2>;
 template class  felitronics::convolution::MatrixConvolver<felitronics::core::fft::DefaultRealFft>;
 template class  felitronics::lineareq::MixedPhaseFir<felitronics::core::fft::DefaultRealFft>;
