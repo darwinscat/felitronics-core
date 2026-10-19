@@ -20,6 +20,8 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/FelitronicsPolicy.cmake)
 #   analysis      felitronics::analysis   felitronics::analysis core+oversampling (SpectrumTap; FFT via the seam; the reference true peak)
 #   dynamics      felitronics::dynamics   felitronics::dynamics  core         (EnvelopeFollower · GainComputer · Compressor · NoiseGate · AutoLeveler · TransientShaper · ChannelLinker)
 #   eq            felitronics::eq         felitronics::eq        core+analysis (matched biquads + Cytomic SVF + EqEngine)
+#   delay         felitronics::delay      felitronics::delay     core         (TapeDelay — the amps' echo)
+#   reverb        felitronics::reverb     felitronics::reverb    core+eq      (Freeverb + AmpReverb — the amps' tail)
 #
 # Consume (pinned by tag, exactly like JUCE) — JUCE-free, so this fetch never pulls JUCE:
 #   include(FetchContent)
@@ -71,6 +73,8 @@ add_subdirectory(modules/multiband)
 add_subdirectory(modules/dynamiceq)
 add_subdirectory(modules/deesser)
 add_subdirectory(modules/dehum)   # mains hum canceller (50/60 Hz + harmonics) — core only
+add_subdirectory(modules/delay)   # the amp plugins' tape-style echo — core only
+add_subdirectory(modules/reverb)   # Freeverb + the amp plugins' six-character tail — core + eq
 add_subdirectory(modules/dither)
 add_subdirectory(modules/lineareq)
 add_subdirectory(modules/measurement)   # OFFLINE IR-measurement math (sweep/Farina deconv/gate) — double, message-thread
@@ -108,7 +112,8 @@ if(FELITRONICS_BUILD_TESTS AND (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU"))
         felitronics::convolution felitronics::oversampling felitronics::limiter felitronics::neural
         felitronics::saturation felitronics::stereo felitronics::multiband felitronics::dynamiceq
         felitronics::deesser felitronics::dither felitronics::lineareq felitronics::measurement felitronics::blend
-        felitronics::io felitronics::text felitronics::codecgrid felitronics::dehum)
+        felitronics::io felitronics::text felitronics::codecgrid felitronics::dehum felitronics::delay
+        felitronics::reverb)
     target_compile_features(felitronics_header_hygiene PRIVATE cxx_std_20)
     target_compile_options(felitronics_header_hygiene PRIVATE ${FELITRONICS_HYGIENE_WARNINGS})
     # When selected, felitronics::convolution propagates the uniform FELITRONICS_WITH_PFFFT definition
@@ -134,7 +139,8 @@ if(FELITRONICS_BUILD_TESTS AND (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU"))
         felitronics::convolution felitronics::oversampling felitronics::limiter felitronics::neural
         felitronics::saturation felitronics::stereo felitronics::multiband felitronics::dynamiceq
         felitronics::deesser felitronics::dither felitronics::lineareq felitronics::measurement felitronics::blend
-        felitronics::io felitronics::text felitronics::codecgrid felitronics::dehum)
+        felitronics::io felitronics::text felitronics::codecgrid felitronics::dehum felitronics::delay
+        felitronics::reverb)
     target_compile_features(felitronics_no_exceptions_probe PRIVATE cxx_std_20)
     target_compile_options(felitronics_no_exceptions_probe PRIVATE -fno-exceptions -fno-rtti)
 endif()

@@ -12,9 +12,9 @@ if(FELITRONICS_BUILD_TESTS)
     # that has such an entry point.
     add_executable(felitronics_call_contract_tests tests/CallContractTests.cpp)
     target_link_libraries(felitronics_call_contract_tests PRIVATE
-        felitronics::analysis felitronics::convolution felitronics::deesser felitronics::dehum felitronics::dither
-        felitronics::dynamiceq felitronics::dynamics felitronics::eq felitronics::limiter
-        felitronics::lineareq felitronics::multiband felitronics::saturation felitronics::stereo)
+        felitronics::analysis felitronics::convolution felitronics::deesser felitronics::dehum felitronics::delay
+        felitronics::dither felitronics::dynamiceq felitronics::dynamics felitronics::eq felitronics::limiter
+        felitronics::lineareq felitronics::multiband felitronics::reverb felitronics::saturation felitronics::stereo)
     target_include_directories(felitronics_call_contract_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
     target_compile_features(felitronics_call_contract_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_call_contract_tests COMMAND felitronics_call_contract_tests)

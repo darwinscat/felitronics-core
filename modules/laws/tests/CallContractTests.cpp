@@ -38,6 +38,7 @@
 #include <felitronics/analysis/TruePeakMeter.h>
 #include <felitronics/convolution/CabConvolver.h>
 #include <felitronics/dehum/HumRemover.h>
+#include <felitronics/delay/TapeDelay.h>
 #include <felitronics/convolution/ConvolutionEngine.h>
 #include <felitronics/convolution/MatrixConvolver.h>
 #include <felitronics/deesser/DeEsser.h>
@@ -54,6 +55,7 @@
 #include <felitronics/multiband/MultibandCompressor.h>
 #include <felitronics/multiband/MultibandWidth.h>
 #include <felitronics/lineareq/NaturalPhaseEq.h>
+#include <felitronics/reverb/AmpReverb.h>
 #include <felitronics/saturation/Saturator.h>
 #include <felitronics/stereo/MonoBass.h>
 #include <felitronics/stereo/StereoWidth.h>
@@ -118,6 +120,39 @@ ADAPT (A_HumRemover, felitronics::dehum::HumRemover<>, kPrepCh, true, true, true
          hp.mains = felitronics::dehum::Mains::Hz50;          // run the canceller, at its quiet width so the
          hp.bandwidthHz = 3.0;                                // short fixture moves the weights
          s.setParams (hp); return okp; },
+       { return s.process (io, nch, n); },
+       { (void) s; return 0.0; },
+       { return s.prepare (kFs, kMaxBlock, w); });
+
+// The amps' echo and room. Both take a mono call as legal (one channel playing) and chunk any length.
+ADAPT (A_TapeDelay, felitronics::delay::TapeDelay, kPrepCh, true, true, true,
+       { const bool okp = s.prepare (kFs, kMaxBlock, kPrepCh);
+         felitronics::delay::TapeDelayParams dp;              // a 1 ms head, so the short fixture hears echoes
+         dp.timeMs = 1.0f; dp.repeats = 0.8f; dp.offsetMs = 0.5f; dp.mix = 1.0f;
+         s.setParams (dp); return okp; },
+       { return s.process (io, nch, n); },
+       { (void) s; return 0.0; },
+       { return s.prepare (kFs, kMaxBlock, w); });
+
+// The room's first comb returns 1214 samples after the input — past the short fixtures — so the census rings
+// it first: there has to be a tail for the properties to watch move.
+inline bool ringAmpReverb (felitronics::reverb::AmpReverb& s)
+{
+    felitronics::reverb::AmpReverbParams rp;
+    rp.character = felitronics::reverb::Character::modulated;
+    rp.mix = 1.0f;
+    s.setParams (rp);
+    std::vector<std::vector<float>> pre; fill (pre, kPrepCh, 4096, 0x5EEDu);
+    for (int at = 0; at < 4096; at += kMaxBlock)
+    {
+        float* q[kPrepCh] = { pre[0].data() + at, pre[1].data() + at };
+        if (! s.process (q, kPrepCh, kMaxBlock)) return false;
+    }
+    return true;
+}
+
+ADAPT (A_AmpReverb, felitronics::reverb::AmpReverb, kPrepCh, true, true, true,
+       { return s.prepare (kFs, kMaxBlock, kPrepCh) && ringAmpReverb (s); },
        { return s.process (io, nch, n); },
        { (void) s; return 0.0; },
        { return s.prepare (kFs, kMaxBlock, w); });
@@ -817,6 +852,8 @@ int main()
     allProperties<A_Dither>();
     allProperties<A_DeEsser>();
     allProperties<A_HumRemover>();
+    allProperties<A_TapeDelay>();
+    allProperties<A_AmpReverb>();
     allProperties<A_DynamicEqBand>();
     allProperties<A_EqBand>();
     allProperties<A_EqEngine>();
