@@ -85,7 +85,9 @@ incompatible dependency is a compile/link error; an allocation in `process()` is
 `ENOTSUP`, so `std::thread` compiles, links and merely aborts at runtime (measured, emsdk 6.0.9). What
 the wrap still cannot see: a thread in code never emitted (an unused inline, an uninstantiated template),
 and `std::mutex`, whose lock lives inside `libc++-noexcept.a` and whose stub silently succeeds — a lint
-over module headers covers the latter. **Law 8 is not covered at all**: a denormal stall is a property of
+over module headers covers the latter. An x86-only intrinsic keyed on `__SSE2__` is a **compile** error:
+every public header is also built under `-msimd128 -msse4.1` (the flags that put Eigen on its SSE path),
+where emscripten defines `__SSE2__` but has no `_mm_setcsr`. **Law 8 is not covered at all**: a denormal stall is a property of
 the CPU at runtime, invisible to any build. Full write-up:
 [`WASM-AUDIO-TIER.md`](WASM-AUDIO-TIER.md).
 - `desktop` — heap in `prepare`, SIMD, JUCE only in adapters.

@@ -11,7 +11,16 @@
 // DESKTOP optimization an adapter MAY add — never a correctness crutch, never set globally by the
 // core. Do NOT compile with -ffast-math (it breaks the NaN/inf semantics the tests assert).
 
-#if defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64) || defined(__x86_64__) || defined(__i386__) || defined(_M_IX86)
+// wasm is tested FIRST because it can look like x86 without being one. Built with -msimd128 -msse4.1
+// (what lets NAM's Eigen take its SSE path, which emscripten lowers onto SIMD128), emscripten defines
+// __SSE__/__SSE2__ and ships an <xmmintrin.h> — but WebAssembly has no MXCSR and no FTZ mode at all, so
+// that header has no _mm_setcsr and its _mm_getcsr returns a constant. Such a TU failed to compile here.
+// wasm therefore takes the path every target without an FP-control register takes: ScopedFlushToZero
+// is the no-op below, and law 8's software flush is what keeps denormals out — as it already was for a
+// wasm build without -msse.
+#if defined(__wasm__) || defined(__EMSCRIPTEN__)
+  // no FP-control register → neither macro below; ScopedFlushToZero is the no-op
+#elif defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64) || defined(__x86_64__) || defined(__i386__) || defined(_M_IX86)
   #include <xmmintrin.h>
   #include <pmmintrin.h>
   #define FELITRONICS_FTZ_X86 1
