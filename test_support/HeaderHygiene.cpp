@@ -53,6 +53,7 @@
 #include <felitronics/core/StreamResampler.h>
 #include <felitronics/deesser/DeEsser.h>
 #include <felitronics/dehum/HumRemover.h>
+#include <felitronics/delay/DelayLaw.h>
 #include <felitronics/delay/TapeDelay.h>
 #include <felitronics/dither/Dither.h>
 #include <felitronics/dynamiceq/DynamicEqBand.h>

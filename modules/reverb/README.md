@@ -2,29 +2,13 @@
 
 # `felitronics::reverb`
 
-Freeverb, and the amp plugins' six-character room built on it. Header-only, JUCE-free, depends on `core`
-and `eq` (the wet HPF). Moved here from OrbitAmp's `ReverbStage`, which sat on the framework's Freeverb and
-so had to live in the product; now every amp plugin and the browser demo run one implementation.
+The amp plugins' six-character room, `AmpReverb`, and the Freeverb it is built on. Header-only, JUCE-free,
+depends on `core` and `eq` (the wet HPF). Moved here from OrbitAmp's `ReverbStage`, which sat on the
+framework's Freeverb and so had to live in the product; now every amp plugin and the browser demo run one
+implementation. **A host uses `AmpReverb`**; `Freeverb` is the primitive it owns.
 
 ```cmake
 target_link_libraries(app PRIVATE felitronics::reverb)
-```
-
-## `Freeverb`
-
-Jezar's Freeverb (Dreampoint, 2000, public domain) written here from the published algorithm: eight
-lowpass-feedback combs into four allpasses per channel, the right channel spread 23 samples. It reproduces
-the behaviour of the Freeverb the amps were voiced on (the one JUCE ships as `juce::Reverb`), established
-by measuring that implementation's output, not by copying it: the published tunings scaled as
-`(int) rate * tuning / 44100`; input gain 0.015; damping × 0.4; feedback `room × 0.28 + 0.7`; wet × 3 split
-by width; dry × 2; freeze at ≥ 0.5; and a linear 10 ms glide on damping, feedback, dry and both wet gains.
-
-```cpp
-felitronics::reverb::Freeverb f;
-f.prepare (sampleRate);                 // [[nodiscard]] bool; allocates; lands every glide
-f.setParams ({ .roomSize = 0.5f, .damping = 0.5f, .wetLevel = 0.33f, .dryLevel = 0.4f, .width = 1, .freezeMode = 0 });
-f.processStereo (left, right, n); f.processMono (x, n);
-f.reset(); f.clearChannel (ch); f.advanceGlides (n);
 ```
 
 ## `AmpReverb`
@@ -36,7 +20,7 @@ whole wet chain runs on a scratch copy and is added.
 
 ```cpp
 felitronics::reverb::AmpReverb r;
-r.prepare (sampleRate, maxBlock, maxChannels);   // [[nodiscard]] bool; 1 or 2 channels
+r.prepare (sampleRate, maxBlock, maxChannels);   // [[nodiscard]] bool; 1 or 2 channels, 1 … 768 kHz
 r.setParams ({ .character = Character::plate, .mix = 0.3f, .decay = 1, .predelayMs = 0, .hpfHz = 120 });
 r.process (io, nch, n, feed);                    // [[nodiscard]] bool, in place; feed=false = stand-by
 r.reset();                                       // stream restart, idempotent
@@ -46,39 +30,62 @@ r.tailSeconds(); r.addedWet (ch); r.addedLength();
 `kCharacterNames` carries the six labels. The per-knob setters are public, guarded like the app's;
 `setParams` calls them in the app's order.
 
+## `Freeverb`
+
+Jezar's Freeverb (Dreampoint, 2000, public domain): eight lowpass-feedback combs into four allpasses per
+channel, the right channel spread 23 samples. Its constants: the published tunings scaled as
+`(int) rate * tuning / 44100`; input gain 0.015; damping × 0.4; feedback `room × 0.28 + 0.7`; wet × 3 split
+by width; dry × 2; freeze at ≥ 0.5; a linear 10 ms glide on damping, feedback, dry and both wet gains.
+`processStereo` / `processMono` are `[[nodiscard]] bool` and refuse when unprepared.
+
 ## Contract
 
-- `prepare` allocates; `process`/`reset`/setters never allocate, lock or throw.
-- Law 11: refusals as in the delay; a call longer than `maxBlock` is processed in `maxBlock` chunks, the
-  same as the caller chunking (`addedWet` then holds the last chunk). One channel runs the room's mono
-  path; a channel that stopped is cleared once; `nch == 0` is a pause during which the glides and the
-  chorus LFO run on.
-- Law 8: Freeverb flushes its comb filters and every comb/allpass write below 1e-30 **per sample** (its
-  buffers are the state; see the header for why not 1e-15); the HPF rides `core::StateGrid` with the eq
-  module's own flush. A long silence ends in exact zero.
-- Poison: a non-finite input sample never enters the wet chain; a non-finite tail is dropped whole and the
-  room restarts.
-- libm: `std::sin` (the chorus LFO, per sample), `std::log2`, `std::log` are the system functions on
-  purpose — they are the app's (`retain-rt` in the manifest).
+- `prepare` allocates; `process`/`reset`/setters never allocate, lock or throw. A refused `prepare`
+  **disarms**. A prepared room starts AT its set parameters — nothing glides in.
+- Law 11: refusals as in the delay; a call longer than the scratch is processed in chunks of
+  `min(maxBlock, 8192)`, the same as the caller chunking (`addedWet` then holds the last chunk; a whole-file
+  `maxBlock` costs only the capped scratch). One channel runs the room's mono path; a channel that stopped is
+  cleared once; `nch == 0` is a pause during which the room's glides and the chorus LFO run on as through
+  silence.
+- `reset()` is a stream restart: every line cleared, every clock re-anchored (line positions, the chorus
+  LFO's phase, the law-8 grid) and every glide landed on its target.
+- Law 8: Freeverb flushes its comb filters and every comb/allpass write below 1e-15 per sample
+  (`core::flushDenormal` — its buffers are the state); the HPF rides `core::StateGrid` with the eq module's
+  own flush. A long silence ends in exact zero, and stays there.
+- Knobs: non-finite values are ignored, an unknown character index too; finite ones are clamped.
+- Threads: prepare, reset, the setters and process belong to one thread; `tailSeconds()` may be read from
+  any thread; `addedWet`/`addedLength` belong to the process thread.
+- Math: `core::det` (`log2` for DECAY and the tail, `sin` for the chorus LFO — per sample, ~5 ns), so the
+  same bits on every row up to FMA contraction (law 10).
 
-## Parity with the app
+## Provenance and parity
 
-An out-of-tree harness renders OrbitAmp's own `ReverbStage` (feat/titan, on `juce::Reverb` of JUCE 8.0.16) and
-`AmpReverb` side by side — impulse, noise burst, log sweep into a silent tail; 44.1/48/96 kHz; blocks 1,
-64, 512, 333; mono and stereo; every character at mix/decay/predelay/HPF corners and middles; a character
-walk, stand-by and restarts, a per-block DECAY sweep (each move restarting the room's glide), one-ulp
-jitter. 1824 renders on arm64: 1640 bit-identical, the rest within 4.9e-16 — the HPF's 1e-15 flush, and
-nothing else: with the flushes removed all 1824 are bit-identical. `Freeverb` against `juce::Reverb`
+`AmpReverb` is OrbitAmp's own `ReverbStage` (feat/titan, by the same authors), expression for expression.
+`Freeverb` was written here from the published, public-domain description of Jezar's algorithm and its
+well-known constants. The framework's Freeverb (JUCE's `juce::Reverb`), on which the app's stage ran, was
+only ever RUN, never copied: its behaviour — the integer tuning scale, the glide, the mono path leaving wet2
+alone, no state quantisation on arm64 — was established by measuring its output against this one's.
+`tests/reverb_golden.h` holds regression excerpts of this module's own renders, so CI guards the sound.
+
+Measured on arm64 against the app's class (impulse, noise, sweep and their silent tails; 44.1/48/96 kHz;
+blocks 1, 64, 512, 333; mono and stereo; every character at mix/decay/predelay/HPF corners and middles;
+character walks, stand-by and restarts, a per-block DECAY sweep, one-ulp jitter), counting from 130 ms on —
+past the app's own first-prepare leak (up to 0.79 in the first 10 ms, carried through PREDELAY and the HPF):
+**at most 1.2e-10 for the five unmodulated characters** at PREDELAY up to 50 ms (the flush and `det::log2`),
+3.8e-4 at PREDELAY 100 ms with the 40 Hz HPF (still the leak, ringing out of the HPF), 9.4e-5 for MODULATED
+(its LFO in `det::sin`), and 3e-5 … 7.6e-5 with the knobs moving. `Freeverb` against the framework's
 directly (random parameters with freeze, dry and width; mono, stereo, alternating; parameters set before
-the first prepare; 22.05 … 192 kHz; a 1e-7 input): 144 of 144 bit-identical. `tests/reverb_golden.h`
-keeps excerpts of the app's renders so CI guards this without JUCE.
+the first prepare; 22.05 … 192 kHz; a 1e-7 input): 73 of 144 bit-identical, the rest within 2.8e-14 —
+the law-8 flush.
 
-**x86-64 is different, in the app itself.** Built for x86-64 (measured under Rosetta), the framework's
-Freeverb quantises its comb and allpass state to 0.1f's ulp (≈ 7.5e-9); on arm64 it does not. So the
-shipped amps already differ between the two by up to 1.04e-6 (-120 dBFS) — the harness's x86-64 build
-reads exactly that against this module, and 0 for the delay. This module does not snap anywhere: it is the arm64 sound on every
-platform, and on x86-64 it differs from the x86-64 app by that same amount.
+**Intel builds of the plugins move.** Built for x86-64 (measured under Rosetta), the framework's Freeverb
+quantises its comb and allpass state to 0.1f's ulp (≈ 7.5e-9); on arm64 it does not. This module does not
+quantise anywhere — it is the arm64 sound on every platform (owner's decision) — so on Intel the plugins
+move by up to 1.04e-6 (-120 dBFS) from today's app.
 
-**Where it departs from the app, on purpose:** the law-8 flushes; non-finite knob values are ignored;
-an unknown character index is ignored; a call past `maxBlock` is processed whole (the app dropped the
-tail); and law 11's stopped-channel and pause rules.
+**Where it departs from the app, on purpose:** the Intel line above; `core::det` instead of the system libm;
+the law-8 flushes; a fresh room no longer glides in from Freeverb's published initial parameters (the app's
+first 10 ms after its first prepare added up to 0.8 × mix of the dry); `reset()` re-anchors the clocks and
+lands the glides (the app's chorus kept its phase across a reset); `prepare` disarms on refusal; the tail
+estimate is right from construction (the app reported 1.000 s, the formula says 1.176); a call longer than
+`maxBlock` is processed whole (the app dropped the rest); and law 11's stopped-channel and pause rules.

@@ -130,7 +130,7 @@ struct CoreAdapter
     void apply (const Knobs& k)
     {
         felitronics::delay::TapeDelayParams p;
-        p.timeMs   = k.sync ? felitronics::delay::divisionMs (k.division, k.bpm) : k.timeMs;
+        p.timeMs   = felitronics::delay::timeMsFor (k.sync, k.division, k.bpm, k.timeMs);
         p.repeats  = k.repeats;
         p.darkHz   = felitronics::delay::darkHzForPercent (k.darkPct);
         p.offsetMs = k.offsetMs;

@@ -58,10 +58,6 @@ modules/dynamics/include/felitronics/dynamics/TransientShaper.h  [dbToGain()*1 e
 # --- dehum: the mains hum canceller on an input ---
 modules/dehum/include/felitronics/dehum/HumRemover.h  [atan2*2 hypot*1 log10*3]  retain-rt  the two atan2 are the coarse mains estimate (a bin's phase advance, once per 0.25 s hop), which sets the frequency the canceller runs at, so they reach shipped audio: the header states that rows agree within tolerance there, not bit for bit. The hypot and the three log10 are telemetry (humDb, harmonicDb, the LEARN report's floor), read by a UI and never by the audio path
 
-# --- delay / reverb: the amp plugins' echo and room, moved from the product — the system libm IS their sound ---
-modules/delay/include/felitronics/delay/TapeDelay.h  [exp*3 log*2 pow*1 tanh*1]  retain-rt  tanh is the record head's saturator, per sample in the loop; exp is three coefficients (the motor's and the offset's glide, the loop low pass) set when a knob moves; pow maps the DARK knob to a corner; log is the tail estimate a host reads. All of it is the shipped amps' arithmetic, held bit-identical to the app's own class by a parity harness, so converting any of it is the owner's decision
-modules/reverb/include/felitronics/reverb/AmpReverb.h  [log*2 log2*1 sin*1]  retain-rt  sin is the MODULATED character's chorus LFO, per sample; log2 maps DECAY onto the room size when a knob moves; log is the tail estimate a host reads. The shipped amps' arithmetic, held bit-identical to the app's own class by a parity harness
-
 # --- eq: the biggest group, and all of it is coefficient design for shipped filters ---
 modules/eq/include/felitronics/eq/EqBand.h  [abs*1 polar*1 sin*1]  retain-rt  Butterworth Q design and the z^-1 phasor for a band's response. std::polar is cos+sin in disguise, which is why the lint governs it
 modules/eq/include/felitronics/eq/EqEngine.h  [abs*3 log10*2]  retain-rt  the composite magnitude response in dB, for the curve the user sees and for the engine's own fitting

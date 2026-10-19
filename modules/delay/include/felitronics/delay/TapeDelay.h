@@ -3,6 +3,10 @@
 
 #pragma once
 
+#include <felitronics/core/DetMath.h>
+#include <felitronics/core/FlushToZero.h>
+#include <felitronics/delay/DelayLaw.h>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -17,8 +21,9 @@ namespace felitronics::delay
 //==============================================================================
 // felitronics::delay::TapeDelay — the echo before the space: repeats of what the preamp made, which a
 // reverb then rooms. Moved here from OrbitAmp (its `DelayStage`) so the amp plugins and the browser demo
-// run ONE implementation; the arithmetic is the app's, expression for expression, and a parity harness
-// against the app's own class pins that (bit-identical on the rows it was run on — see README.md).
+// run ONE implementation. The signal path is the app's, expression for expression; the transcendentals are
+// core::det rather than the system libm, so every row computes the same bits from the same arithmetic — the
+// distance to the app's own class is measured by a parity harness and is ulp-level (see README.md).
 //
 // A TAPE HEAD, NOT A SAMPLER. The delay TIME is a target the line glides toward, and while it glides the
 // read head moves at the wrong speed — the repeats bend in pitch, the way a tape echo bends when its motor
@@ -35,7 +40,8 @@ namespace felitronics::delay
 //
 // CONTRACT (DSP-ARCHITECTURE.md §2).
 //   · prepare(sampleRate, maxBlock, maxChannels) allocates every line; process()/reset() never allocate,
-//     lock or throw. maxChannels is 1 or 2 — a wider prepare is REFUSED, not clamped (law 11b).
+//     lock or throw. maxChannels is 1 or 2 and the rate 1 kHz … 768 kHz — anything else is REFUSED, and a
+//     refused prepare DISARMS the instance: process() refuses until a prepare succeeds (law 11b).
 //   · process() is [[nodiscard]] bool (law 11): an unprepared instance, a width above the prepared one, or a
 //     negative extent is refused before anything moves; any n >= 0 is processed in full (the stage has no
 //     block-sized scratch, so maxBlock is not a limit here).
@@ -43,65 +49,34 @@ namespace felitronics::delay
 //     offset line and loop filter are dropped once, on that edge, and its offset head snaps to its target
 //     when it returns. nch == 0 with n > 0 is a gap: the shared motor glides on through it as through
 //     silence (law 11c) and every channel's memory is dropped.
-//   · Law 8: the loop filter's state and the offset glide are flushed to zero below 1e-30 PER SAMPLE, so no
-//     path reaches the subnormal band — the line is written only through the loop filter, and a glide whose
-//     target is zero would otherwise park a few subnormals short of it. Per sample, so the flush cannot
-//     depend on how the caller slices the stream. Neither flush can move a sample by more than ~1e-29.
+//   · reset() is a stream RESTART: the lines cleared, the write clocks re-anchored at zero and the heads
+//     snapped to their targets on the next call — what follows a reset does not depend on what came before.
+//   · Law 8: the loop filter's state and the offset glide are flushed to zero below 1e-15 PER SAMPLE
+//     (core::flushDenormal), so no path reaches the subnormal band — the line is written only through the
+//     loop filter, and a glide whose target is zero would otherwise park a few subnormals short of it. Per
+//     sample, so the flush cannot depend on how the caller slices the stream. Both heads glide in double and
+//     LAND: once an update no longer moves a head, it is put on its target (LAW8-AUDIT.md, item 6) — the
+//     app's float heads parked up to 1/(2·coeff) ulps short, 2.3 ms at 6 s.
 //   · POISON: a non-finite INPUT sample is not recorded (the dry keeps it — it is not this stage's to
-//     change); a non-finite loop state at the end of a call restarts the line from silence.
-//   · The picture taps (tailSeconds, shownTimeMs, shownOffsetMs, inputPeak) are relaxed atomics: the audio
-//     thread writes them, any other thread may read them.
-//   · libm: std::exp (coefficients), std::tanh (per sample), std::log (the tail estimate) and std::pow (the
-//     DARK mapping) are the SYSTEM functions, deliberately — they are the app's, and parity with the shipped
-//     sound is the point. Listed in tools/lint/det-math-manifest.txt as retain-rt.
+//     change); a non-finite loop state at the end of a call restarts the line from silence. Knob values are
+//     bounded before they reach any arithmetic: a non-finite one is ignored, a finite one is clamped.
+//   · THREADS: prepare, reset, the setters and process belong to ONE thread (the audio thread, or whichever
+//     owns the stage). tailSeconds, shownTimeMs, shownOffsetMs and inputPeak are relaxed atomics that any
+//     other thread may read.
+//   · Math: core::det (exp2, log2, pow) for the coefficients and the tail, and a det-built tanh per sample in
+//     the loop — ~5 ns a call, measured against the system tanh's ~2: one call per sample per channel.
 //==============================================================================
 
 /** The knobs, in the units the stage takes. `TapeDelay::setParams` applies them in this order, through
     the same guarded setters a caller may use one by one. */
 struct TapeDelayParams
 {
-    float timeMs   = 350.0f;   ///< the head's destination, ms (>= 1); free, or `divisionMs()` for a synced one
+    float timeMs   = 350.0f;   ///< the head's destination, ms (1 … 6100); free, or from `timeMsFor()`
     float repeats  = 0.35f;    ///< feedback 0..1 — the dark filter and the saturator keep even 1 bounded
     float darkHz   = 4000.0f;  ///< the loop low-pass corner, Hz (`darkHzForPercent()` maps the DARK knob)
     float offsetMs = 0.0f;     ///< signed: positive holds the RIGHT repeats back, negative the left (±31)
     float mix      = 0.25f;    ///< 0 = dry only, 1 = the repeats added at unity; dry never moves
 };
-
-//------------------------------------------------------------------------------
-// The parameter law of the shipped amps — the sync ladder and the DARK knob — so a host that drives this
-// stage (a plugin, the web demo) lands on the same numbers the app does.
-//------------------------------------------------------------------------------
-
-/** The sync ladder, longest first, dotted and triplet beside each plain value. */
-inline constexpr int kNumDivisions = 13;
-inline constexpr const char* kDivisionNames[kNumDivisions] = { "1/1", "1/2.", "1/2", "1/2T", "1/4.", "1/4",
-                                                               "1/4T", "1/8.", "1/8", "1/8T", "1/16.", "1/16",
-                                                               "1/16T" };
-/** The same ladder in quarter notes: ms = beats × 60000 / BPM. */
-inline constexpr float kDivisionBeats[kNumDivisions] = { 4.0f, 3.0f, 2.0f, 4.0f / 3.0f, 1.5f, 1.0f,
-                                                         2.0f / 3.0f, 0.75f, 0.5f, 1.0f / 3.0f, 0.375f,
-                                                         0.25f, 1.0f / 6.0f };
-inline constexpr int   kDivisionDefault = 5;                       // 1/4
-inline constexpr float kBpmMin = 40.0f, kBpmMax = 240.0f, kBpmDefault = 120.0f;
-inline constexpr float kTimeMinMs = 20.0f, kTimeMaxMs = 2000.0f;   // the free TIME knob's range
-inline constexpr float kOffsetMaxMs = 30.0f;                       // the OFFSET knob's reach
-inline constexpr float kDarkLoHz = 800.0f, kDarkHiHz = 16000.0f;   // DARK's floor and ceiling
-inline constexpr float kDarkDefaultPct = 45.0f;                    // ~4 kHz — the tape-ish middle
-
-/** A synced division's time at `bpm`, in ms. The division index is clamped to the ladder; `bpm` must be
-    positive (the caller chooses whose tempo — the host's or its own field). */
-inline float divisionMs (int division, double bpm) noexcept
-{
-    const int d = division < 0 ? 0 : (division >= kNumDivisions ? kNumDivisions - 1 : division);
-    return (float) ((double) kDivisionBeats[d] * 60000.0 / bpm);
-}
-
-/** DARK is a percent of darkness, so the knob's direction tells the truth: clockwise darkens. The corner
-    falls log-evenly from the bright ceiling to the dark floor, every degree darkening by the same ear-step. */
-inline float darkHzForPercent (float percent) noexcept
-{
-    return kDarkHiHz * std::pow (kDarkLoHz / kDarkHiHz, percent * 0.01f);
-}
 
 namespace detail
 {
@@ -119,11 +94,35 @@ namespace detail
 
     inline float clampf (float lo, float hi, float v) noexcept { return v < lo ? lo : (hi < v ? hi : v); }
 
-    /** Law 8, per sample: exact zero below 1e-30. Not the house 1e-15 (core::flushDenormal): the loop
-        integrates what it flushes, so the threshold sets how far the deep tail departs from the unflushed
-        reference — 1.5e-15 at 1e-15, measured. 1e-30 is still eight decades clear of the subnormal floor,
-        and no product in the loop (coefficients >= ~1e-4 at any sane rate) can reach it. */
-    inline void flushTiny (float& x) noexcept { if (std::fabs (x) < 1.0e-30f) x = 0.0f; }
+    inline constexpr double kLog2E = 1.4426950408889634074;
+
+    /** e^x, the same bits on every row: core::det::exp2 of a pinned product. */
+    inline double detExp (double x) noexcept { return core::det::exp2 (core::det::mul (x, kLog2E)); }
+
+    /** tanh, the same bits on every row, for the loop's saturator. Below 1/16 a Taylor polynomial (its next
+        term is < 1e-14 relative there), above it 1 − 2/(e^{2|x|} + 1), which no longer cancels; every
+        multiply-add pinned against contraction (core::det::mulAdd). Accurate far past float in both. */
+    inline float detTanh (float xf) noexcept
+    {
+        const double x = (double) xf;
+        const double a = std::fabs (x);
+
+        if (a < 0.0625)
+        {
+            const double x2 = core::det::mul (x, x);
+            double p = core::det::mulAdd (x2, 62.0 / 2835.0, -17.0 / 315.0);
+            p = core::det::mulAdd (x2, p, 2.0 / 15.0);
+            p = core::det::mulAdd (x2, p, -1.0 / 3.0);
+            return (float) core::det::mulAdd (core::det::mul (x, x2), p, x);
+        }
+
+        if (a > 20.0)
+            return x > 0.0 ? 1.0f : -1.0f;
+
+        const double e = core::det::exp2 (core::det::mul (2.0 * a, kLog2E));
+        const double t = 1.0 - 2.0 / (e + 1.0);
+        return (float) (x < 0.0 ? -t : t);
+    }
 } // namespace detail
 
 class TapeDelay
@@ -132,13 +131,19 @@ public:
     static constexpr int    kMaxChannels      = 2;
     static constexpr double kMaxDelaySeconds  = 6.1;     // 1/1 at 40 BPM, with margin
     static constexpr double kMaxOffsetSeconds = 0.031;   // the offset knob's reach
-    static constexpr float  kMinDarkHz = 1.0f, kMaxDarkHz = 100000.0f;   // a corner outside is clamped
+    static constexpr float  kMaxTimeMs = (float) (kMaxDelaySeconds * 1000.0);   // a longer TIME is this
+    static constexpr float  kMinDarkHz = 1.0f, kMaxDarkHz = 100000.0f;          // a corner outside is clamped
+    static constexpr double kMinSampleRate = 1000.0, kMaxSampleRate = 768000.0;
 
-    /** Allocates every line for `maxChannels` (1 or 2) at `sampleRate`. `maxBlock` (>= 1) is recorded, not
-        a limit: the stage has no block-sized scratch. A refused prepare leaves the instance as it was. */
+    TapeDelay() noexcept { refreshTail(); }
+
+    /** Allocates every line for `maxChannels` (1 or 2) at `sampleRate` (1 kHz … 768 kHz). `maxBlock` (>= 1) is
+        recorded, not a limit: the stage has no block-sized scratch. A refused prepare DISARMS the instance. */
     [[nodiscard]] bool prepare (double newSampleRate, int maxBlock, int maxChannels)
     {
-        if (! (newSampleRate > 0.0) || ! std::isfinite (newSampleRate) || maxBlock < 1
+        prepared_ = false;   // law 11b: whatever happens next, the old preparation no longer stands
+
+        if (! (newSampleRate >= kMinSampleRate && newSampleRate <= kMaxSampleRate) || maxBlock < 1
             || maxChannels < 1 || maxChannels > kMaxChannels)
             return false;
 
@@ -156,8 +161,8 @@ public:
             const bool used = (int) ch < maxCh_;
             line[ch].assign (used ? lineMax : 0, 0.0f);
             offLine[ch].assign (used ? offMax : 0, 0.0f);
-            lpfState[ch] = 0.0f;
-            live_[ch]    = false;
+            lpfState[ch]   = 0.0f;
+            live_[ch]      = false;
             offPrimed_[ch] = true;
         }
 
@@ -172,9 +177,10 @@ public:
         // The glides, seeded: a fresh line starts ON its targets rather than sweeping in from wherever the
         // last session left the heads.
         currentDelay = targetDelaySamples();
-        currentOff[0] = currentOff[1] = 0.0f;
+        currentOff[0] = currentOff[1] = 0.0;
 
         updateCoeffs();
+        refreshTail();
         prepared_ = true;
         return true;
     }
@@ -184,8 +190,8 @@ public:
     int  maxBlock()    const noexcept { return prepared_ ? maxBlock_ : 0; }
     static constexpr int latencySamples() noexcept { return 0; }
 
-    /** A stream restart: the lines cleared and the heads re-snapped on the next call. Cheap-idempotent — a
-        stage out of the rig may call it every block; the clear runs once. */
+    /** A stream restart: the lines cleared, the write clocks back at zero, the heads re-snapped on the next
+        call. Cheap-idempotent — a stage out of the rig may call it every block; the clear runs once. */
     void reset() noexcept
     {
         if (cleared)
@@ -199,6 +205,8 @@ public:
             live_[ch]    = false;
         }
 
+        writePos = 0;   // law 11a: a restart re-anchors the clocks, so the read fractions after it do not
+        offPos   = 0;   // depend on how long the stream ran before it
         primed  = false;
         cleared = true;
     }
@@ -213,14 +221,14 @@ public:
         setMix (p.mix);
     }
 
-    /** The head's destination, in milliseconds — free or from `divisionMs()`. The line glides there; big
-        moves bend. Below 1 ms is 1 ms; a non-finite value is ignored. */
+    /** The head's destination, in milliseconds — free, or `timeMsFor()`. The line glides there; big moves
+        bend. Clamped to 1 … 6100 ms (the line's reach); a non-finite value is ignored. */
     void setTimeMs (float ms) noexcept
     {
         if (! std::isfinite (ms))
             return;
 
-        const float want = std::max (1.0f, ms);
+        const float want = detail::clampf (1.0f, kMaxTimeMs, ms);
 
         if (! detail::nearlyEqual (want, timeMs))
         {
@@ -247,7 +255,7 @@ public:
         refreshTail();
     }
 
-    /** The loop low-pass corner — LOWER is darker, and every pass darkens again. */
+    /** The loop low-pass corner — LOWER is darker, and every pass darkens again. Clamped to 1 Hz … 100 kHz. */
     void setDarkHz (float hz) noexcept
     {
         if (! std::isfinite (hz))
@@ -337,7 +345,7 @@ public:
             // Law 11c — a pause is silence for the shared motor: it glides on as it would through n samples
             // of digital silence. Every channel stopped above, so there is no line to read or write.
             for (int i = 0; i < numSamples; ++i)
-                currentDelay += (tgtDelay - currentDelay) * glideCoeff;
+                glide (currentDelay, tgtDelay, glideCoeff);
 
             writePos = (int) (((long long) writePos + numSamples) % lineN_);
             offPos   = (int) (((long long) offPos   + numSamples) % offN_);
@@ -362,8 +370,8 @@ public:
         {
             // The motor: one exponential glide shared by both channels, so the comb never splits while it
             // travels.
-            currentDelay += (tgtDelay - currentDelay) * glideCoeff;
-            const float dly = detail::clampf (1.0f, (float) (lineN - 4), currentDelay);
+            glide (currentDelay, tgtDelay, glideCoeff);
+            const float dly = detail::clampf (1.0f, (float) (lineN - 4), (float) currentDelay);
 
             for (int ch = 0; ch < nch; ++ch)
             {
@@ -392,17 +400,17 @@ public:
                 // the dry keeps it, it is not ours.
                 float v = (feed && std::isfinite (x) ? x : 0.0f) + tap * repeats;
                 lpfState[ch] += lpfCoeff * (v - lpfState[ch]);
-                detail::flushTiny (lpfState[ch]);   // law 8: the only way into the line is through here
-                v = std::tanh (lpfState[ch] * satDrive) * satNorm;
+                core::flushDenormal (lpfState[ch]);   // law 8: the only way into the line is through here
+                v = detail::detTanh (lpfState[ch] * satDrive) * satNorm;
                 ln[writePos] = v;
 
                 // The offset line rides the WET only — one channel's comb held back whole. It runs on its OWN
                 // write position: it is a short line, and the long line's clock would walk past its end.
-                currentOff[ch] += (tgtOff[ch] - currentOff[ch]) * offGlideCoeff;
-                detail::flushTiny (currentOff[ch]);   // law 8: a glide to zero parks subnormals short of it
+                glide (currentOff[ch], tgtOff[ch], offGlideCoeff);
+                core::flushDenormal (currentOff[ch]);   // law 8: a glide to zero parks subnormals short of it
                 ol[offPos] = tap;
 
-                float opos = (float) offPos - detail::clampf (0.0f, (float) (offN - 4), currentOff[ch]);
+                float opos = (float) offPos - detail::clampf (0.0f, (float) (offN - 4), (float) currentOff[ch]);
                 if (opos < 0.0f)
                     opos += (float) offN;
 
@@ -438,7 +446,7 @@ public:
         echoes are discrete, and the n-th leaves at n·t carrying g^(n-1), so the first under a thousandth is
         `1 + ln(0.001)/ln(g)` of them. At zero it is one echo; at one it never decays and the answer is a
         million seconds — the caller caps it. Deliberately the LONG estimate: the darkening and the
-        saturator bleed the loop further. */
+        saturator bleed the loop further. Correct from construction on, before any knob is touched. */
     float tailSeconds()   const noexcept { return tailSec_.load (std::memory_order_relaxed); }
 
     /** The picture's taps — the glided time and offset while the stage runs (the set targets while it does
@@ -450,12 +458,12 @@ public:
     /** True when any recursive state sits in the subnormal band — the law-8 witness for the tests. */
     bool anySubnormalState() const noexcept
     {
-        const auto sub = [] (float v) { return std::fpclassify (v) == FP_SUBNORMAL; };
-        for (int ch = 0; ch < kMaxChannels; ++ch)
+        const auto sub = [] (auto v) { return std::fpclassify (v) == FP_SUBNORMAL; };
+        for (std::size_t ch = 0; ch < (std::size_t) kMaxChannels; ++ch)
         {
             if (sub (lpfState[ch]) || sub (currentOff[ch]))
                 return true;
-            for (float v : line[(std::size_t) ch])
+            for (float v : line[ch])
                 if (sub (v))
                     return true;
         }
@@ -463,6 +471,17 @@ public:
     }
 
 private:
+    /** One step of an exponential glide that LANDS. The heads glide in DOUBLE: in float the update stops
+        moving the value once (target − current)·coeff falls under half an ulp of `current`, which is
+        1/(2·coeff) ulps short — measured on the app's float motor, 112 samples (2.3 ms) short of a 6 s target
+        at 48 kHz, parked there for good. In double that distance is ~1e-6 of a sample, so when the update no
+        longer moves the value, putting it on the target is a step nobody can hear. */
+    static void glide (double& current, double target, double coeff) noexcept
+    {
+        const double next = current + (target - current) * coeff;
+        current = std::fabs (next - current) > 0.0 ? next : target;
+    }
+
     float targetDelaySamples() const noexcept
     {
         return (float) ((double) timeMs * 0.001 * sampleRate);
@@ -471,9 +490,9 @@ private:
     void updateCoeffs() noexcept
     {
         // The motor's inertia: ~150 ms to the new time — enough travel to hear the bend.
-        glideCoeff    = 1.0f - std::exp ((float) (-1.0 / (0.15 * sampleRate)));
-        offGlideCoeff = 1.0f - std::exp ((float) (-1.0 / (0.03 * sampleRate)));
-        lpfCoeff      = 1.0f - std::exp ((float) (-kTwoPi * (double) darkHz / sampleRate));
+        glideCoeff    = 1.0 - detail::detExp (-1.0 / (0.15 * sampleRate));
+        offGlideCoeff = 1.0 - detail::detExp (-1.0 / (0.03 * sampleRate));
+        lpfCoeff      = 1.0f - (float) detail::detExp (-kTwoPi * (double) darkHz / sampleRate);
     }
 
     void stopChannel (int ch) noexcept
@@ -504,7 +523,7 @@ private:
 
     /** Worked out where the numbers it depends on are set, rather than where it is asked: the asker may be
         any thread and these are the audio thread's. Every setter checks first, so an untouched knob costs no
-        logarithm. */
+        logarithm. log2 for ln: the ratio is the same in any base. */
     void refreshTail() noexcept
     {
         const double t   = (double) timeMs * 0.001;
@@ -513,11 +532,11 @@ private:
 
         tailSec_.store ((float) (off + (g <= 0.0 ? t
                                       : g >= 1.0 ? 1.0e6            // never decays; the caller caps it
-                                                 : t * (1.0 + std::log (0.001) / std::log (g)))),
+                                                 : t * (1.0 + core::det::log2 (0.001) / core::det::log2 (g)))),
                         std::memory_order_relaxed);
     }
 
-    std::atomic<float> tailSec_       { 0.35f };
+    std::atomic<float> tailSec_       { 0.0f };   // set by the constructor, from the formula
     std::atomic<float> shownTimeMs_   { 350.0f };
     std::atomic<float> shownOffsetMs_ { 0.0f };
     std::atomic<float> envIn_         { 0.0f };
@@ -529,13 +548,14 @@ private:
     float mix      = 0.25f;
 
     double sampleRate = 48000.0;
-    float  glideCoeff = 0.0f, offGlideCoeff = 0.0f, lpfCoeff = 1.0f;
+    double glideCoeff = 0.0, offGlideCoeff = 0.0;   // the heads' glides, in double
+    float  lpfCoeff = 1.0f;
 
     std::array<std::vector<float>, kMaxChannels> line, offLine;
     int   lineN_ = 0, offN_ = 0;
     int   writePos = 0, offPos = 0;
-    float currentDelay = 0.0f;
-    float currentOff[kMaxChannels] { 0.0f, 0.0f };
+    double currentDelay = 0.0;                        // the heads glide in double — see glide()
+    double currentOff[kMaxChannels] { 0.0, 0.0 };
     float lpfState[kMaxChannels]   { 0.0f, 0.0f };
     bool  live_[kMaxChannels]      { false, false };   // carried by a call since the last clear (law 11a)
     bool  offPrimed_[kMaxChannels] { true, true };     // false: the offset head snaps on the channel's return

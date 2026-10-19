@@ -29,7 +29,7 @@ The guitar-amp modules — `nam` (the NeuralAmpModelerCore backend), `rigplayer`
 
 | Module | What | Key types |
 |---|---|---|
-| `delay` | tape-style echo: a gliding (repitching) head, a dark saturated loop, a stereo offset; the sync ladder and DARK law | `TapeDelay`, `divisionMs`, `darkHzForPercent` |
+| `delay` | tape-style echo: a gliding (repitching) head, a dark saturated loop, a stereo offset; the knob law (sync ladder, sync policy, DARK) | `TapeDelay`, `DelayLaw.h` (`divisionMs`, `timeMsFor`, `darkHzForPercent`) |
 | `reverb` | Freeverb (the published algorithm, matched to the behaviour the amps were voiced on) and the six-character amp room | `Freeverb`, `AmpReverb` |
 
 ## Mastering stages

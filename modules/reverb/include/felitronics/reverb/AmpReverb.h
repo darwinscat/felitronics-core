@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <felitronics/core/DetMath.h>
 #include <felitronics/core/StateGrid.h>
 #include <felitronics/eq/Svf.h>
 #include <felitronics/reverb/Freeverb.h>
@@ -37,21 +38,30 @@ namespace felitronics::reverb
 //
 // CONTRACT (DSP-ARCHITECTURE.md §2).
 //   · prepare(sampleRate, maxBlock, maxChannels) allocates; process()/reset() never allocate, lock or throw.
-//     maxChannels is 1 or 2 — a wider prepare is REFUSED, not clamped (law 11b).
-//   · process() is [[nodiscard]] bool (law 11). Any n >= 0 is processed IN FULL, in chunks of maxBlock — the
-//     same as the caller chunking at those boundaries (11a); `addedWet` then holds the LAST chunk.
+//     maxChannels is 1 or 2 and the rate 1 kHz … 768 kHz — anything else is REFUSED, and a refused prepare
+//     DISARMS the instance: process() refuses until a prepare succeeds (law 11b). A prepared room starts AT
+//     its set parameters: no glide in from anywhere.
+//   · process() is [[nodiscard]] bool (law 11). Any n >= 0 is processed IN FULL, in chunks of
+//     min(maxBlock, 8192) — the scratch is capped, so a whole-file maxBlock costs nothing — the same as the
+//     caller chunking at those boundaries (11a); `addedWet` then holds the LAST chunk.
 //   · A NARROWER call is legal: one channel runs the room's mono path. A channel at an index >= nch with
 //     n > 0 has STOPPED (11a): its combs, allpasses, predelay, chorus line and HPF state are dropped once, on
 //     that edge. nch == 0 with n > 0 is a gap (11c): the room's parameter glides and the chorus LFO run on
 //     through it as through silence, and every channel's memory is dropped.
-//   · Law 8: the room is clean by construction (see Freeverb.h — its state is snapped to a grid far above the
-//     subnormal band); the predelay and chorus lines are pure delays; the HPF's integrators are flushed on
-//     `core::StateGrid` (audio time, 64 samples) and healed at the end of every call. The flush cannot change
-//     a sample above -300 dBFS.
+//   · reset() is a stream RESTART: every line cleared, every clock re-anchored (the line positions, the chorus
+//     LFO's phase, the law-8 grid) and every parameter glide landed on its target — what follows a reset does
+//     not depend on what came before it.
+//   · Law 8: the room flushes its own state to zero below 1e-15 per sample (Freeverb.h); the predelay and
+//     chorus lines are pure delays; the HPF's integrators are flushed on `core::StateGrid` (audio time, 64
+//     samples) and healed at the end of every call.
 //   · POISON: a non-finite input sample never enters the wet chain (the dry keeps it); a block whose tail is
-//     not finite is dropped whole and the room restarts from silence, the dry passing untouched.
-//   · libm: std::log2 (DECAY), std::log (the tail estimate) and std::sin (the chorus LFO, per sample) are the
-//     SYSTEM functions, deliberately — they are the app's. Listed in tools/lint/det-math-manifest.txt.
+//     not finite is dropped whole and the room restarts from silence, the dry passing untouched. Knob values
+//     are bounded before they reach any arithmetic: a non-finite one is ignored, a finite one clamped.
+//   · THREADS: prepare, reset, the setters and process belong to ONE thread (the audio thread, or whichever
+//     owns the stage). tailSeconds() is a relaxed atomic any thread may read; addedWet()/addedLength() are the
+//     process thread's — read them there, between calls.
+//   · Math: core::det (log2 for DECAY and the tail, sin for the chorus LFO — per sample, ~5 ns a call), so
+//     every row computes the same coefficients and the same LFO.
 //==============================================================================
 
 enum class Character { ambience, room, hall, plate, spring, modulated };
@@ -76,23 +86,36 @@ class AmpReverb
 public:
     static constexpr int kMaxChannels = 2;
 
+    static constexpr double kMinSampleRate = 1000.0, kMaxSampleRate = 768000.0;
+    static constexpr int    kMaxChunk      = 8192;   // the scratch's cap: longer calls are chunked here
+
+    AmpReverb() noexcept { refreshTail(); }
+
     [[nodiscard]] bool prepare (double newSampleRate, int maxBlock, int maxChannels)
     {
-        if (! (newSampleRate > 0.0) || ! std::isfinite (newSampleRate) || newSampleRate > 2.0e9
+        prepared_ = false;   // law 11b: whatever happens next, the old preparation no longer stands
+
+        if (! (newSampleRate >= kMinSampleRate && newSampleRate <= kMaxSampleRate)
             || maxBlock < 1 || maxChannels < 1 || maxChannels > kMaxChannels)
             return false;
 
         sampleRate = newSampleRate;
-        maxBlock_  = maxBlock;
+        maxBlock_  = std::min (maxBlock, kMaxChunk);
         maxCh_     = maxChannels;
 
-        (void) room.prepare (sampleRate);   // cannot refuse: the rate was checked above
-        room.reset();
+        // The room's parameters FIRST, then its prepare: prepare() lands every glide on the targets set
+        // here, so a fresh room starts at its character instead of gliding in from Freeverb's published
+        // initial parameters (whose dry gain would leak the input into the tail for the first 10 ms).
+        hpf.prepare (sampleRate, kMaxChannels);
+        applyHpf();
+        apply();
+        (void) room_.prepare (sampleRate);   // cannot refuse: the rate was checked above
+        room_.reset();
 
         for (auto& b : wet)
-            b.assign ((std::size_t) maxBlock, 0.0f);
+            b.assign ((std::size_t) maxBlock_, 0.0f);
         for (auto& b : wetOut)
-            b.assign ((std::size_t) maxBlock, 0.0f);
+            b.assign ((std::size_t) maxBlock_, 0.0f);
 
         const auto preMax = (std::size_t) std::ceil (0.1 * sampleRate) + 8;   // 100 ms of predelay
         const auto modMax = (std::size_t) std::ceil (0.02 * sampleRate) + 8;  // 12 ms base + depth
@@ -108,11 +131,8 @@ public:
         lfoPhase = 0.0f;
         addedCount = 0;
 
-        hpf.prepare (sampleRate, kMaxChannels);
         hpf.reset();
         grid_.reset();
-        applyHpf();
-        apply();
 
         cleared   = true;
         prepared_ = true;
@@ -129,11 +149,13 @@ public:
         and fifty kilobytes — which must not be a per-block memset. */
     void reset() noexcept
     {
+        room_.landGlides();   // a restart starts AT the set parameters, like a fresh prepare — even on a cleared room
+
         if (cleared)
             return;
 
         cleared = true;
-        room.reset();
+        room_.reset();
         hpf.reset();
         grid_.reset();
         for (std::size_t ch = 0; ch < (std::size_t) kMaxChannels; ++ch)
@@ -142,6 +164,8 @@ public:
             std::fill (modLine[ch].begin(), modLine[ch].end(), 0.0f);
             live_[ch] = false;
         }
+        prePos = modPos = 0;   // law 11a: the clocks are re-anchored with the lines
+        lfoPhase = 0.0f;
     }
 
     /** All five knobs, in the order the app sets them. */
@@ -251,6 +275,22 @@ public:
     const float* addedWet (int ch) const noexcept { return wetOut[(std::size_t) std::clamp (ch, 0, 1)].data(); }
 
     /** How many samples of `addedWet` the last chunk wrote (0 after a pause). A reader must not go past it. */
+
+    /** The room itself, read-only — its glide state is what a pause has to move as silence would. */
+    const Freeverb& room() const noexcept { return room_; }
+
+    /** True when the room, the predelay or the chorus line holds a subnormal — the law-8 witness for the tests.
+        (The HPF's two integrators per channel are the eq module's; its own flush is tested there.) */
+    bool anySubnormalState() const noexcept
+    {
+        const auto sub = [] (float v) { return std::fpclassify (v) == FP_SUBNORMAL; };
+        for (std::size_t ch = 0; ch < (std::size_t) kMaxChannels; ++ch)
+        {
+            for (float v : preLine[ch]) if (sub (v)) return true;
+            for (float v : modLine[ch]) if (sub (v)) return true;
+        }
+        return room_.anySubnormalState();
+    }
     int addedLength() const noexcept { return addedCount; }
 
     /** HOW LONG THE ROOM GOES ON SOUNDING after the last note went in, in seconds — what a plugin tells a host
@@ -268,7 +308,7 @@ private:
         if (ch < 0 || ch >= kMaxChannels || ! live_[ch])   // the bound is for the optimiser's array-bounds check
             return;
 
-        room.clearChannel (ch);
+        room_.clearChannel (ch);
         hpf.resetChannel (ch);
         std::fill (preLine[(std::size_t) ch].begin(), preLine[(std::size_t) ch].end(), 0.0f);
         std::fill (modLine[(std::size_t) ch].begin(), modLine[(std::size_t) ch].end(), 0.0f);
@@ -281,7 +321,7 @@ private:
     {
         cleared = false;
         addedCount = 0;
-        room.advanceGlides (n);
+        room_.advanceGlides (n);
 
         if (character == Character::modulated)
         {
@@ -320,9 +360,9 @@ private:
 
         // The room itself, 100% wet (the wet level 1/3 undoes Freeverb's ×3).
         if (nch >= 2)
-            room.processStereo (wet[0].data(), wet[1].data(), n);
+            (void) room_.processStereo (wet[0].data(), wet[1].data(), n);   // prepared, planes ours: cannot refuse
         else
-            room.processMono (wet[0].data(), n);
+            (void) room_.processMono (wet[0].data(), n);
 
         // The slow chorus on the tail — a modulated delay, the Lexicon dress.
         if (character == Character::modulated)
@@ -399,7 +439,7 @@ private:
 
         // DECAY breathes through the room size: half-to-double maps to a quarter of the scale either way,
         // clamped clear of runaway.
-        return clampf (0.05f, 0.98f, size + std::log2 (decayScale) * 0.25f);
+        return clampf (0.05f, 0.98f, size + (float) core::det::log2 ((double) decayScale) * 0.25f);
     }
 
     void refreshTail() noexcept
@@ -409,7 +449,7 @@ private:
         // The energy of the k-th pass sits in the interval that ENDS at (k+1) combs, so the last one still
         // above a thousandth runs one comb longer than the envelope's answer.
         tailSec.store ((float) ((double) predelayMs * 0.001
-                                  + comb * (1.0 + std::log (0.001) / std::log (g))),
+                                  + comb * (1.0 + core::det::log2 (0.001) / core::det::log2 (g))),   // any base
                        std::memory_order_relaxed);
     }
 
@@ -436,7 +476,7 @@ private:
         p.wetLevel   = 1.0f / 3.0f;
         p.freezeMode = 0.0f;
 
-        room.setParams (p);
+        room_.setParams (p);
     }
 
     void applyHpf() noexcept
@@ -464,7 +504,7 @@ private:
 
                 // Quadrature between the channels, so the dress swirls instead of pumping.
                 const float ph  = lfoPhase + (ch == 1 ? 0.25f : 0.0f);
-                const float lfo = std::sin (ph * kTwoPiF);
+                const float lfo = (float) core::det::sin ((double) (ph * kTwoPiF));
                 const float dly = baseS + depthS * lfo;
 
                 double pos = (double) modPos - (double) dly;
@@ -483,14 +523,14 @@ private:
 
     static constexpr float kTwoPiF = 6.283185307179586476925286766559f;
 
-    Freeverb room;
+    Freeverb room_;
     eq::Svf  hpf;
     core::StateGrid grid_;
 
     Character character  = Character::room;
     float     mix        = 0.2f;
     float     decayScale = 1.0f;
-    std::atomic<float> tailSec { 1.0f };   // see tailSeconds()
+    std::atomic<float> tailSec { 0.0f };   // see tailSeconds(); set by the constructor, from the formula
     float     predelayMs = 0.0f;
     float     hpfHz      = 120.0f;
 

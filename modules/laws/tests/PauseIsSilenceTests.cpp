@@ -37,6 +37,8 @@
 #include <felitronics/multiband/MultibandCompressor.h>
 #include <felitronics/core/Math.h>
 #include <felitronics/eq/EqBand.h>
+#include <felitronics/delay/TapeDelay.h>
+#include <felitronics/reverb/AmpReverb.h>
 
 #include <felitronics_test.h>
 #include <law11c_pause.h>
@@ -1382,9 +1384,95 @@ static void theShapersDeZipperIsInThePredicate()
     ok (! bitsEqual (bl[0], 1.0f), "precondition: the de-zipper was NOT at unity — it had somewhere to travel");
 }
 
+//==============================================================================
+// The amps' echo and room. Each holds SHARED ballistics that a pause must move as silence would: the delay's
+// motor (one glide for both channels), the room's five parameter glides and the MODULATED chorus's LFO phase.
+// Both stages start at rest (silence in, silence out — so a pause, which drops every channel's memory, and
+// silence at a live width, which keeps an all-zero memory, differ ONLY in the shared state), a knob move puts
+// a glide in flight, then A pauses and B hears silence for the same length, and both play the same signal.
+// The return must be bit-identical, and different from a third stage that had no gap at all (or the gap
+// moved nothing and the comparison would be blind).
+template <class Stage, class Arm, class Move, class Observe>
+static void ampStageInvariant (const char* name, Arm arm, Move move, Observe observe, int blockSize, int playLen)
+{
+    int seen = 0, seenSame = 0, seenMoved = 0;
+    int cases = 0, same = 0, moved = 0;
+    for (int gap : kGaps)
+    {
+        Stage A, B, C;
+        arm (A); arm (B); arm (C);
+        std::vector<float> z1 ((std::size_t) blockSize, 0.0f), z2 ((std::size_t) blockSize, 0.0f);
+        float* zz[2] = { z1.data(), z2.data() };
+        for (Stage* s : { &A, &B, &C })   // at rest, and primed
+        {
+            std::fill (z1.begin(), z1.end(), 0.0f); std::fill (z2.begin(), z2.end(), 0.0f);
+            run (s->process (zz, 2, blockSize));
+        }
+        move (A); move (B); move (C);
+        run (A.process (nullptr, 0, gap));
+        for (int done = 0; done < gap; done += blockSize)
+        {
+            std::fill (z1.begin(), z1.end(), 0.0f); std::fill (z2.begin(), z2.end(), 0.0f);
+            run (B.process (zz, 2, std::min (blockSize, gap - done)));
+        }
+        // The shared state itself, right after the gap: equal to silence's, and moved by the gap.
+        {
+            const auto oa = observe (A), ob = observe (B), oc = observe (C);
+            bool e = oa.size() == ob.size(), m = false;
+            for (std::size_t i = 0; e && i < oa.size(); ++i) e = bitsEqual (oa[i], ob[i]);
+            for (std::size_t i = 0; i < oa.size() && i < oc.size(); ++i) m = m || ! bitsEqual (oa[i], oc[i]);
+            ++seen; if (e) ++seenSame; if (m) ++seenMoved;
+        }
+        std::vector<float> a ((std::size_t) playLen), b, c;
+        fillTone (a, 0, 997.0, 0.5f);
+        b = a; c = a;
+        std::vector<float> a2 = a, b2 = a, c2 = a;
+        bool eq = true, diff = false;
+        for (int pos = 0; pos < playLen; pos += blockSize)
+        {
+            const int n = std::min (blockSize, playLen - pos);
+            float* pa[2] = { a.data() + pos, a2.data() + pos };
+            float* pb[2] = { b.data() + pos, b2.data() + pos };
+            float* pc[2] = { c.data() + pos, c2.data() + pos };
+            run (A.process (pa, 2, n)); run (B.process (pb, 2, n)); run (C.process (pc, 2, n));
+        }
+        for (int i = 0; i < playLen; ++i)
+        {
+            eq = eq && bitsEqual (a[(std::size_t) i], b[(std::size_t) i]) && bitsEqual (a2[(std::size_t) i], b2[(std::size_t) i]);
+            diff = diff || ! bitsEqual (a[(std::size_t) i], c[(std::size_t) i]) || ! bitsEqual (a2[(std::size_t) i], c2[(std::size_t) i]);
+        }
+        ++cases;
+        if (eq) ++same; else ok (false, std::string (name) + ": pause != silence, gap " + std::to_string (gap));
+        if (diff) ++moved;
+    }
+    ok (same == cases, std::string (name) + ": after a pause the return is bit-identical to silence, in all "
+                       + std::to_string (cases) + " gaps");
+    ok (moved >= cases - 1, std::string (name) + ": ...and the gap MOVED the shared state (" + std::to_string (moved)
+                            + " of " + std::to_string (cases) + " returns differ from no gap at all; the 1-sample gap may not)");
+    ok (seenSame == seen, std::string (name) + ": the shared state right after the pause is silence's, bit for bit, in all "
+                          + std::to_string (seen) + " gaps");
+    ok (seenMoved == seen, std::string (name) + ": ...and it MOVED across every gap (a glide was in flight)");
+}
+
+static void ampStagesPauseIsSilence()
+{
+    group ("law 11c — the amps' echo and room: the motor, the room's glides and the chorus LFO run through a pause");
+    ampStageInvariant<delay::TapeDelay> ("TapeDelay",
+        [] (delay::TapeDelay& d) { run (d.prepare (kFs, 256, 2)); delay::TapeDelayParams p; p.timeMs = 20.0f; p.repeats = 0.6f; p.mix = 1.0f; p.offsetMs = 3.0f; d.setParams (p); },
+        [] (delay::TapeDelay& d) { delay::TapeDelayParams p; p.timeMs = 60.0f; p.repeats = 0.6f; p.mix = 1.0f; p.offsetMs = 3.0f; d.setParams (p); },
+        [] (delay::TapeDelay& d) { return std::vector<float> { d.shownTimeMs() }; },
+        256, 9600);
+    ampStageInvariant<reverb::AmpReverb> ("AmpReverb",
+        [] (reverb::AmpReverb& r) { run (r.prepare (kFs, 256, 2)); reverb::AmpReverbParams p; p.character = reverb::Character::modulated; p.mix = 1.0f; r.setParams (p); },
+        [] (reverb::AmpReverb& r) { reverb::AmpReverbParams p; p.character = reverb::Character::modulated; p.mix = 0.6f; p.decay = 1.8f; r.setParams (p); },
+        [] (reverb::AmpReverb& r) { const auto g = r.room().glideState(); return std::vector<float> { g.damping, g.feedback, g.dry, g.wet1, g.wet2 }; },
+        256, 9600);
+}
+
 int main()
 {
     std::printf ("law 11c — a pause is silence\n");
+    ampStagesPauseIsSilence();
     floorPremise();
     collapseAgainstHonestLoop();
     fixedPointIsIdempotent();

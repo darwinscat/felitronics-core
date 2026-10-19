@@ -3,7 +3,7 @@
 
 //==================================================================================================
 // LAW 11 (DSP-ARCHITECTURE.md §2) — the property harness of CallContractTests: the fixture helpers,
-// the ADAPT macro that describes a stage, and the seven properties P1–P7 swept by allProperties<A>().
+// the ADAPT macro that describes a stage, and the eight properties P1–P8 swept by allProperties<A>().
 // Moved out of the census, CallContractTests.cpp (now modules/laws/tests/), verbatim, so the satellite
 // repositories (felitronics-guitar-core, felitronics-mastering-core) sweep their stages with the SAME
 // properties instead of a copy that could drift. The census of
@@ -413,6 +413,46 @@ void prepareIsBinding()
     }
 }
 
+//==================================================================================================
+// P8 — A REFUSED RE-PREPARE DISARMS. P7 asks that prepare() refuse a width it cannot honour; this asks what
+// the instance IS afterwards. A prepare that refuses but leaves the PREVIOUS preparation armed hands the
+// caller an object whose process() still accepts calls against a configuration the caller has just tried
+// to replace — and was told nothing about, because the caller reads the `false` as "not prepared". So the
+// first thing a prepare() does is disarm: refused, the instance is unprepared, and process() refuses (and
+// touches nothing) until a prepare succeeds. Found by review on delay::TapeDelay and reverb::AmpReverb,
+// whose first version restored nothing and kept the old preparation live.
+//==================================================================================================
+template <class A>
+void refusedPrepareDisarms()
+{
+    if constexpr (! A::needsPrepare || ! A::hasPrepareWidth) return;   // nothing to disarm
+    else
+    {
+        int cases = 0, refusedAfter = 0, untouched = 0;
+        for (int bad : { core::kMaxChannels + 1, 0, -1 })
+        {
+            typename A::T s;
+            if (! A::prep (s)) { ok (false, std::string (A::name()) + ": prepare failed"); return; }
+            {
+                std::vector<std::vector<float>> b; fill (b, A::maxCh, kMaxBlock, 0xD15Au);
+                auto p = planes (b);
+                if (! A::run (s, p.data(), A::maxCh, kMaxBlock)) { ok (false, std::string (A::name()) + ": a prepared call was refused (precondition)"); return; }
+            }
+            if (A::prepWidth (s, bad)) { ok (false, std::string (A::name()) + ": prepare accepted width " + std::to_string (bad)); continue; }
+            std::vector<std::vector<float>> b; fill (b, A::maxCh, kMaxBlock, 0xD15Bu + (std::uint32_t) (bad + 8));
+            const auto before = b;
+            auto p = planes (b);
+            ++cases;
+            if (! A::run (s, p.data(), A::maxCh, kMaxBlock)) ++refusedAfter;
+            if (bitEqual (b, before)) ++untouched;
+        }
+        ok (cases > 0, std::string (A::name()) + ": the re-prepare sweep is non-empty (precondition)");
+        ok (refusedAfter == cases, std::string (A::name()) + ": after a REFUSED re-prepare, process() refuses all "
+                                   + std::to_string (cases) + " calls — the old preparation no longer stands");
+        ok (untouched == cases, std::string (A::name()) + ": ...and touches nothing");
+    }
+}
+
 template <class A>
 void allProperties()
 {
@@ -424,6 +464,7 @@ void allProperties()
     unpreparedRefuses<A>();
     zeroWidthGapIsSilent<A>();
     prepareIsBinding<A>();
+    refusedPrepareDisarms<A>();
 }
 
 } // namespace felitronics::test::law11

@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-core — see LICENSE.
 
-// delay::TapeDelay — the goldens the app's ORIGINAL stage rendered (the parity harness that wrote them runs the
-// app's class itself; here core CI holds the line without it), the parameter law, and the stage contract:
-// re-slicing, a stopped channel, a pause, poison, law 8, no allocation.
+// delay::TapeDelay and its knob law — regression goldens (the core's own renders; how far they sit from the
+// app's original class is the out-of-tree parity harness's report), the ladder and the ranges, and the stage
+// contract: prepare binds and a refused one disarms, the tail is right from construction, reset is a restart,
+// absurd knobs stay bounded, re-slicing, a stopped channel, a pause, poison, law 8, the glides land, no
+// allocation.
 #include <felitronics_test.h>
 #include <alloc_counter.h>   // installs the allocation counter
 
@@ -11,6 +13,7 @@
 #include "delay_golden.h"
 
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <string>
 #include <vector>
@@ -34,14 +37,14 @@ std::vector<std::vector<float>> renderCore (const dc::Case& c, bool* accepted = 
     return io;
 }
 
-// Tolerances that hold on every row: the goldens are bit-exact on the row that wrote them, but std::tanh and
-// std::exp are the system libm (by design — see the header) and FMA contraction differs between ISAs.
+// The goldens are bit-exact on the row that wrote them. Elsewhere only FMA contraction can move a bit (law 10:
+// arm64 fuses a*b + c, x86-64 and wasm cannot) — every transcendental is core::det.
 constexpr double kSampleTol = 1.0e-6;
 constexpr double kSumRelTol = 1.0e-6;
 
 void goldens()
 {
-    group ("goldens: the app's original DelayStage, rendered by the parity harness");
+    group ("regression goldens: the core's own renders");
     const auto cases = dc::goldenCases();
     ok (std::size (test::delaygolden::kGolden) == cases.size(), "one golden per scenario");
 
@@ -60,7 +63,7 @@ void goldens()
             for (int ch = 0; ch < c.nch; ++ch)
                 for (int i = 0; i < 16; ++i)
                     worst = std::max (worst, std::abs ((double) io[(std::size_t) ch][(std::size_t) (w.start + i)] - (double) w.x[ch][i]));
-        ok (worst <= kSampleTol, std::string (c.name) + ": 3 windows within 1e-6 of the app (worst " + std::to_string (worst) + ")");
+        ok (worst <= kSampleTol, std::string (c.name) + ": 3 windows within 1e-6 (worst " + std::to_string (worst) + ")");
 
         for (int ch = 0; ch < c.nch; ++ch)
         {
@@ -68,19 +71,48 @@ void goldens()
             for (float v : io[(std::size_t) ch]) { sa += std::abs ((double) v); sq += (double) v * v; }
             ok (std::abs (sa - g.sumAbs[ch]) <= kSumRelTol * g.sumAbs[ch] + 1e-9
                 && std::abs (sq - g.sumSq[ch]) <= kSumRelTol * g.sumSq[ch] + 1e-9,
-                std::string (c.name) + ": channel " + std::to_string (ch) + " sums of |x| and x^2 match the app");
+                std::string (c.name) + ": channel " + std::to_string (ch) + " sums of |x| and x^2 match");
         }
     }
 }
 
 void parameterLaw()
 {
-    group ("the parameter law: sync ladder and DARK");
+    group ("the knob law: the whole ladder, the ranges, the sync policy, DARK");
+    ok (delay::kNumDivisions == 13 && std::size (delay::kDivisionNames) == 13 && std::size (delay::kDivisionBeats) == 13,
+        "13 divisions, 13 names, 13 beat values");
+    const char* plain[] = { "1/1", "1/2", "1/4", "1/8", "1/16" };
+    const float plainBeats[] = { 4.0f, 2.0f, 1.0f, 0.5f, 0.25f };
+    const int   plainAt[] = { 0, 2, 5, 8, 11 };
+    bool ladder = true;
+    for (int k = 0; k < 5; ++k)
+    {
+        const int i = plainAt[k];
+        ladder = ladder && std::strcmp (delay::kDivisionNames[i], plain[k]) == 0 && delay::kDivisionBeats[i] == plainBeats[k];
+        if (i > 0)   // 1/1 has neither: the ladder opens on it
+            ladder = ladder && std::strcmp (delay::kDivisionNames[i + 1], (std::string (plain[k]) + "T").c_str()) == 0
+                            && delay::kDivisionBeats[i + 1] == plainBeats[k] * (2.0f / 3.0f);     // triplet: ⅔ after it
+        if (i > 0)
+            ladder = ladder && std::strcmp (delay::kDivisionNames[i - 1], (std::string (plain[k]) + ".").c_str()) == 0
+                            && delay::kDivisionBeats[i - 1] == plainBeats[k] * 1.5f;          // dotted: 1.5 before it
+    }
+    ok (ladder, "after 1/1, every plain value has its dotted (×1.5) just before it and its triplet (×⅔) just after, named so");
+    ok (delay::kDivisionDefault == 5 && std::strcmp (delay::kDivisionNames[delay::kDivisionDefault], "1/4") == 0, "the default is 1/4");
+    ok (delay::kBpmMin == 40.0f && delay::kBpmMax == 240.0f && delay::kBpmDefault == 120.0f, "BPM field 40 … 240, default 120");
+    ok (delay::kTimeMinMs == 20.0f && delay::kTimeMaxMs == 2000.0f, "free TIME 20 … 2000 ms");
+    ok (delay::kOffsetMaxMs == 30.0f, "OFFSET reaches ±30 ms");
+    ok (delay::kDarkLoHz == 800.0f && delay::kDarkHiHz == 16000.0f && delay::kDarkDefaultPct == 45.0f, "DARK 16 kHz … 800 Hz, default 45 %");
+
     ok (delay::divisionMs (delay::kDivisionDefault, 120.0) == 500.0f, "1/4 at 120 BPM is 500 ms");
     ok (delay::divisionMs (0, 40.0) == 6000.0f, "1/1 at 40 BPM is 6000 ms — the line's design maximum");
+    ok (delay::divisionMs (0, 20.0) == 6000.0f && delay::divisionMs (0, 0.0) == 6000.0f
+        && delay::divisionMs (0, std::numeric_limits<double>::quiet_NaN()) == 6000.0f,
+        "a tempo below 40 BPM (or none) counts as 40: the knob never names more than the line plays");
     ok (delay::divisionMs (99, 120.0) == delay::divisionMs (12, 120.0) && delay::divisionMs (-3, 120.0) == delay::divisionMs (0, 120.0),
         "an index off the ladder is clamped onto it");
-    ok (delay::divisionMs (0, 40.0) <= (float) (delay::TapeDelay::kMaxDelaySeconds * 1000.0), "the slowest division fits the line");
+    ok (delay::divisionMs (0, 40.0) <= delay::TapeDelay::kMaxTimeMs, "the slowest division fits the line");
+    ok (delay::timeMsFor (true, 8, 120.0, 777.0f) == 250.0f && delay::timeMsFor (false, 8, 120.0, 777.0f) == 777.0f,
+        "the sync policy: synced plays the division, free plays the knob");
     ok (delay::darkHzForPercent (0.0f) == 16000.0f, "DARK 0 % is the bright ceiling, 16 kHz");
     test::approx (delay::darkHzForPercent (100.0f), 800.0, 0.01, "DARK 100 % is the dark floor, 800 Hz");
     ok (delay::darkHzForPercent (45.0f) > 3500.0f && delay::darkHzForPercent (45.0f) < 4500.0f, "the default 45 % is ~4 kHz");
@@ -88,20 +120,27 @@ void parameterLaw()
 
 void contract()
 {
-    group ("contract: prepare is binding, refusals move nothing, n == 0 is a no-op");
+    group ("contract: prepare is binding, a refused one disarms, refusals move nothing, n == 0 is a no-op");
     delay::TapeDelay d;
     float a[64] {}, b[64] {};
     float* io[2] = { a, b };
     ok (! d.process (io, 1, 64), "an unprepared stage refuses");
     ok (! d.prepare (48000.0, 64, 3) && ! d.prepare (48000.0, 64, 0) && ! d.prepare (0.0, 64, 2)
+        && ! d.prepare (999.0, 64, 2) && ! d.prepare (768001.0, 64, 2) && ! d.prepare (1.0e9, 64, 2)
         && ! d.prepare (std::numeric_limits<double>::quiet_NaN(), 64, 2) && ! d.prepare (48000.0, 0, 2),
-        "prepare refuses a width outside 1..2, a bad rate and an empty block");
+        "prepare refuses a width outside 1..2, a rate outside 1 kHz … 768 kHz, and an empty block");
     ok (! d.isPrepared(), "...and a refused prepare leaves it unprepared");
     test::run (d.prepare (48000.0, 64, 1));
     a[0] = 0.5f;
     ok (! d.process (io, 2, 64) && a[0] == 0.5f, "a call wider than prepared is refused before anything moves");
     ok (! d.process (io, -1, 64) && ! d.process (io, 1, -1), "a negative width or length is refused");
     ok (d.process (io, 1, 0) && a[0] == 0.5f, "n == 0 is accepted and changes nothing");
+
+    ok (! d.prepare (48000.0, 64, 5), "a re-prepare at a width it cannot honour is refused");
+    a[0] = 0.25f;
+    ok (! d.isPrepared() && ! d.process (io, 1, 64) && a[0] == 0.25f,
+        "...and DISARMS: the old preparation no longer stands, process refuses and touches nothing");
+    ok (d.prepare (1000.0, 64, 2) && d.prepare (768000.0, 64, 2), "the rate's edges, 1 kHz and 768 kHz, are accepted");
 
     group ("mix 0: the dry is bit-exact, whatever the loop holds");
     delay::TapeDelay m;
@@ -118,6 +157,32 @@ void contract()
     ok (l == l0 && r == r0, "the dry passes untouched at mix 0");
 }
 
+double tailFormula (double timeMs, double repeats, double offsetMs)
+{
+    const double t = timeMs * 0.001;
+    return std::abs (offsetMs) * 0.001 + (repeats <= 0.0 ? t : repeats >= 1.0 ? 1.0e6 : t * (1.0 + std::log (0.001) / std::log (repeats)));
+}
+
+void tail()
+{
+    group ("tailSeconds: right from construction, and the discrete-echo estimate");
+    delay::TapeDelay fresh;
+    test::approx (fresh.tailSeconds(), tailFormula (350.0, (double) 0.35f, 0.0), 1e-5,
+                  "a fresh instance at its default knobs already reports the formula (2.653 s), not a placeholder");
+    fresh.setParams (delay::TapeDelayParams {});
+    test::run (fresh.prepare (48000.0, 64, 2));
+    test::approx (fresh.tailSeconds(), tailFormula (350.0, (double) 0.35f, 0.0), 1e-5, "...and still after the default knobs and a prepare");
+
+    delay::TapeDelay d;
+    delay::TapeDelayParams p; p.timeMs = 500.0f; p.repeats = 0.0f; p.offsetMs = 10.0f;
+    d.setParams (p);
+    test::approx (d.tailSeconds(), 0.51, 1e-6, "no feedback: one echo plus the offset");
+    p.repeats = 0.5f; d.setParams (p);
+    test::approx (d.tailSeconds(), tailFormula (500.0, 0.5, 10.0), 1e-5, "0.5: the first echo under a thousandth");
+    p.repeats = 1.0f; d.setParams (p);
+    ok (d.tailSeconds() > 1.0e5f, "full feedback never decays — the caller caps it");
+}
+
 void reslicing()
 {
     group ("law 8a: per-sample state, so any slicing of one stream is bit-identical");
@@ -131,6 +196,68 @@ void reslicing()
         if (ref.empty()) ref = out; else same = same && out == ref;
     }
     ok (same, "blocks 1, 64, 333, 517 and 4096 give the same bits");
+}
+
+void resetIsRestart()
+{
+    group ("reset() is a stream restart: what follows does not depend on what came before");
+    delay::TapeDelayParams p; p.timeMs = 3.1f; p.repeats = 0.7f; p.offsetMs = 4.3f; p.mix = 1.0f;
+    std::vector<std::vector<float>> first;
+    bool same = true;
+    for (int warm : { 0, 1, 777, 48000, 262147 })   // 262147: the write clock past 2^18, where a float's ulp is 1/32
+    {
+        delay::TapeDelay d;
+        test::run (d.prepare (48000.0, 4096, 2));
+        d.setParams (p);
+        std::vector<float> l (4096), r (4096);
+        float* lr[2] = { l.data(), r.data() };
+        dc::Lcg g { 21u };
+        for (int done = 0; done < warm; done += 4096)
+        {
+            for (auto& v : l) v = 0.3f * g.next();
+            for (auto& v : r) v = 0.3f * g.next();
+            test::run (d.process (lr, 2, std::min (4096, warm - done)));
+        }
+        d.reset();
+        dc::Lcg h { 99u };
+        for (auto& v : l) v = 0.3f * h.next();
+        for (auto& v : r) v = 0.3f * h.next();
+        test::run (d.process (lr, 2, 4096));
+        std::vector<std::vector<float>> out { l, r };
+        if (first.empty()) first = out; else same = same && out == first;
+    }
+    ok (same, "after warm-ups of 0, 1, 777, 48000 and 262147 samples, the post-reset output is bit-identical");
+}
+
+void extremes()
+{
+    group ("absurd but finite knobs stay bounded: no NaN, no index off the line");
+    bool finite = true;
+    for (double sr : { 1000.0, 48000.0, 768000.0 })
+    {
+        delay::TapeDelay d;
+        test::run (d.prepare (sr, 256, 2));
+        std::vector<float> l (256), r (256);
+        float* lr[2] = { l.data(), r.data() };
+        dc::Lcg g { 5u };
+        const float F = std::numeric_limits<float>::max();
+        const float knobs[][5] = { { F, F, F, F, F }, { -F, -F, -F, -F, -F }, { F, 0.9f, 1e-30f, -F, 1.0f },
+                                   { 350.0f, 1.0f, F, F, 1.0f }, { 1e-30f, 1.0f, 1.0f, 1e-30f, 1.0f },
+                                   { 350.0f, 0.5f, 4000.0f, 0.0f, 0.5f } };
+        for (const auto& k : knobs)
+        {
+            d.setParams ({ k[0], k[1], k[2], k[3], k[4] });
+            for (int b = 0; b < 40; ++b)
+            {
+                for (auto& v : l) v = 0.5f * g.next();
+                for (auto& v : r) v = 0.5f * g.next();
+                test::run (d.process (lr, 2, 256));
+                for (int i = 0; i < 256; ++i) finite = finite && std::isfinite (l[(std::size_t) i]) && std::isfinite (r[(std::size_t) i]);
+                finite = finite && std::isfinite (d.shownTimeMs()) && std::isfinite (d.shownOffsetMs());
+            }
+        }
+    }
+    ok (finite, "±FLT_MAX and 1e-30 on every knob, at 1, 48 and 768 kHz, then back to sane: every sample finite");
 }
 
 void stoppedChannelAndPause()
@@ -163,7 +290,6 @@ void stoppedChannelAndPause()
     }
     ok (worstR == 0.0f, "the right channel comes back to silence, not to the echoes it held when it stopped");
 
-    // A pause moves the shared motor exactly as silence would.
     delay::TapeDelay x, y;
     test::run (x.prepare (48000.0, 64, 2)); test::run (y.prepare (48000.0, 64, 2));
     x.setParams (p); y.setParams (p);
@@ -179,6 +305,26 @@ void stoppedChannelAndPause()
     }
     ok (x.shownTimeMs() == y.shownTimeMs() && x.shownTimeMs() > 50.0f && x.shownTimeMs() < 400.0f,
         "after a 3000-sample pause the head stands where 3000 samples of silence left it, mid-glide");
+}
+
+void glidesLand()
+{
+    group ("the heads LAND on their targets (LAW8-AUDIT.md item 6)");
+    delay::TapeDelay d;
+    test::run (d.prepare (48000.0, 480, 2));
+    delay::TapeDelayParams p; p.timeMs = 350.0f; p.offsetMs = 20.0f;
+    d.setParams (p);
+    std::vector<float> l (480, 0.0f), r (480, 0.0f);
+    float* lr[2] = { l.data(), r.data() };
+    test::run (d.process (lr, 2, 480));
+    p.timeMs = 6000.0f; p.offsetMs = 7.0f;
+    d.setParams (p);
+    for (int b = 0; b < 1000; ++b)   // ten seconds: sixty-six of the motor's time constants
+        test::run (d.process (lr, 2, 480));
+    ok (d.shownTimeMs() == 6000.0f, "the motor stands ON 6000 ms (a float motor parks 112 samples short): "
+                                    + std::to_string (d.shownTimeMs()));
+    ok (std::abs (d.shownOffsetMs() - 7.0f) < 1.0e-5f, "the offset head stands on 7 ms (a float head parks 4.6e-4 ms short): "
+                                                         + std::to_string (d.shownOffsetMs()));
 }
 
 void poisonAndLaw8()
@@ -203,27 +349,31 @@ void poisonAndLaw8()
     for (float v : x) clean = clean && std::isfinite (v);
     ok (clean, "the next block is finite: nothing poisoned the line");
 
-    group ("law 8: a minute of silence after a full-feedback bloom leaves no subnormal anywhere");
+    group ("law 8: a minute of silence after a bloom leaves no subnormal anywhere, and the silence holds");
     delay::TapeDelay s;
     test::run (s.prepare (48000.0, 480, 2));
-    delay::TapeDelayParams q2; q2.timeMs = 37.0f; q2.repeats = 0.6f; q2.offsetMs = 20.0f; q2.mix = 1.0f;
-    s.setParams (q2);
+    delay::TapeDelayParams q; q.timeMs = 37.0f; q.repeats = 0.6f; q.offsetMs = 20.0f; q.mix = 1.0f;
+    s.setParams (q);
     std::vector<float> l (480), r (480);
     float* lr[2] = { l.data(), r.data() };
     dc::Lcg g { 11u };
     for (int i = 0; i < 480; ++i) { l[(std::size_t) i] = 0.5f * g.next(); r[(std::size_t) i] = 0.5f * g.next(); }
     test::run (s.process (lr, 2, 480));
-    q2.offsetMs = 0.0f; s.setParams (q2);   // the offset glide now heads for ZERO — the case that parks subnormals
-    bool anySub = false, silentAtEnd = false;
+    q.offsetMs = 0.0f; s.setParams (q);   // the offset glide now heads for ZERO — the case that parks subnormals
+    bool anySub = false;
+    int lastLoud = -1;
     for (int b = 0; b < 6000; ++b)
     {
         std::fill (l.begin(), l.end(), 0.0f); std::fill (r.begin(), r.end(), 0.0f);
         test::run (s.process (lr, 2, 480));
         anySub = anySub || s.anySubnormalState();
-        if (b == 5999) silentAtEnd = std::all_of (l.begin(), l.end(), [] (float v) { return v == 0.0f; });
+        const bool silent = std::all_of (l.begin(), l.end(), [] (float v) { return v == 0.0f; })
+                         && std::all_of (r.begin(), r.end(), [] (float v) { return v == 0.0f; });
+        if (! silent) lastLoud = b;
     }
     ok (! anySub, "no subnormal in the loop filter, the offset glide or the line, at any block");
-    ok (silentAtEnd, "...and the tail ends in exact digital silence");
+    ok (lastLoud >= 0 && lastLoud < 5000, "the tail ends in exact digital silence (last sound at block "
+                                          + std::to_string (lastLoud) + ") and STAYS silent to the minute's end");
 }
 
 void noAllocation()
@@ -243,19 +393,6 @@ void noAllocation()
     test::run (d.process (lr, 2, 1024, false));
     felitronics::test::okNoAlloc (alloc::count.load() == before, "no allocation: setParams, process (stereo, mono, pause, stand-by), reset");
 }
-
-void tail()
-{
-    group ("tailSeconds: the discrete-echo estimate");
-    delay::TapeDelay d;
-    delay::TapeDelayParams p; p.timeMs = 500.0f; p.repeats = 0.0f; p.offsetMs = 10.0f;
-    d.setParams (p);
-    test::approx (d.tailSeconds(), 0.51, 1e-6, "no feedback: one echo plus the offset");
-    p.repeats = 0.5f; d.setParams (p);
-    test::approx (d.tailSeconds(), 0.01 + 0.5 * (1.0 + std::log (0.001) / std::log (0.5)), 1e-5, "0.5: the first echo under a thousandth");
-    p.repeats = 1.0f; d.setParams (p);
-    ok (d.tailSeconds() > 1.0e5f, "full feedback never decays — the caller caps it");
-}
 } // namespace
 
 int main()
@@ -264,10 +401,13 @@ int main()
     goldens();
     parameterLaw();
     contract();
+    tail();
     reslicing();
+    resetIsRestart();
+    extremes();
     stoppedChannelAndPause();
+    glidesLand();
     poisonAndLaw8();
     noAllocation();
-    tail();
     return felitronics::test::report();
 }

@@ -242,26 +242,33 @@ cases) with FTZ off on the `deb` row.
 
 ### Added with the modules: `delay::TapeDelay` and `reverb::Freeverb` / `reverb::AmpReverb` — flushed per sample
 
-**Recursive state.** `TapeDelay`: the loop's one-pole low pass (`x ← x + c·(v − x)`), the line it writes
-(every write is `tanh` of that state), the motor glide (`d ← d + c·(T − d)`, T ≥ 1 ms of samples, so it parks a
-few ulp short of a NORMAL target) and the per-channel offset glides (target 0 whenever the offset is 0, so they
-decay geometrically toward zero). `Freeverb`: each comb's damping one-pole, and every value written into a comb
-(feedback up to 1) or an allpass (0.5). `AmpReverb` adds the wet HPF (`eq::Svf`); its predelay and chorus lines
-are pure delays and its parameter glides are linear (they end exactly on target).
-**Verdict: flushed, per sample, at 1e-30.** Ported unflushed from the app — whose Freeverb did not quantise on
-arm64, measured — every one of these decayed into the subnormal band on silence; the offset glide to zero is
-point 6 of the checklist below, and with the line written only through the loop filter, a flush there keeps
-every stored line value zero or ≥ 1e-30. In Freeverb the buffers ARE the state, so a flush at each write is the
-only place one can stand. Per sample makes the claim slicing-free. **1e-30, not 1e-15,** because these loops
-integrate what they flush: the same-signed tails of eight combs are zeroed on every sample and summed over a
-time constant of ~63 000 samples, so the 1e-15 house threshold moved a HALL impulse by 1.2e-10 against the
-reference, and 1e-30 by nothing measurable (the parity harness reads it bit-identical above 1e-30). Eight
-decades above the subnormal floor is still clear of every product in these kernels (factors ≥ 0.5, ≥ 0.6,
-≥ 0.7 in Freeverb; ≥ ~1e-4 in the delay's coefficients). The HPF keeps the eq module's own 1e-15 flush on
-`core::StateGrid` (audio time) and heals poison at the end of every call; it moves the tail by at most 4.9e-16.
+**Recursive state.** `TapeDelay`: the loop's one-pole low pass (`x ← x + c·(v − x)`), the line it writes (every
+write is a `tanh` of that state), the motor glide (`d ← d + c·(T − d)`, T ≥ 1 ms of samples) and the per-channel
+offset glides (target 0 whenever the offset is 0, so they decay geometrically toward zero). `Freeverb`: each
+comb's damping one-pole, and every value written into a comb (feedback up to 1) or an allpass (0.5).
+`AmpReverb` adds the wet HPF (`eq::Svf`); its predelay and chorus lines are pure delays and its parameter glides
+are linear (they end exactly on target).
+**Verdict: flushed, per sample, at the house 1e-15 (`core::flushDenormal`).** Ported unflushed from the app —
+whose Freeverb did not quantise on arm64, measured — every one of these decayed into the subnormal band on
+silence; the offset glide to zero is item 6 below. With the line written only through the loop filter, a flush
+there keeps every stored line value zero or ≥ 1e-15; in Freeverb the buffers ARE the state, so a flush at each
+write is the only place one can stand. Per sample makes the claim slicing-free. Against an unflushed reference
+the flush moves a HALL impulse by 1.2e-10 at most (-198 dBFS). That number is not flushed residues piling up
+over the decay: it is about one ulp of a ~1e-3 sample, where a sum's rounding flips because a flushed residue
+would have met a loud operand. Inaudible, and since these stages compute in `core::det` the goal is the same
+bits on every row, not the app's bits. The HPF keeps the eq module's own 1e-15 flush on `core::StateGrid`
+(audio time) and heals poison at the end of every call.
+**Cost, measured** (review): the per-sample flush adds 13 % to a kernel that costs 0.07 % of real time — about
++0.008 % RT.
+**Item 6, the glides that do not head for zero.** The delay's heads glide in DOUBLE and land: once an update no
+longer moves a head, it is put on its target. In float — as the app had them — the update stops moving the
+value once `(T − d)·c` falls under half an ulp of `d`, which is `1/(2c)` ulps short: 112 samples (2.3 ms) short
+of a 6 s target at 48 kHz, parked there for good. In double that distance is ~1e-6 of a sample, so the landing
+step is inaudible. The room's glides are linear and land by construction.
 Tested in `modules/delay/tests/TapeDelayTests.cpp` (a minute of silence after a bloom with the offset gliding to
-zero: no subnormal in any state at any block, and exact silence at the end) and
-`modules/reverb/tests/AmpReverbTests.cpp` (a HALL at DECAY ×2 reaches exact digital zero).
+zero: no subnormal in any state at any block, and the silence holds; the heads stand exactly on their targets)
+and `modules/reverb/tests/AmpReverbTests.cpp` (three minutes after a HALL at DECAY ×2: no subnormal in the room,
+the predelay or the chorus line, and once exact zero is reached it holds).
 
 ## How these are tested
 
@@ -307,4 +314,6 @@ would fail without the fix, so writing one would be theatre.
    than by a test.
 6. Where the state glides to a *parameter* rather than to zero, use both conditions (threshold **and**
    "the update did not move the value"). A threshold alone leaves every non-zero target parked a few ulp
-   short forever.
+   short forever. "A few ulp" is optimistic: an exponential glide with coefficient `c` parks `1/(2c)` ulps short —
+   thousands for a slow motor (`delay::TapeDelay`: 112 samples at 6 s). Landing from there is a jump; glide
+   in double, where the parked distance is negligible, and then land.

@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <felitronics/core/FlushToZero.h>
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -39,17 +41,18 @@ namespace felitronics::reverb
 //
 // LAW 8. Left at that, the combs' damping filters and every recirculating comb and allpass value decay
 // geometrically into the subnormal band on silence — and stay there on any tier without hardware FTZ (wasm
-// has none). So each comb's filter state and every value written into a comb or an allpass is flushed to
-// exact zero below 1e-30 PER SAMPLE, inside the kernel. Per sample because the buffers are the state: a value
-// written a hair above zero comes round again a comb length later, and only a flush at the write keeps every
-// stored value either zero or at least 1e-30, eight decades clear of the subnormal floor — no product in the
-// kernel (factors 0.5, 1 - damp >= 0.6, feedback >= 0.7) can then land in the band.
-// WHY 1e-30 AND NOT THE HOUSE 1e-15 (core::flushDenormal). The flushed values are not independent: a decaying
-// tail is flushed at every one of the eight combs on every sample, all with the same sign, and the loop
-// integrates them over its time constant (a comb length over 1 - feedback, ~63000 samples for a long HALL).
-// Measured against the reference at 1e-15: 1.2e-10 of difference on a HALL impulse — still -199 dBFS, but
-// five decades above the threshold that caused it. At 1e-30 the same accumulation stays near 1e-25.
-// It is the only way this Freeverb departs from the measured one.
+// has none). So each comb's filter state and every value written into a comb or an allpass is FLUSHED TO
+// ZERO below 1e-15 PER SAMPLE (core::flushDenormal, the house threshold), inside the kernel. Per sample
+// because the buffers are the state: a value written a hair above zero comes round again a comb length
+// later, and only a flush at the write keeps every stored value either zero or at least 1e-15 — no product in
+// the kernel (factors 0.5, 1 − damp >= 0.6, feedback >= 0.7) can then land in the band. What the flush costs
+// against an unflushed reference was measured: 1.2e-10 at most on a HALL impulse (-198 dBFS). That is not
+// the flushed residues piling up over the decay — it is about one ulp of a ~1e-3 sample, from the rounding
+// of a sum flipping where a flushed residue would have met a loud operand. Inaudible, and the only way this
+// Freeverb departs from the measured one.
+//
+// THE PRIMITIVE UNDER AmpReverb. A host — a plugin, the browser demo — uses `AmpReverb`, which owns one of
+// these and guards its prepare; this class is public for that stage and for its own tests.
 //
 // Real-time rule: prepare() allocates; process*/reset/setParams never allocate, lock or throw. No libm call
 // (std::floor of the glide length in prepare() is exact).
@@ -57,9 +60,6 @@ namespace felitronics::reverb
 
 namespace detail
 {
-    /** Law 8, per sample: exact zero below 1e-30 — see the header for why not 1e-15. */
-    inline void flushTiny (float& x) noexcept { if (std::fabs (x) < 1.0e-30f) x = 0.0f; }
-
     /** Equal within one relative float epsilon (or the smallest normal, absolutely); non-finite: exact only.
         The reverb's guard for "the same value again" — in a glide target and in every AmpReverb setter. */
     inline bool nearlyEqual (float a, float b) noexcept
@@ -100,6 +100,7 @@ public:
     static constexpr float  kOffsetRoom    = 0.7f;
     static constexpr double kGlideSeconds  = 0.01;
     static constexpr double kTuningRate    = 44100.0;
+    static constexpr double kMinSampleRate = 1000.0, kMaxSampleRate = 768000.0;
 
     Freeverb() noexcept
     {
@@ -108,10 +109,12 @@ public:
     }
 
     /** Sizes every comb and allpass for `sampleRate` (allocates) and clears them; every parameter glide
-        lands on its target. A non-positive or non-finite rate is refused and nothing changes. */
+        lands on its target. A rate outside 1 kHz … 768 kHz is refused, and a refused prepare disarms. */
     [[nodiscard]] bool prepare (double sampleRate)
     {
-        if (! (sampleRate > 0.0) || ! std::isfinite (sampleRate) || sampleRate > 2.0e9)
+        prepared_ = false;   // a refused prepare disarms: process* refuse until one succeeds
+
+        if (! (sampleRate >= kMinSampleRate && sampleRate <= kMaxSampleRate))
             return false;
 
         const long long rate = (long long) sampleRate;
@@ -134,7 +137,8 @@ public:
 
     bool isPrepared() const noexcept { return prepared_; }
 
-    /** Clears every comb and allpass of both channels. The parameter glides are not touched. */
+    /** Clears every comb and allpass of both channels and re-anchors their positions. The parameter glides
+        are not touched (an owner that restarts lands them with landGlides()). */
     void reset() noexcept
     {
         clearChannel (0);
@@ -174,11 +178,12 @@ public:
         }
     }
 
-    /** Both channels' combs hear `(left + right) · gain`; each side's tail is mixed back with width. */
-    void processStereo (float* left, float* right, int numSamples) noexcept
+    /** Both channels' combs hear `(left + right) · gain`; each side's tail is mixed back with width. Refused
+        (false, nothing touched) when unprepared, on a null plane or a negative length. */
+    [[nodiscard]] bool processStereo (float* left, float* right, int numSamples) noexcept
     {
-        if (! prepared_ || left == nullptr || right == nullptr)
-            return;
+        if (! prepared_ || left == nullptr || right == nullptr || numSamples < 0)
+            return false;
 
         for (int i = 0; i < numSamples; ++i)
         {
@@ -207,13 +212,15 @@ public:
             left[i]  = outL * wet1 + outR * wet2 + left[i]  * dry;
             right[i] = outR * wet1 + outL * wet2 + right[i] * dry;
         }
+        return true;
     }
 
-    /** The left channel's combs and allpasses only; wet2 has no other side to take from. */
-    void processMono (float* samples, int numSamples) noexcept
+    /** The left channel's combs and allpasses only; wet2 has no other side to take from. Refused like
+        processStereo. */
+    [[nodiscard]] bool processMono (float* samples, int numSamples) noexcept
     {
-        if (! prepared_ || samples == nullptr)
-            return;
+        if (! prepared_ || samples == nullptr || numSamples < 0)
+            return false;
 
         for (int i = 0; i < numSamples; ++i)
         {
@@ -234,6 +241,7 @@ public:
 
             samples[i] = out * wet1 + samples[i] * dry;
         }
+        return true;
     }
 
     /** `n` samples of parameter glide with no audio — a pause in the stream, during which the glides keep
@@ -247,6 +255,34 @@ public:
         }
     }
 
+    /** Where the five glides stand now (the values the next sample would step from) — an observable for the
+        tests that ask whether a pause moved them as silence would. */
+    struct GlideState { float damping, feedback, dry, wet1, wet2; };
+    GlideState glideState() const noexcept
+    {
+        return { damp_.current, feedback_.current, dry_.current, wet1_.current, wet2_.current };
+    }
+
+    /** Every parameter glide put on its target now — what prepare() does, for an owner that restarts. */
+    void landGlides() noexcept { landGlides (glideRate_); }
+
+    /** True when any comb or allpass value, or a comb's filter state, sits in the subnormal band — the law-8
+        witness for the tests. */
+    bool anySubnormalState() const noexcept
+    {
+        const auto sub = [] (float v) { return std::fpclassify (v) == FP_SUBNORMAL; };
+        for (const auto& side : combs)
+            for (const auto& c : side)
+            {
+                if (sub (c.last)) return true;
+                for (float v : c.buf) if (sub (v)) return true;
+            }
+        for (const auto& side : allpasses)
+            for (const auto& a : side)
+                for (float v : a.buf) if (sub (v)) return true;
+        return false;
+    }
+
     /** Longest comb of the right channel at the prepared rate, in samples (0 before prepare). */
     int longestCombSamples() const noexcept { return (int) combs[1][(std::size_t) kNumCombs - 1].buf.size(); }
 
@@ -254,7 +290,7 @@ private:
 
     static std::size_t sizeFor (long long rate, int tuning) noexcept
     {
-        const long long s = rate * (long long) tuning / 44100;
+        const long long s = rate * (long long) tuning / (long long) kTuningRate;
         return (std::size_t) std::max (1LL, s);
     }
 
@@ -319,15 +355,16 @@ private:
         {
             std::fill (buf.begin(), buf.end(), 0.0f);
             last = 0.0f;
+            idx  = 0;
         }
 
         float process (float input, float damp, float feedback) noexcept
         {
             const float out = buf[idx];
             last = out * (1.0f - damp) + last * damp;
-            detail::flushTiny (last);
+            core::flushDenormal (last);
             float w = input + last * feedback;
-            detail::flushTiny (w);
+            core::flushDenormal (w);
             buf[idx] = w;
             if (++idx == buf.size())
                 idx = 0;
@@ -350,13 +387,13 @@ private:
             clear();
         }
 
-        void clear() noexcept { std::fill (buf.begin(), buf.end(), 0.0f); }
+        void clear() noexcept { std::fill (buf.begin(), buf.end(), 0.0f); idx = 0; }
 
         float process (float input) noexcept
         {
             const float held = buf[idx];
             float w = input + held * 0.5f;
-            detail::flushTiny (w);
+            core::flushDenormal (w);
             buf[idx] = w;
             if (++idx == buf.size())
                 idx = 0;
@@ -366,6 +403,7 @@ private:
 
     void landGlides (double sampleRate) noexcept
     {
+        glideRate_ = sampleRate;
         const int steps = (int) std::floor (kGlideSeconds * sampleRate);
         damp_.land (steps); feedback_.land (steps);
         dry_.land (steps);  wet1_.land (steps); wet2_.land (steps);
@@ -375,6 +413,7 @@ private:
     std::array<std::array<Allpass, kNumAllpasses>, 2> allpasses;
     Glide damp_, feedback_, dry_, wet1_, wet2_;
     float gain_     = kFixedGain;
+    double glideRate_ = kTuningRate;
     bool  prepared_ = false;
 };
 
