@@ -789,6 +789,10 @@ here is the *goal* state — only the adapter touches JUCE.
 Their DSP beyond this core — the NAM backend, the `.orbitrig` pack player, the tube power-amp trunk —
 lives in felitronics-guitar-core. The pre-migration inventory of OrbitCab's DSP that this section used to
 carry left core with those modules.
+The amps' echo and room are core's: the five amp plugins (OrbitAmp, CatpitAmp, RedPawAmp, FrostPawAmp,
+AmberPawAmp) and the site's in-browser demo consume `delay::TapeDelay` with its knob law (`DelayLaw.h`) and
+`reverb::AmpReverb` (which owns its `reverb::Freeverb`), moved out of OrbitAmp's own stages — see the two
+modules' READMEs for the provenance and the measured distance to the app.
 
 ### Future products
 - Standalone **compressor** (Felitronics) — `dynamics` broadband + optional sidechain `eq`.

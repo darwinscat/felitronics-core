@@ -12,22 +12,22 @@ if(FELITRONICS_BUILD_TESTS)
     # that has such an entry point.
     add_executable(felitronics_call_contract_tests tests/CallContractTests.cpp)
     target_link_libraries(felitronics_call_contract_tests PRIVATE
-        felitronics::analysis felitronics::convolution felitronics::deesser felitronics::dehum felitronics::dither
-        felitronics::dynamiceq felitronics::dynamics felitronics::eq felitronics::limiter
-        felitronics::lineareq felitronics::multiband felitronics::saturation felitronics::stereo)
+        felitronics::analysis felitronics::convolution felitronics::deesser felitronics::dehum felitronics::delay
+        felitronics::dither felitronics::dynamiceq felitronics::dynamics felitronics::eq felitronics::limiter
+        felitronics::lineareq felitronics::multiband felitronics::reverb felitronics::saturation felitronics::stereo)
     target_include_directories(felitronics_call_contract_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
     target_compile_features(felitronics_call_contract_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_call_contract_tests COMMAND felitronics_call_contract_tests)
 
-    # Law 11c ("a pause is silence") spans six addresses in five modules plus one composite, and the law
+    # Law 11c ("a pause is silence") spans eight addresses in seven modules plus one composite, and the law
     # is ONE claim — split per module, each stage would get to answer it its own way. Here for the same
-    # reason CallContractTests is. The seventh address, poweramp::PowerAmpStage, moved with its module to
+    # reason CallContractTests is. One more address, poweramp::PowerAmpStage, moved with its module to
     # felitronics-guitar-core and is tested there through the same fixture helpers
     # (test_support/law11c_pause.h), not a copy of them.
     add_executable(felitronics_pause_is_silence_tests tests/PauseIsSilenceTests.cpp)
     target_link_libraries(felitronics_pause_is_silence_tests PRIVATE
-        felitronics::deesser felitronics::dynamiceq felitronics::dynamics felitronics::eq
-        felitronics::multiband)
+        felitronics::deesser felitronics::delay felitronics::dynamiceq felitronics::dynamics felitronics::eq
+        felitronics::multiband felitronics::reverb)
     target_include_directories(felitronics_pause_is_silence_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
     target_compile_features(felitronics_pause_is_silence_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_pause_is_silence_tests COMMAND felitronics_pause_is_silence_tests)

@@ -53,6 +53,8 @@
 #include <felitronics/core/StreamResampler.h>
 #include <felitronics/deesser/DeEsser.h>
 #include <felitronics/dehum/HumRemover.h>
+#include <felitronics/delay/DelayLaw.h>
+#include <felitronics/delay/TapeDelay.h>
 #include <felitronics/dither/Dither.h>
 #include <felitronics/dynamiceq/DynamicEqBand.h>
 #include <felitronics/dynamiceq/LaneDynamics.h>
@@ -103,6 +105,8 @@
 #include <felitronics/oversampling/CascadeOversampler.h>
 #include <felitronics/oversampling/Oversampler.h>
 #include <felitronics/oversampling/PolyphaseOversampler.h>
+#include <felitronics/reverb/AmpReverb.h>
+#include <felitronics/reverb/Freeverb.h>
 #include <felitronics/saturation/Saturator.h>
 #include <felitronics/saturation/WaveShaper.h>
 #include <felitronics/stereo/MidSide.h>

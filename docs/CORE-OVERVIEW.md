@@ -25,6 +25,13 @@ same audit had been started three times.
 The guitar-amp modules — `nam` (the NeuralAmpModelerCore backend), `rigplayer` (the `.orbitrig` pack player) and
 `poweramp` (the tube power-amp trunk) — live in [felitronics-guitar-core](https://github.com/darwinscat/felitronics-guitar-core).
 
+## Amp stages (the plugins' echo and room)
+
+| Module | What | Key types |
+|---|---|---|
+| `delay` | tape-style echo: a gliding (repitching) head, a dark saturated loop, a stereo offset; the knob law (sync ladder, sync policy, DARK) | `TapeDelay`, `DelayLaw.h` (`divisionMs`, `timeMsFor`, `darkHzForPercent`) |
+| `reverb` | Freeverb (the published algorithm, matched to the behaviour the amps were voiced on) and the six-character amp room | `Freeverb`, `AmpReverb` |
+
 ## Mastering stages
 
 | Module | What | Key types |
