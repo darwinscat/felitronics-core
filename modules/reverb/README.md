@@ -69,11 +69,14 @@ alone, no state quantisation on arm64 — was established by measuring its outpu
 
 Measured on arm64 against the app's class (impulse, noise, sweep and their silent tails; 44.1/48/96 kHz;
 blocks 1, 64, 512, 333; mono and stereo; every character at mix/decay/predelay/HPF corners and middles;
-character walks, stand-by and restarts, a per-block DECAY sweep, one-ulp jitter), counting from 130 ms on —
-past the app's own first-prepare leak (up to 0.79 in the first 10 ms, carried through PREDELAY and the HPF):
-**at most 1.2e-10 for the five unmodulated characters** at PREDELAY up to 50 ms (the flush and `det::log2`),
-3.8e-4 at PREDELAY 100 ms with the 40 Hz HPF (still the leak, ringing out of the HPF), 9.4e-5 for MODULATED
-(its LFO in `det::sin`), and 3e-5 … 7.6e-5 with the knobs moving. `Freeverb` against the framework's
+character walks, stand-by and restarts, a per-block DECAY sweep, one-ulp jitter). Both stages are primed
+after `prepare` with floor(0.01 · rate) samples of silence — the app's first prepare glides in from
+Freeverb's published initial parameters, and through silence that glide carries nothing — and compared from
+sample 0: **892 of 1728 fixed-knob renders bit-identical; the five unmodulated characters within 1.2e-10**
+(the flush and `det::log2`), **MODULATED within 5.4e-5** (its LFO in `det::sin` and its read position
+pinned against contraction, where the app's is the system `sin` and a fused multiply-add). With the knobs
+moving: the DECAY sweep and the one-ulp jitter bit-identical, the character walk 3.5e-5 and stand-by with
+restarts 2.9e-5 (both through MODULATED). `Freeverb` against the framework's
 directly (random parameters with freeze, dry and width; mono, stereo, alternating; parameters set before
 the first prepare; 22.05 … 192 kHz; a 1e-7 input): 73 of 144 bit-identical, the rest within 2.8e-14 —
 the law-8 flush.

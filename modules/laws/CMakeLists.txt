@@ -21,7 +21,7 @@ if(FELITRONICS_BUILD_TESTS)
 
     # Law 11c ("a pause is silence") spans eight addresses in seven modules plus one composite, and the law
     # is ONE claim — split per module, each stage would get to answer it its own way. Here for the same
-    # reason CallContractTests is. The seventh address, poweramp::PowerAmpStage, moved with its module to
+    # reason CallContractTests is. One more address, poweramp::PowerAmpStage, moved with its module to
     # felitronics-guitar-core and is tested there through the same fixture helpers
     # (test_support/law11c_pause.h), not a copy of them.
     add_executable(felitronics_pause_is_silence_tests tests/PauseIsSilenceTests.cpp)

@@ -27,24 +27,14 @@ namespace
 double noSin (double) { return 0.0; }
 double noExp (double) { return 0.0; }
 
-// The goldens are bit-exact on the row that wrote them. Elsewhere only FMA contraction can move a bit (law 10:
-// arm64 fuses a*b + c, x86-64 and wasm cannot) — every transcendental is core::det. One path AMPLIFIES that
-// last bit: the MODULATED chorus reads its line at a fractional position of ~576 samples built from fusable
-// multiply-adds, so one ulp of position (6e-5 of a sample) times the tail's slope reaches the output —
-// measured 1.0e-5 between arm64 and wasm with core::det::sin in the LFO (8e-6 with the system sin: the sine
-// was never the cause). A scenario that ever runs it is held to 5e-5; making it bit-identical across rows
-// would take pinning every multiply-add in the chain against contraction, which law 10 reserves to one
-// header today.
+// The goldens are bit-exact on the row that wrote them. Elsewhere only FMA contraction could move a bit (law 10:
+// arm64 fuses a*b + c, x86-64 and wasm cannot) — every transcendental is core::det. The one place that would
+// AMPLIFY a fused-or-not last bit, the MODULATED chorus's read position (~576 samples, so one ulp of it times
+// the tail's slope reached 1.0e-5 between arm64 and wasm), is pinned with core::det::mulAdd — the same pinned
+// multiply-add every det function is built from, not the pragma override law 10 reserves to core::firDot. So
+// one tolerance holds for every scenario on every row.
 constexpr double kSampleTol = 1.0e-6;
-constexpr double kChorusTol = 5.0e-5;
 constexpr double kSumRelTol = 1.0e-6;
-
-bool runsChorus (const rc::Case& c)
-{
-    bool any = c.knobs.character == (int) reverb::Character::modulated;
-    for (const auto& e : c.events) any = any || e.knobs.character == (int) reverb::Character::modulated;
-    return any;
-}
 
 void goldens()
 {
@@ -68,9 +58,7 @@ void goldens()
             for (int ch = 0; ch < c.nch; ++ch)
                 for (int i = 0; i < 16; ++i)
                     worst = std::max (worst, std::abs ((double) io[(std::size_t) ch][(std::size_t) (w.start + i)] - (double) w.x[ch][i]));
-        const double tol = runsChorus (c) ? kChorusTol : kSampleTol;
-        ok (worst <= tol, std::string (c.name) + ": 3 windows within " + (runsChorus (c) ? "5e-5" : "1e-6")
-                          + " (worst " + std::to_string (worst) + ")");
+        ok (worst <= kSampleTol, std::string (c.name) + ": 3 windows within 1e-6 (worst " + std::to_string (worst) + ")");
 
         for (int ch = 0; ch < c.nch; ++ch)
         {
@@ -190,6 +178,16 @@ void startsAtParams()
         test::run (r.process (lr, 2, 1000));
         // The first comb returns after 1214 samples at 48 kHz: until then the room adds exactly nothing.
         ok (l == l0 && rr == r0, std::string (reverb::kCharacterNames[c]) + ": the first 1000 samples are the dry, bit for bit");
+
+        // ...and in a plugin's order: prepare at the default room, THEN the knobs, then audio. The knob move
+        // glides (10 ms) from the prepared room, never from Freeverb's published initial parameters.
+        reverb::AmpReverb q;
+        test::run (q.prepare (48000.0, 1000, 2));
+        q.setParams (p);
+        auto l2 = l0, r2 = r0;
+        float* lr2[2] = { l2.data(), r2.data() };
+        test::run (q.process (lr2, 2, 1000));
+        ok (l2 == l0 && r2 == r0, std::string (reverb::kCharacterNames[c]) + ": prepare -> setParams -> process: the dry, bit for bit");
     }
 }
 
@@ -218,7 +216,7 @@ void resetIsRestart()
 {
     group ("reset() is a stream restart: what follows does not depend on what came before");
     std::vector<std::vector<float>> first;
-    bool same = true;
+    bool same = true, landed = true;
     for (int warm : { 0, 1, 333, 4801, 96001 })
     {
         reverb::AmpReverb r;
@@ -238,6 +236,14 @@ void resetIsRestart()
         r.setParams (p);
         if (warm > 0) test::run (r.process (lr, 2, 7));
         r.reset();
+        {
+            reverb::AmpReverb ref;            // the targets: a room prepared at these knobs has landed on them
+            ref.setParams (p);
+            test::run (ref.prepare (48000.0, 512, 2));
+            const auto got = r.room().glideState(), want = ref.room().glideState();
+            landed = landed && got.damping == want.damping && got.feedback == want.feedback && got.dry == want.dry
+                            && got.wet1 == want.wet1 && got.wet2 == want.wet2;
+        }
         std::vector<std::vector<float>> out;
         rc::Lcg h { 77u };
         for (int b = 0; b < 40; ++b)
@@ -252,6 +258,7 @@ void resetIsRestart()
         if (first.empty()) first = out; else same = same && out == first;
     }
     ok (same, "after warm-ups of 0, 1, 333, 4801 and 96001 samples (a glide in flight), the post-reset output is bit-identical");
+    ok (landed, "...and right after reset() every one of the room's five glides stands ON its target, bit for bit");
 }
 
 void extremes()

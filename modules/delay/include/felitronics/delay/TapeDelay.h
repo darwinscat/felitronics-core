@@ -131,7 +131,8 @@ public:
     static constexpr int    kMaxChannels      = 2;
     static constexpr double kMaxDelaySeconds  = 6.1;     // 1/1 at 40 BPM, with margin
     static constexpr double kMaxOffsetSeconds = 0.031;   // the offset knob's reach
-    static constexpr float  kMaxTimeMs = (float) (kMaxDelaySeconds * 1000.0);   // a longer TIME is this
+    static constexpr float  kLineMaxMs = (float) (kMaxDelaySeconds * 1000.0);   // the STAGE's clamp on TIME, 6100 ms
+                                                                                 // (the KNOB's range is DelayLaw's kTimeMaxMs)
     static constexpr float  kMinDarkHz = 1.0f, kMaxDarkHz = 100000.0f;          // a corner outside is clamped
     static constexpr double kMinSampleRate = 1000.0, kMaxSampleRate = 768000.0;
 
@@ -228,7 +229,7 @@ public:
         if (! std::isfinite (ms))
             return;
 
-        const float want = detail::clampf (1.0f, kMaxTimeMs, ms);
+        const float want = detail::clampf (1.0f, kLineMaxMs, ms);
 
         if (! detail::nearlyEqual (want, timeMs))
         {
@@ -454,6 +455,11 @@ public:
     float shownTimeMs()   const noexcept { return shownTimeMs_.load (std::memory_order_relaxed); }
     float shownOffsetMs() const noexcept { return shownOffsetMs_.load (std::memory_order_relaxed); }
     float inputPeak()     const noexcept { return envIn_.load (std::memory_order_relaxed); }
+
+    /** Where the heads stand, in samples — the motor's delay and channel `ch`'s offset (0 or 1). The tests read
+        them to see a glide LAND on its target, bit for bit. */
+    double headSamples() const noexcept { return currentDelay; }
+    double offsetHeadSamples (int ch) const noexcept { return currentOff[ch < 0 ? 0 : (ch > 1 ? 1 : ch)]; }
 
     /** True when any recursive state sits in the subnormal band — the law-8 witness for the tests. */
     bool anySubnormalState() const noexcept

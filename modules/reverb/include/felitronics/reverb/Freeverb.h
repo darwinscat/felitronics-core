@@ -55,7 +55,8 @@ namespace felitronics::reverb
 // these and guards its prepare; this class is public for that stage and for its own tests.
 //
 // Real-time rule: prepare() allocates; process*/reset/setParams never allocate, lock or throw. No libm call
-// (std::floor of the glide length in prepare() is exact).
+// but one: std::floor of the glide length in landGlides() (from the constructor, prepare() and an owner's
+// restart) — exact, so the same on every row.
 //==============================================================================
 
 namespace detail

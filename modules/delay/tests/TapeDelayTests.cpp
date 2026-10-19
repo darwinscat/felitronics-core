@@ -13,6 +13,7 @@
 #include "delay_golden.h"
 
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <limits>
 #include <string>
@@ -110,7 +111,7 @@ void parameterLaw()
         "a tempo below 40 BPM (or none) counts as 40: the knob never names more than the line plays");
     ok (delay::divisionMs (99, 120.0) == delay::divisionMs (12, 120.0) && delay::divisionMs (-3, 120.0) == delay::divisionMs (0, 120.0),
         "an index off the ladder is clamped onto it");
-    ok (delay::divisionMs (0, 40.0) <= delay::TapeDelay::kMaxTimeMs, "the slowest division fits the line");
+    ok (delay::divisionMs (0, 40.0) <= delay::TapeDelay::kLineMaxMs, "the slowest division fits the line");
     ok (delay::timeMsFor (true, 8, 120.0, 777.0f) == 250.0f && delay::timeMsFor (false, 8, 120.0, 777.0f) == 777.0f,
         "the sync policy: synced plays the division, free plays the knob");
     ok (delay::darkHzForPercent (0.0f) == 16000.0f, "DARK 0 % is the bright ceiling, 16 kHz");
@@ -321,10 +322,47 @@ void glidesLand()
     d.setParams (p);
     for (int b = 0; b < 1000; ++b)   // ten seconds: sixty-six of the motor's time constants
         test::run (d.process (lr, 2, 480));
-    ok (d.shownTimeMs() == 6000.0f, "the motor stands ON 6000 ms (a float motor parks 112 samples short): "
-                                    + std::to_string (d.shownTimeMs()));
-    ok (std::abs (d.shownOffsetMs() - 7.0f) < 1.0e-5f, "the offset head stands on 7 ms (a float head parks 4.6e-4 ms short): "
-                                                         + std::to_string (d.shownOffsetMs()));
+    // The targets, spelt as the stage spells them: the motor's in double from TIME, the offset head's in float.
+    const double motorTarget  = (double) (float) ((double) 6000.0f * 0.001 * 48000.0);
+    const double offsetTarget = (double) (7.0f * 0.001f * (float) 48000.0);
+    ok (d.headSamples() == motorTarget, "the motor stands ON its target, bit for bit (a float motor parks 112 samples "
+                                        "short, a double one without the landing ~2e-7 short): "
+                                        + std::to_string (d.headSamples() - motorTarget));
+    ok (d.offsetHeadSamples (1) == offsetTarget && d.offsetHeadSamples (0) == 0.0,
+        "the offset heads stand ON theirs: the right on 7 ms of samples, the left on zero");
+}
+
+std::int64_t ulpsApart (float a, float b)
+{
+    std::int32_t ia, ib;
+    std::memcpy (&ia, &a, 4); std::memcpy (&ib, &b, 4);
+    if (ia < 0) ia = std::numeric_limits<std::int32_t>::min() - ia;   // a monotone integer line through ±0
+    if (ib < 0) ib = std::numeric_limits<std::int32_t>::min() - ib;
+    return std::abs ((std::int64_t) ia - (std::int64_t) ib);
+}
+
+void detTanhAccuracy()
+{
+    group ("the loop's det tanh: within 1 ulp of the correctly rounded tanh, both branches and the seam");
+    std::int64_t worst = 0;
+    int points = 0;
+    auto probe = [&] (float x)
+    {
+        const float want = (float) std::tanh ((double) x);   // double tanh, rounded once: the reference
+        worst = std::max (worst, ulpsApart (delay::detail::detTanh (x), want));
+        ++points;
+    };
+    for (float sign : { 1.0f, -1.0f })
+    {
+        for (double x = 1.0e-30; x < 30.0; x *= 1.0001)       // every decade from the flush floor to saturation
+            probe (sign * (float) x);
+        float s = 0.0625f;                                      // the seam between the series and the exponential:
+        for (int k = 0; k < 4096; ++k) s = std::nextafter (s, 0.0f);   // 4096 floats either side of it, one by one
+        for (int k = 0; k < 8193; ++k, s = std::nextafter (s, 1.0f))
+            probe (sign * s);
+    }
+    probe (0.0f);
+    ok (worst <= 1, std::to_string (points) + " points, worst " + std::to_string (worst) + " ulp");
 }
 
 void poisonAndLaw8()
@@ -407,6 +445,7 @@ int main()
     extremes();
     stoppedChannelAndPause();
     glidesLand();
+    detTanhAccuracy();
     poisonAndLaw8();
     noAllocation();
     return felitronics::test::report();

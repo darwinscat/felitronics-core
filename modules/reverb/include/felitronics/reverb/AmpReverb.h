@@ -141,7 +141,7 @@ public:
 
     bool isPrepared()  const noexcept { return prepared_; }
     int  maxChannels() const noexcept { return prepared_ ? maxCh_ : 0; }
-    int  maxBlock()    const noexcept { return prepared_ ? maxBlock_ : 0; }
+    int  maxBlock()    const noexcept { return prepared_ ? maxBlock_ : 0; }   // the CHUNK: min(maxBlock, kMaxChunk)
     static constexpr int latencySamples() noexcept { return 0; }
 
     /** A stream restart. Idempotent on purpose: a chain calls this every block a room is out of the rig, and
@@ -505,9 +505,12 @@ private:
                 // Quadrature between the channels, so the dress swirls instead of pumping.
                 const float ph  = lfoPhase + (ch == 1 ? 0.25f : 0.0f);
                 const float lfo = (float) core::det::sin ((double) (ph * kTwoPiF));
-                const float dly = baseS + depthS * lfo;
+                // Pinned against contraction (core::det::mulAdd): this one position is where a fused and an
+                // unfused multiply-add would part by an ulp of ~576 samples, and the tail's slope carries that
+                // ulp to the output — 1.0e-5 between arm64 and wasm before the pin, measured.
+                const double dly = core::det::mulAdd ((double) depthS, (double) lfo, (double) baseS);
 
-                double pos = (double) modPos - (double) dly;
+                double pos = (double) modPos - dly;
                 while (pos < 0.0) pos += (double) modN;
 
                 const int i0 = (int) pos;

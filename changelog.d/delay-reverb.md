@@ -23,8 +23,8 @@ implementation; the signal paths are the app's, expression for expression, with 
 - **Law 11, a new census property for every stage**: P8, a refused re-prepare disarms. Every existing stage
   already did.
 - **Distance to the app** (an out-of-tree harness renders the app's own classes beside these): the delay within
-  3.0e-7 at fixed knobs (ulp-level: `det` against the system libm); the room within 1.2e-10 for the unmodulated characters and 9.4e-5 for MODULATED
-  once past the app's own first-10-ms leak; `Freeverb` against the framework's within 2.8e-14. Regression goldens
+  3.0e-7 at fixed knobs (ulp-level: `det` against the system libm); the room within 1.2e-10 for the unmodulated characters and 5.4e-5 for MODULATED
+  (both stages primed past the app's own first-10-ms leak); `Freeverb` against the framework's within 2.8e-14. Regression goldens
   of the core's own renders (25 KB) guard the sound in CI.
 - **Intel builds of the plugins move by up to 1.04e-6 (-120 dBFS) from today's app**: the framework's Freeverb
   quantises its state on x86-64 and not on arm64; these modules quantise nowhere — the arm64 sound everywhere.
