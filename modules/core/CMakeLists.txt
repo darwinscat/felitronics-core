@@ -100,6 +100,20 @@ if(FELITRONICS_BUILD_TESTS)
     target_compile_features(felitronics_core_flushpoison_falsify_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_core_flushpoison_falsify_tests COMMAND felitronics_core_flushpoison_falsify_tests)
 
+    # The wasm tier under Eigen's SSE flags. A consumer that wants Eigen's SSE path in wasm (NAM) builds with
+    # -msimd128 -msse4.1, and emscripten then defines __SSE2__ — which once sent FlushToZero.h to a _mm_setcsr
+    # wasm does not have, so no TU including it compiled. Building this target is the gate; running it pins
+    # that ScopedFlushToZero stays a no-op there and the software flush still covers denormals (law 8).
+    # Emscripten only: natively these flags are just x86 flags, which the desktop rows already build.
+    if(EMSCRIPTEN)
+        add_executable(felitronics_core_wasm_sse_tests tests/WasmSseTests.cpp)
+        target_link_libraries(felitronics_core_wasm_sse_tests PRIVATE felitronics::core)
+        target_include_directories(felitronics_core_wasm_sse_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+        target_compile_features(felitronics_core_wasm_sse_tests PRIVATE cxx_std_20)
+        target_compile_options(felitronics_core_wasm_sse_tests PRIVATE -msimd128 -msse4.1)
+        add_test(NAME felitronics_core_wasm_sse_tests COMMAND felitronics_core_wasm_sse_tests)
+    endif()
+
     # RT swap-discipline types — a suite that needs REAL threads (convolution's restart race is the other), so
     # it is outside the `wasm-audio` tier by construction: that tier is single-threaded by contract (no
     # pthreads, no SharedArrayBuffer, no COOP/COEP). Emscripten does NOT refuse this build without -pthread — it

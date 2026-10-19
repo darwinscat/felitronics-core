@@ -35,6 +35,7 @@ of the flags; it is true now, but only because of one extra link flag and with t
 | a thread in code never emitted | — | not caught |
 | a `std::mutex` | a lint over module headers, not the artifact | build (textual) |
 | an allocation on an **allocation-counted** path | the counter in `test_support/alloc_counter.h`, asserted through `okNoAlloc()` in `felitronics_test.h` | **run** |
+| an x86-only intrinsic behind `__SSE2__`, hit when a consumer adds `-msse4.1` for Eigen's SSE path (emscripten defines `__SSE2__` but has no `_mm_setcsr`) | `felitronics_wasm_sse_probe` (every public header under `-msimd128 -msse4.1`) + `felitronics_core_wasm_sse_tests` | **build** (+ run) |
 | a denormal stall (law 8) | **not at all** | — |
 
 **The thread claim was false until one link flag made it true, and that is worth spelling out.** Measured on

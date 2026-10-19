@@ -248,6 +248,9 @@ jobs:
   #                                      wrap still cannot see: a thread in code never emitted (an unused
   #                                      inline, an uninstantiated template), and std::mutex, whose lock sits
   #                                      inside libc++-noexcept.a — hence the header lint below.
+  #   an x86-only intrinsic keyed on  -> COMPILE error: felitronics_wasm_sse_probe builds every public header
+  #   __SSE2__                           under -msimd128 -msse4.1 (Eigen's SSE path), where emscripten defines
+  #                                      __SSE2__ but has no _mm_setcsr.
   #   denormal / law-8 violations     -> NOT caught, at all. That is a property of the CPU at runtime, not of
   #                                      the build (see the KWeightingFilter finding).
   #   long double ON AN EMITTED PATH  -> caught from the ARTIFACT: on wasm32 the type is software binary128,

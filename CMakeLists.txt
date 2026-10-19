@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(felitronics_core VERSION 0.61.0 LANGUAGES CXX)
+project(felitronics_core VERSION 0.61.1 LANGUAGES CXX)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)   # so clangd / IDEs parse the headers at the right C++ standard
 
@@ -143,4 +143,19 @@ if(FELITRONICS_BUILD_TESTS AND (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU"))
         felitronics::reverb)
     target_compile_features(felitronics_no_exceptions_probe PRIVATE cxx_std_20)
     target_compile_options(felitronics_no_exceptions_probe PRIVATE -fno-exceptions -fno-rtti)
+endif()
+
+# ----------------------------------------------------------------------------
+# wasm + SSE-compat PROBE — compile-only, emscripten only. The hygiene TU again (every public header, the
+# same strict warnings), now under -msimd128 -msse4.1: the flags a consumer passes to put Eigen on its SSE
+# path, which emscripten lowers onto SIMD128. They also define __SSE2__ in a target that is not x86, so a
+# header that keys an x86-only intrinsic on __SSE2__ (FlushToZero.h's _mm_setcsr did, until it tested for
+# wasm first) breaks every such consumer. modules/core's felitronics_core_wasm_sse_tests runs the behaviour;
+# this catches the next header to make the same mistake. Building it IS the assertion.
+if(FELITRONICS_BUILD_TESTS AND EMSCRIPTEN)
+    add_library(felitronics_wasm_sse_probe OBJECT test_support/HeaderHygiene.cpp)
+    get_target_property(_felitronics_hygiene_libs felitronics_header_hygiene LINK_LIBRARIES)   # one module list, not a third copy
+    target_link_libraries(felitronics_wasm_sse_probe PRIVATE ${_felitronics_hygiene_libs})
+    target_compile_features(felitronics_wasm_sse_probe PRIVATE cxx_std_20)
+    target_compile_options(felitronics_wasm_sse_probe PRIVATE ${FELITRONICS_HYGIENE_WARNINGS} -msimd128 -msse4.1)
 endif()
