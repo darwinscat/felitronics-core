@@ -49,6 +49,10 @@ by width; dry × 2; freeze at ≥ 0.5; a linear 10 ms glide on damping, feedback
   silence.
 - `reset()` is a stream restart: every line cleared, every clock re-anchored (line positions, the chorus
   LFO's phase, the law-8 grid) and every glide landed on its target.
+- `feed` fades, it does not switch: what enters the wet chain ramps linearly to nothing, or back, over
+  `kFeedRampSeconds` (5 ms), so a flip on a loud note sends no click into the room. The room's own tail is
+  never ramped, and a held `feed` is bit-identical to the old switch. A pause moves the ramp as silence would;
+  after `prepare`/`reset` it starts settled on the next call's `feed` — a fresh room does not fade in.
 - Law 8: Freeverb flushes its comb filters and every comb/allpass write below 1e-15 per sample
   (`core::flushDenormal` — its buffers are the state); the HPF rides `core::StateGrid` with the eq module's
   own flush. A long silence ends in exact zero, and stays there.
