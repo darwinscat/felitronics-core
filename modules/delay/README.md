@@ -48,6 +48,10 @@ same number.
   the shared motor glides on as through silence.
 - `reset()` is a stream restart: lines cleared, write clocks re-anchored at zero, heads re-snapped — what
   follows does not depend on what came before.
+- `feed` fades, it does not switch: what enters the record head ramps linearly to nothing, or back, over
+  `kFeedRampSeconds` (5 ms), so a flip on a loud note leaves no tick in the repeats. The recirculation is
+  never ramped, and a held `feed` is bit-identical to the old switch. A pause moves the ramp as silence would;
+  after `prepare`/`reset` it starts settled on the next call's `feed` — a fresh stage does not fade in.
 - Law 8: the loop filter's state and the offset glide are flushed below 1e-15 per sample
   (`core::flushDenormal`). Bit-identical under any re-slicing. The heads glide in double and land exactly
   on their targets.

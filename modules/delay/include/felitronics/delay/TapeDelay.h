@@ -51,6 +51,12 @@ namespace felitronics::delay
 //     silence (law 11c) and every channel's memory is dropped.
 //   · reset() is a stream RESTART: the lines cleared, the write clocks re-anchored at zero and the heads
 //     snapped to their targets on the next call — what follows a reset does not depend on what came before.
+//   · FEED (process's last argument) is the insert's stand-by, and it is a DOOR, not a switch: what enters the
+//     record head is ramped linearly to nothing, or back, over kFeedRampSeconds — a flip on a loud note would
+//     otherwise be recorded as a step that every repeat replays as a tick. Only the input is ramped, never the
+//     recirculation, and a held `feed` records exactly what the switch did. The door is shared by the channels;
+//     a pause moves it as silence would (law 11c), and after prepare() or reset() it stands where the next
+//     call's `feed` puts it, with no travel, so a fresh stage does not fade in its first note.
 //   · Law 8: the loop filter's state and the offset glide are flushed to zero below 1e-15 PER SAMPLE
 //     (core::flushDenormal), so no path reaches the subnormal band — the line is written only through the
 //     loop filter, and a glide whose target is zero would otherwise park a few subnormals short of it. Per
@@ -136,6 +142,14 @@ public:
     static constexpr float  kMinDarkHz = 1.0f, kMaxDarkHz = 100000.0f;          // a corner outside is clamped
     static constexpr double kMinSampleRate = 1000.0, kMaxSampleRate = 768000.0;
 
+    /** How long `feed` takes to open or close the record head. A linear ramp of T is the switch's step smeared
+        over T: its spectrum is the step's times sinc(f·T), so above 1/T it falls at 12 dB/oct instead of 6. At
+        5 ms that corner is 200 Hz and the edge is 36 dB under the step's by 4 kHz; on a full-scale tone the
+        repeats' largest step falls from 13-16x the tone's own to 0.98-1.05x (TapeDelayTests). Short on purpose:
+        the door still answers the hand, and a note struck on the switch loses only its first 5 ms to the fade.
+        Counted in samples at the prepared rate (240 at 48 kHz, 5 at 1 kHz). */
+    static constexpr double kFeedRampSeconds = 0.005;
+
     TapeDelay() noexcept { refreshTail(); }
 
     /** Allocates every line for `maxChannels` (1 or 2) at `sampleRate` (1 kHz … 768 kHz). `maxBlock` (>= 1) is
@@ -182,6 +196,11 @@ public:
 
         updateCoeffs();
         refreshTail();
+
+        // The door's travel; `primed` is false, so the first call settles it on its own `feed`.
+        feedLen_  = std::max (1, (int) (kFeedRampSeconds * sampleRate + 0.5));
+        feedStep_ = 1.0f / (float) feedLen_;
+
         prepared_ = true;
         return true;
     }
@@ -191,8 +210,9 @@ public:
     int  maxBlock()    const noexcept { return prepared_ ? maxBlock_ : 0; }
     static constexpr int latencySamples() noexcept { return 0; }
 
-    /** A stream restart: the lines cleared, the write clocks back at zero, the heads re-snapped on the next
-        call. Cheap-idempotent — a stage out of the rig may call it every block; the clear runs once. */
+    /** A stream restart: the lines cleared, the write clocks back at zero, the heads re-snapped and the door
+        settled on the next call. Cheap-idempotent — a stage out of the rig may call it every block; the clear
+        runs once. */
     void reset() noexcept
     {
         if (cleared)
@@ -296,7 +316,8 @@ public:
     /** `feed` false is the INSERT'S BYPASS: the record head stops taking new signal, but the recirculation
         keeps going round, so the repeats already in the line ring out into the dry instead of being chopped.
         The line is only cleared by `reset()` — the difference between standing a pedal by and unplugging it.
-        In place; channels at index >= 2 are never part of a call (a wider call is refused). */
+        A flip is not instant: the input fades out (or in) over kFeedRampSeconds, from wherever a reversed flip
+        left it. In place; channels at index >= 2 are never part of a call (a wider call is refused). */
     [[nodiscard]] bool process (float* const* channels, int numChannels, int numSamples, bool feed = true) noexcept
     {
         if (! prepared_ || numChannels < 0 || numSamples < 0 || numChannels > maxCh_)
@@ -321,6 +342,7 @@ public:
             currentOff[0] = offsetMs < 0.0f ? -offsetMs * 0.001f * (float) sampleRate : 0.0f;
             currentOff[1] = offsetMs > 0.0f ?  offsetMs * 0.001f * (float) sampleRate : 0.0f;
             offPrimed_[0] = offPrimed_[1] = true;
+            feedPos_ = feed ? feedLen_ : 0;   // ...and the door stands where this call wants it: no fade-in
             primed  = true;
         }
         cleared = false;
@@ -348,6 +370,7 @@ public:
             for (int i = 0; i < numSamples; ++i)
                 glide (currentDelay, tgtDelay, glideCoeff);
 
+            feedPos_ = feedAfter (numSamples, feed);   // the door travels on, as through silence
             writePos = (int) (((long long) writePos + numSamples) % lineN_);
             offPos   = (int) (((long long) offPos   + numSamples) % offN_);
             envIn_.store (0.0f, std::memory_order_relaxed);
@@ -355,8 +378,9 @@ public:
             return true;
         }
 
-        const int lineN = lineN_;
-        const int offN  = offN_;
+        const int lineN  = lineN_;
+        const int offN   = offN_;
+        const int feedTo = feed ? feedLen_ : 0;
 
         // The comb's pulse listens at the door: the block peak of what the line is being FED, taken before
         // the loop overwrites the channel in place.
@@ -373,6 +397,13 @@ public:
             // travels.
             glide (currentDelay, tgtDelay, glideCoeff);
             const float dly = detail::clampf (1.0f, (float) (lineN - 4), (float) currentDelay);
+
+            // The door: one sample of travel toward `feed`, shared by both channels like the motor.
+            if (feedPos_ != feedTo)
+                feedPos_ += feedPos_ < feedTo ? 1 : -1;
+            const bool  feedOpen = feedPos_ == feedLen_;
+            const bool  feedShut = feedPos_ == 0;
+            const float feedGain = (float) feedPos_ * feedStep_;   // read only strictly between the ends
 
             for (int ch = 0; ch < nch; ++ch)
             {
@@ -398,8 +429,11 @@ public:
 
                 // The record head: input plus the recirculation, darkened and pressed — the first echo
                 // already wears one pass, the n-th wears n. A sample that is not a number is not recorded;
-                // the dry keeps it, it is not ours.
-                float v = (feed && std::isfinite (x) ? x : 0.0f) + tap * repeats;
+                // the dry keeps it, it is not ours. The input comes through the door — the plain sample when
+                // it is open and a plain zero when it is shut, so a held `feed` records the same bits it
+                // always did, scaled only while the door travels. The recirculation does not pass the door.
+                const float in = feedOpen ? x : (feedShut ? 0.0f : x * feedGain);
+                float v = (std::isfinite (x) ? in : 0.0f) + tap * repeats;
                 lpfState[ch] += lpfCoeff * (v - lpfState[ch]);
                 core::flushDenormal (lpfState[ch]);   // law 8: the only way into the line is through here
                 v = detail::detTanh (lpfState[ch] * satDrive) * satNorm;
@@ -488,6 +522,14 @@ private:
         current = std::fabs (next - current) > 0.0 ? next : target;
     }
 
+    /** Where the door stands `n` samples on, travelling toward `feed`'s end and stopping there. */
+    int feedAfter (int n, bool feed) const noexcept
+    {
+        const int to   = feed ? feedLen_ : 0;
+        const int step = std::min (n, std::abs (to - feedPos_));
+        return feedPos_ < to ? feedPos_ + step : feedPos_ - step;
+    }
+
     float targetDelaySamples() const noexcept
     {
         return (float) ((double) timeMs * 0.001 * sampleRate);
@@ -563,6 +605,10 @@ private:
     double currentDelay = 0.0;                        // the heads glide in double — see glide()
     double currentOff[kMaxChannels] { 0.0, 0.0 };
     float lpfState[kMaxChannels]   { 0.0f, 0.0f };
+    // The door, 0 = shut … feedLen_ = open. COUNTED, not glided: it lands on its ends exactly, where a glide
+    // toward zero would park subnormals short of it (law 8) and a door a hair open would still record.
+    int   feedLen_ = 1, feedPos_ = 0;
+    float feedStep_ = 1.0f;                            // 1 / feedLen_
     bool  live_[kMaxChannels]      { false, false };   // carried by a call since the last clear (law 11a)
     bool  offPrimed_[kMaxChannels] { true, true };     // false: the offset head snaps on the channel's return
     bool  primed = false, cleared = true;

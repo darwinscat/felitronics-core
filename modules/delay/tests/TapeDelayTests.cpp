@@ -4,14 +4,15 @@
 // delay::TapeDelay and its knob law — regression goldens (the core's own renders; how far they sit from the
 // app's original class is the out-of-tree parity harness's report), the ladder and the ranges, and the stage
 // contract: prepare binds and a refused one disarms, the tail is right from construction, reset is a restart,
-// absurd knobs stay bounded, re-slicing, a stopped channel, a pause, poison, law 8, the glides land, no
-// allocation.
+// absurd knobs stay bounded, re-slicing, a stopped channel, a pause, poison, law 8, the glides land, the feed
+// door has no edge, no allocation.
 #include <felitronics_test.h>
 #include <alloc_counter.h>   // installs the allocation counter
 
 #include "delay_cases.h"
 #include "delay_golden.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -414,6 +415,148 @@ void poisonAndLaw8()
                                           + std::to_string (lastLoud) + ") and STAYS silent to the minute's end");
 }
 
+// THE DOOR (`feed`). A 375 Hz cosine at 0 dBFS in 48 kHz: its period is 128 samples, so every boundary of a
+// 64- or 256-sample block sits on a crest or a trough and a flip lands on the worst sample there is. It fades in
+// over 10 ms, so its own start is no step.
+std::vector<float> doorTone (int len)
+{
+    std::vector<float> x ((std::size_t) len);
+    for (int i = 0; i < len; ++i)
+        x[(std::size_t) i] = (float) (std::cos (6.283185307179586 * (double) i / 128.0) * std::min (1.0, (double) i / 480.0));
+    return x;
+}
+
+double maxStep (const std::vector<float>& w, int from, int to)
+{
+    double m = 0.0;
+    for (int i = std::max (1, from); i < to && i < (int) w.size(); ++i)
+        m = std::max (m, std::abs ((double) w[(std::size_t) i] - (double) w[(std::size_t) i - 1]));
+    return m;
+}
+
+delay::TapeDelayParams doorKnobs()
+{
+    // 250 ms = 12000 samples; DARK 0 % (the loop's low pass at 16 kHz hides nothing); half the echo goes round.
+    delay::TapeDelayParams p; p.timeMs = 250.0f; p.repeats = 0.5f; p.darkHz = delay::darkHzForPercent (0.0f); p.mix = 1.0f;
+    return p;
+}
+
+/** The tone through a fresh mono stage in `block`-sample calls, `feed` per call from `feedAt (pos)`; the wet
+    (out − in, at mix 1) comes back. */
+template <class FeedAt>
+std::vector<float> doorWet (int len, int block, FeedAt feedAt)
+{
+    delay::TapeDelay d;
+    test::run (d.prepare (48000.0, block, 1));
+    d.setParams (doorKnobs());
+    const auto x = doorTone (len);
+    auto y = x;
+    for (int pos = 0; pos < len; pos += block)
+    {
+        float* io[1] = { y.data() + pos };
+        test::run (d.process (io, 1, std::min (block, len - pos), feedAt (pos)));
+    }
+    for (std::size_t i = 0; i < y.size(); ++i)
+        y[i] -= x[i];
+    return y;
+}
+
+void feedDoor()
+{
+    group ("the door: a flip of feed reaches the repeats with no tick, either way, even reversed half-way");
+    constexpr int D = 12000;   // what is recorded at t plays at t + D, and again at t + 2D
+    // The largest sample-to-sample step of the wet where the 1st and the 2nd repeat replay the flip.
+    const auto ticks = [] (const std::vector<float>& w, int at)
+    {
+        return std::max (maxStep (w, at + D - 64, at + D + 512), maxStep (w, at + 2 * D - 64, at + 2 * D + 512));
+    };
+    const auto report = [] (const char* what, double tick, double steady)
+    {
+        std::printf ("      [%s: largest step %.6f, steady echo's %.6f, x%.3f]\n", what, tick, steady, tick / steady);
+        ok (tick <= 1.5 * steady, std::string (what) + ": the repeats' largest step " + std::to_string (tick)
+                                  + " against the steady echo's own " + std::to_string (steady) + " (x"
+                                  + std::to_string (tick / steady) + ", at most x1.5)");
+    };
+
+    {   // ON -> OFF on a crest, after a second of tone: the record head must not take a full-scale step.
+        const int flip = 188 * 256;
+        const auto w = doorWet (flip + 2 * D + 4800, 256, [&] (int pos) { return pos < flip; });
+        report ("on -> off", ticks (w, flip), maxStep (w, flip - 6000, flip));
+    }
+    {   // OFF -> ON: a stage that stood by from its first call (nothing in the line) opens on a crest.
+        const int flip = 94 * 256;
+        const auto w = doorWet (flip + 2 * D + 4800, 256, [&] (int pos) { return pos >= flip; });
+        report ("off -> on", ticks (w, flip), maxStep (w, flip + D + 2400, flip + 2 * D - 64));
+    }
+    {   // ...and reversed before it got there: off for 128 samples, less than the door's travel, then on again.
+        const int flip = 752 * 64;
+        const auto w = doorWet (flip + 2 * D + 4800, 64, [&] (int pos) { return pos < flip || pos >= flip + 128; });
+        report ("on -> off -> on in 128 samples", ticks (w, flip), maxStep (w, flip - 6000, flip));
+    }
+
+    group ("the door after reset(): settled on the next call's feed, no travel");
+    {
+        // A stage left standing by is reset and fed an impulse: the same bits as a fresh stage. A door that
+        // kept its old position would open across the impulse and scale it.
+        delay::TapeDelay used, fresh;
+        test::run (used.prepare (48000.0, 256, 1)); test::run (fresh.prepare (48000.0, 256, 1));
+        used.setParams (doorKnobs()); fresh.setParams (doorKnobs());
+        auto x = doorTone (256 * 40);
+        for (int pos = 0; pos < (int) x.size(); pos += 256)
+        {
+            float* io[1] = { x.data() + pos };
+            test::run (used.process (io, 1, 256, pos < 256 * 20));   // the last 20 blocks stood by
+        }
+        used.reset();
+        std::vector<float> a ((std::size_t) D + 256, 0.0f), b ((std::size_t) D + 256, 0.0f);
+        a[0] = b[0] = 1.0f;
+        float* ia[1] = { a.data() }; float* ib[1] = { b.data() };
+        test::run (used.process (ia, 1, (int) a.size(), true)); test::run (fresh.process (ib, 1, (int) b.size(), true));
+        ok (a == b && b[(std::size_t) D] > 0.5f, "reset after a stand-by, then feed on: the impulse's echo is a fresh "
+                                                 "stage's, bit for bit (" + std::to_string (b[(std::size_t) D]) + ")");
+
+        // ...and the other way: reset while open, then stand by from the first sample — nothing enters.
+        used.reset();
+        auto t = doorTone (D + 256);
+        const auto t0 = t;
+        float* it[1] = { t.data() };
+        test::run (used.process (it, 1, (int) t.size(), false));
+        ok (t == t0, "reset while feeding, then feed off: not one sample of the tone reaches the line");
+    }
+
+    group ("the door through a pause (law 11c): it travels as through silence");
+    {
+        delay::TapeDelay A, B, C;
+        std::vector<float> z (64, 0.0f), z2 (64, 0.0f);
+        float* zz[2] = { z.data(), z2.data() };
+        delay::TapeDelayParams p = doorKnobs(); p.timeMs = 20.0f;
+        for (auto* s : { &A, &B, &C })
+        {
+            test::run (s->prepare (48000.0, 64, 2));
+            s->setParams (p);
+            test::run (s->process (zz, 2, 64, true));    // at rest, open
+            test::run (s->process (zz, 2, 64, false));   // closing: 64 samples of the travel spent on silence
+        }
+        test::run (A.process (nullptr, 0, 100, false));  // A pauses, B hears 100 samples of silence, C neither
+        test::run (B.process (zz, 2, 50, false));
+        test::run (B.process (zz, 2, 50, false));
+        std::vector<std::vector<float>> outs;
+        for (auto* s : { &A, &B, &C })
+        {
+            auto l = doorTone (4096), r = doorTone (4096);
+            for (int pos = 0; pos < 4096; pos += 64)
+            {
+                float* q[2] = { l.data() + pos, r.data() + pos };
+                test::run (s->process (q, 2, 64, false));
+            }
+            l.insert (l.end(), r.begin(), r.end());
+            outs.push_back (l);
+        }
+        ok (outs[0] == outs[1], "a 100-sample pause mid-travel leaves the door where 100 samples of silence leave it");
+        ok (outs[0] != outs[2], "...and it moved it: the tone that follows gets in for less time than with no gap");
+    }
+}
+
 void noAllocation()
 {
     group ("RT: process, reset and the setters never allocate");
@@ -447,6 +590,7 @@ int main()
     glidesLand();
     detTanhAccuracy();
     poisonAndLaw8();
+    feedDoor();
     noAllocation();
     return felitronics::test::report();
 }
