@@ -51,6 +51,12 @@ namespace felitronics::reverb
 //   · reset() is a stream RESTART: every line cleared, every clock re-anchored (the line positions, the chorus
 //     LFO's phase, the law-8 grid) and every parameter glide landed on its target — what follows a reset does
 //     not depend on what came before it.
+//   · FEED (process's last argument) is the insert's stand-by, and it is a DOOR, not a switch: what enters the
+//     wet chain is ramped linearly to nothing, or back, over kFeedRampSeconds — a flip on a loud note would
+//     otherwise walk into the room as a step, a click the tail then carries. Only the input is ramped, never
+//     the room's own tail, and a held `feed` feeds the room exactly what the switch did. The door is shared by
+//     the channels; a pause moves it as silence would (law 11c), and after prepare() or reset() it stands where
+//     the next call's `feed` puts it, with no travel, so a fresh room does not fade in its first note.
 //   · Law 8: the room flushes its own state to zero below 1e-15 per sample (Freeverb.h); the predelay and
 //     chorus lines are pure delays; the HPF's integrators are flushed on `core::StateGrid` (audio time, 64
 //     samples) and healed at the end of every call.
@@ -88,6 +94,14 @@ public:
 
     static constexpr double kMinSampleRate = 1000.0, kMaxSampleRate = 768000.0;
     static constexpr int    kMaxChunk      = 8192;   // the scratch's cap: longer calls are chunked here
+
+    /** How long `feed` takes to open or close the room's door — the same 5 ms as delay::TapeDelay's, for the
+        same reason: a linear ramp of T is the switch's step smeared over T, whose spectrum falls at 12 dB/oct
+        above 1/T (200 Hz here) instead of the step's 6. On a full-scale tone into a PLATE, what the flip sends
+        through the room above 4 kHz falls from -24 dB re the room's steady answer to -64…-70 dB
+        (AmpReverbTests); a note struck on the switch loses only its first 5 ms to the fade. Counted in samples
+        at the prepared rate (240 at 48 kHz). */
+    static constexpr double kFeedRampSeconds = 0.005;
 
     AmpReverb() noexcept { refreshTail(); }
 
@@ -134,6 +148,10 @@ public:
         hpf.reset();
         grid_.reset();
 
+        feedLen_    = std::max (1, (int) (kFeedRampSeconds * sampleRate + 0.5));
+        feedStep_   = 1.0f / (float) feedLen_;
+        feedPrimed_ = false;   // the first call settles the door on its own `feed`
+
         cleared   = true;
         prepared_ = true;
         return true;
@@ -150,6 +168,7 @@ public:
     void reset() noexcept
     {
         room_.landGlides();   // a restart starts AT the set parameters, like a fresh prepare — even on a cleared room
+        feedPrimed_ = false;  // ...and the door stands where the next call's `feed` puts it, with no travel
 
         if (cleared)
             return;
@@ -239,7 +258,8 @@ public:
 
     /** `feed` false is the INSERT'S BYPASS: nothing new enters the wet chain, so the room that is already
         ringing decays into the dry rather than being cut. The dry is untouched either way; this stage only
-        ever ADDS. */
+        ever ADDS. A flip is not instant: the input fades out (or in) over kFeedRampSeconds, from wherever a
+        reversed flip left it. */
     [[nodiscard]] bool process (float* const* channels, int numChannels, int numSamples, bool feed = true) noexcept
     {
         if (! prepared_ || numChannels < 0 || numSamples < 0 || numChannels > maxCh_)
@@ -255,7 +275,7 @@ public:
 
         if (numChannels == 0)
         {
-            pause (numSamples);
+            pause (numSamples, feed);
             return true;
         }
 
@@ -316,12 +336,14 @@ private:
     }
 
     /** Law 11c: n samples of digital silence at no width. Every channel has stopped (its memory is gone), so
-        what is left to move is shared: the room's glides, the chorus LFO and the line clocks. */
-    void pause (int n) noexcept
+        what is left to move is shared: the room's glides, the chorus LFO, the line clocks and the door. */
+    void pause (int n, bool feed) noexcept
     {
         cleared = false;
         addedCount = 0;
         room_.advanceGlides (n);
+        primeFeed (feed);
+        feedPos_ = feedAfter (n, feed);
 
         if (character == Character::modulated)
         {
@@ -348,15 +370,37 @@ private:
             live_[ch] = true;   // per chunk: a poison restart below clears the marks mid-call
 
         // The wet copy: the whole wet chain runs on it, and the dry never enters. A sample that is not a
-        // number does not enter it either — the dry keeps whatever it was handed.
+        // number does not enter it either — the dry keeps whatever it was handed. It comes through the door:
+        // standing still, the copy is the plain one, so a held `feed` feeds the room the same bits it always
+        // did; travelling, one sample of travel per sample, the same for every channel, and the ends are still
+        // the plain sample and the plain zero.
+        primeFeed (feed);
+        const int feedTo = feed ? feedLen_ : 0;
+
         for (int ch = 0; ch < nch; ++ch)
         {
             float* w = wet[(std::size_t) ch].data();
             const float* d = channels[ch];
 
-            for (int i = 0; i < n; ++i)
-                w[i] = feed && std::isfinite (d[i]) ? d[i] : 0.0f;
+            if (feedPos_ == feedTo)
+            {
+                for (int i = 0; i < n; ++i)
+                    w[i] = feed && std::isfinite (d[i]) ? d[i] : 0.0f;
+            }
+            else
+            {
+                for (int i = 0, at = feedPos_; i < n; ++i)
+                {
+                    if (at != feedTo)
+                        at += at < feedTo ? 1 : -1;
+                    w[i] = at == 0 || ! std::isfinite (d[i]) ? 0.0f
+                         : at == feedLen_                    ? d[i]
+                                                             : d[i] * ((float) at * feedStep_);
+                }
+            }
         }
+
+        feedPos_ = feedAfter (n, feed);
 
         // The room itself, 100% wet (the wet level 1/3 undoes Freeverb's ×3).
         if (nch >= 2)
@@ -418,6 +462,24 @@ private:
         for (int ch = 0; ch < nch; ++ch)
             for (int i = 0; i < n; ++i)
                 channels[ch][i] += wetOut[(std::size_t) ch][(std::size_t) i];
+    }
+
+    /** After prepare() or reset() the door takes the first `feed` it is given as where it stands. */
+    void primeFeed (bool feed) noexcept
+    {
+        if (feedPrimed_)
+            return;
+
+        feedPos_    = feed ? feedLen_ : 0;
+        feedPrimed_ = true;
+    }
+
+    /** Where the door stands `n` samples on, travelling toward `feed`'s end and stopping there. */
+    int feedAfter (int n, bool feed) const noexcept
+    {
+        const int to   = feed ? feedLen_ : 0;
+        const int step = std::min (n, std::abs (to - feedPos_));
+        return feedPos_ < to ? feedPos_ + step : feedPos_ - step;
     }
 
     /** The room the character asks for, as DECAY leaves it — the one place this is worked out. */
@@ -542,6 +604,11 @@ private:
     std::array<std::vector<float>, kMaxChannels> wet, wetOut;
     std::array<std::vector<float>, kMaxChannels> preLine, modLine;
     bool  live_[kMaxChannels] { false, false };   // carried by a call since the last clear (law 11a)
+    // The door, 0 = shut … feedLen_ = open. COUNTED, not glided: it lands on its ends exactly, where a glide
+    // toward zero would park subnormals short of it (law 8) and a door a hair open would still feed the room.
+    int   feedLen_ = 1, feedPos_ = 0;
+    float feedStep_ = 1.0f;     // 1 / feedLen_
+    bool  feedPrimed_ = false;  // false: the next chunk or pause takes its `feed` as where the door stands
     bool  cleared   = true;    // see reset()
     bool  prepared_ = false;
     int   addedCount = 0;      // see addedLength()

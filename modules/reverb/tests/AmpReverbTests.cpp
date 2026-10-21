@@ -5,13 +5,17 @@
 // the app's original class is the out-of-tree parity harness's report), Freeverb's published constants and
 // glide, and the stage contract: prepare binds and a refused one disarms, a fresh room starts at its
 // parameters, the tail is right from construction, reset is a restart, absurd knobs stay bounded, chunking,
-// a stopped channel, poison, law 8, no allocation. The pause (law 11c) is in modules/laws.
+// a stopped channel, poison, law 8, the feed door has no edge, no allocation. The pause (law 11c) is in
+// modules/laws.
 #include <felitronics_test.h>
 #include <alloc_counter.h>   // installs the allocation counter
 
 #include "reverb_cases.h"
 #include "reverb_golden.h"
 
+#include <felitronics/eq/Svf.h>
+
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <string>
@@ -367,6 +371,147 @@ void poisonAndLaw8()
                                             + " s), then reached exact zero and STAYED there to the end");
 }
 
+// THE DOOR (`feed`). A 375 Hz cosine at 0 dBFS in 48 kHz: its period is 128 samples, so every boundary of a
+// 64- or 256-sample block sits on a crest or a trough and a flip lands on the worst sample there is. It fades in
+// over 10 ms, so its own start is no step.
+std::vector<float> doorTone (int len)
+{
+    std::vector<float> x ((std::size_t) len);
+    for (int i = 0; i < len; ++i)
+        x[(std::size_t) i] = (float) (std::cos (6.283185307179586 * (double) i / 128.0) * std::min (1.0, (double) i / 480.0));
+    return x;
+}
+
+/** The tone through a fresh mono PLATE (the shipping room, and the brightest damping) in `block`-sample calls,
+    `feed` per call from `feedAt (pos)`; the wet (out − in, at mix 1) comes back. */
+template <class FeedAt>
+std::vector<float> doorWet (int len, int block, FeedAt feedAt)
+{
+    reverb::AmpReverb r;
+    test::run (r.prepare (48000.0, block, 1));
+    reverb::AmpReverbParams p; p.character = reverb::Character::plate; p.mix = 1.0f;
+    r.setParams (p);
+    const auto x = doorTone (len);
+    auto y = x;
+    for (int pos = 0; pos < len; pos += block)
+    {
+        float* io[1] = { y.data() + pos };
+        test::run (r.process (io, 1, std::min (block, len - pos), feedAt (pos)));
+    }
+    for (std::size_t i = 0; i < y.size(); ++i)
+        y[i] -= x[i];
+    return y;
+}
+
+/** The click, in dB: the largest sample above 4 kHz (two 12 dB/oct high-passes) in [from, to), against the
+    largest sample of the room's steady answer to the tone in [refFrom, refTo). A room fed a pure tone answers in
+    that tone, which the high-pass puts 83 dB down; a step into the room is broadband and comes straight through. */
+double clickDb (const std::vector<float>& w, int from, int to, int refFrom, int refTo)
+{
+    eq::Svf a, b;
+    a.prepare (48000.0, 1); b.prepare (48000.0, 1);
+    a.setParams (eq::FilterType::HighPass, 4000.0, 0.7071, 0.0); b.setParams (eq::FilterType::HighPass, 4000.0, 0.7071, 0.0);
+    double hf = 0.0, ref = 0.0;
+    for (int i = 0; i < to; ++i)
+    {
+        const float h = b.processSample (0, a.processSample (0, w[(std::size_t) i]));
+        if (i >= from) hf = std::max (hf, (double) std::abs (h));
+    }
+    for (int i = refFrom; i < refTo; ++i)
+        ref = std::max (ref, (double) std::abs (w[(std::size_t) i]));
+    return 20.0 * std::log10 (hf / ref);
+}
+
+void feedDoor()
+{
+    group ("the door: a flip of feed reaches the room with no click, either way, even reversed half-way");
+    const auto report = [] (const char* what, double db)
+    {
+        std::printf ("      [%s: above 4 kHz %.1f dB re the steady answer]\n", what, db);
+        ok (db < -50.0, std::string (what) + ": above 4 kHz in the 250 ms after the flip the room's largest sample is "
+                        + std::to_string (db) + " dB re its steady answer (at most -50)");
+    };
+    {   // ON -> OFF on a crest, after two seconds of tone: the room's answer is steady.
+        const int flip = 375 * 256;
+        const auto w = doorWet (flip + 12000, 256, [&] (int pos) { return pos < flip; });
+        report ("on -> off", clickDb (w, flip, flip + 12000, flip - 12000, flip));
+    }
+    {   // OFF -> ON: a room that stood by from its first call (silent) opens on a crest; two seconds later it is steady.
+        const int flip = 94 * 256;
+        const auto w = doorWet (flip + 108000, 256, [&] (int pos) { return pos >= flip; });
+        report ("off -> on", clickDb (w, flip, flip + 12000, flip + 96000, flip + 108000));
+    }
+    {   // ...and reversed before it got there: off for 128 samples, less than the door's travel, then on again.
+        const int flip = 1500 * 64;
+        const auto w = doorWet (flip + 12000, 64, [&] (int pos) { return pos < flip || pos >= flip + 128; });
+        report ("on -> off -> on in 128 samples", clickDb (w, flip, flip + 12000, flip - 12000, flip));
+    }
+
+    group ("the door after reset(): settled on the next call's feed, no travel");
+    {
+        // A room left standing by is reset and fed an impulse: the same bits as a fresh room. A door that kept
+        // its old position would open across the impulse and scale it.
+        reverb::AmpReverb used, fresh;
+        reverb::AmpReverbParams p; p.character = reverb::Character::plate; p.mix = 1.0f;
+        used.setParams (p); fresh.setParams (p);
+        test::run (used.prepare (48000.0, 256, 1)); test::run (fresh.prepare (48000.0, 256, 1));
+        auto x = doorTone (256 * 40);
+        for (int pos = 0; pos < (int) x.size(); pos += 256)
+        {
+            float* io[1] = { x.data() + pos };
+            test::run (used.process (io, 1, 256, pos < 256 * 20));   // the last 20 blocks stood by
+        }
+        used.reset();
+        std::vector<float> a (4096, 0.0f), b (4096, 0.0f);
+        a[0] = b[0] = 1.0f;
+        float* ia[1] = { a.data() }; float* ib[1] = { b.data() };
+        test::run (used.process (ia, 1, 4096, true)); test::run (fresh.process (ib, 1, 4096, true));
+        float tail = 0.0f;
+        for (std::size_t i = 1; i < b.size(); ++i) tail = std::max (tail, std::abs (b[i]));
+        ok (a == b && tail > 0.01f, "reset after a stand-by, then feed on: the impulse's room is a fresh room's, bit for bit");
+
+        // ...and the other way: reset while open, then stand by from the first sample — nothing enters.
+        used.reset();
+        auto t = doorTone (4096);
+        const auto t0 = t;
+        float* it[1] = { t.data() };
+        test::run (used.process (it, 1, 4096, false));
+        ok (t == t0, "reset while feeding, then feed off: not one sample of the tone reaches the room");
+    }
+
+    group ("the door through a pause (law 11c): it travels as through silence");
+    {
+        reverb::AmpReverb A, B, C;
+        std::vector<float> z (64, 0.0f), z2 (64, 0.0f);
+        float* zz[2] = { z.data(), z2.data() };
+        reverb::AmpReverbParams p; p.character = reverb::Character::plate; p.mix = 1.0f;
+        for (auto* s : { &A, &B, &C })
+        {
+            s->setParams (p);
+            test::run (s->prepare (48000.0, 64, 2));
+            test::run (s->process (zz, 2, 64, true));    // at rest, open
+            test::run (s->process (zz, 2, 64, false));   // closing: 64 samples of the travel spent on silence
+        }
+        test::run (A.process (nullptr, 0, 100, false));  // A pauses, B hears 100 samples of silence, C neither
+        test::run (B.process (zz, 2, 50, false));
+        test::run (B.process (zz, 2, 50, false));
+        std::vector<std::vector<float>> outs;
+        for (auto* s : { &A, &B, &C })
+        {
+            auto l = doorTone (4096), r = doorTone (4096);
+            for (int pos = 0; pos < 4096; pos += 64)
+            {
+                float* q[2] = { l.data() + pos, r.data() + pos };
+                test::run (s->process (q, 2, 64, false));
+            }
+            l.insert (l.end(), r.begin(), r.end());
+            outs.push_back (l);
+        }
+        ok (outs[0] == outs[1], "a 100-sample pause mid-travel leaves the door where 100 samples of silence leave it");
+        ok (outs[0] != outs[2], "...and it moved it: the tone that follows gets in for less time than with no gap");
+    }
+}
+
 void noAllocation()
 {
     group ("RT: process, reset and the setters never allocate");
@@ -398,6 +543,7 @@ int main()
     extremes();
     stoppedChannel();
     poisonAndLaw8();
+    feedDoor();
     noAllocation();
     return felitronics::test::report();
 }
