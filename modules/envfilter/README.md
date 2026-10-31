@@ -70,3 +70,5 @@ fastest settings peaks at −0.55 dBFS; no zipper (energy above 6 kHz −150 dB 
 −152 … −154; a cutoff held for 32 samples reads −105); keepLows 1 holds 31 … 73 Hz within 1.23 dB where 0 loses
 43 dB; plus the law-11 properties, amount 0, glides, re-slicing, 11a/11c, reset, poison, law 8 and allocation.
 
+`tools/EnvelopeFilterRender.cpp` (`felitronics_envfilter_render <outDir> [inDir]`) renders a bass DI —
+every `*.wav` in `inDir`, or a synthesised plucked-string line — at several slider positions to 24-bit WAVs.

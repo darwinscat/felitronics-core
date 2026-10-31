@@ -15,3 +15,9 @@ if(FELITRONICS_BUILD_TESTS)
     add_test(NAME felitronics_envfilter_tests COMMAND felitronics_envfilter_tests)
 endif()
 
+# A listening tool, not a test: renders a bass DI through the stage at several slider positions to 24-bit WAVs.
+if(PROJECT_IS_TOP_LEVEL AND NOT EMSCRIPTEN)
+    add_executable(felitronics_envfilter_render tools/EnvelopeFilterRender.cpp)
+    target_link_libraries(felitronics_envfilter_render PRIVATE felitronics::envfilter felitronics::io)
+    target_compile_features(felitronics_envfilter_render PRIVATE cxx_std_20)
+endif()
