@@ -86,9 +86,12 @@ namespace felitronics::octave
 // AND the note is locked and not dying. Between notes the sub is an exact zero. A gate down at −90 dBFS opens on a
 // DI's own noise floor and the tracker follows the hiss — the range stops at −90 for that reason; −50 is the default.
 //
-// RANGE. Fundamentals from 25 Hz (below drop A, 27.5) to about 400 Hz. Below 25 Hz a period comes too close to the
-// 1/22 s loss deadline for acquisition to be promised: a smooth 22.2 Hz note acquires, but only after 0.2 … 0.9 s
-// depending on its polarity. From 25 Hz smooth harmonic notes acquire in both polarities within 2.5 cycles (tested).
+// RANGE. Fundamentals from 26 Hz (drop A, 27.5, and low B, 30.9, well inside) to about 400 Hz. Below it a period comes
+// too close to the 1/22 s loss deadline for acquisition to be promised, and one polarity may not acquire at all: a
+// smooth 22.2 Hz note acquires in one polarity after 0.2 s and never in the other (ten seconds, every rate); a
+// bridge-pickup pluck double-triggers once at 25.0 and 25.25 Hz and is clean from 25.5. Inside the range smooth
+// harmonic notes acquire in both polarities and every phase within 1.7 cycles at 26 … 31 Hz, rising to 2.0 at 98 Hz
+// and 2.7 at 400 Hz (measured worst; the tests bound 1.8 / 2.2 / 2.8).
 //
 // MONOPHONIC. A chord has no one fundamental: the comparator follows whatever its sum crosses — usually the lowest
 // note when it is the loudest in the band, otherwise the beat pattern between the notes — and the sub comes out as
@@ -107,7 +110,8 @@ namespace felitronics::octave
 //     longer in the sum). The tracker and the voices are ONE shared, linked instrument, and nch == 0 with n > 0 is a
 //     pause that runs them exactly as n samples of silence would (law 11c) — the gate holds, glides travel, a note
 //     dies — and stops computing the moment a silent sample would change no state word at all (the silent fixed
-//     point), so a long pause costs its first second and a half at most.
+//     point), so a long pause costs only the audio it takes to get there: 1.5 … 1.6 s after a 0.5-peak note, at most
+//     about 1.8 s (the source peak's 50 ms decay from the +12 dBFS input limit to the flush).
 //   · reset() is a stream RESTART: tracker and voices cleared, the levels and the corners re-snapped to their
 //     targets on the next call, the audio-time grid re-anchored.
 //   · IDLE NOTHING IS COMPUTED. When both sub levels stand at exactly zero the stage drops its tracker at the next
@@ -200,7 +204,7 @@ public:
     static constexpr float  kHysteresis = 0.88f;
     static constexpr double kThresholdReleaseSeconds = 0.040;
     static constexpr double kMinTrackHz = 22.0;    // 1/22 s between edges: lost, whatever the period was — so the
-                                                   // SUPPORTED range starts at 25 Hz (see RANGE)
+                                                   // SUPPORTED range starts at 26 Hz (see RANGE)
     static constexpr double kMaxTrackHz = 480.0;   // an edge sooner than 1/480 s after the last: not a fundamental
     static constexpr float  kInputLimit = 4.0f;    // what the tracker reads: +12 dBFS; beyond is clamped
     static constexpr float  kFloorUnderBand = 0.1f; // the comparator's floor rides 20 dB under the band's own level

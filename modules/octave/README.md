@@ -11,9 +11,11 @@ target_link_libraries(app PRIVATE felitronics::octave)
 
 ## `Octaver`
 
-**Range: fundamentals from 25 Hz to about 400 Hz.** Below 25 Hz the period comes too close to the 1/22 s loss
-deadline for acquisition to be promised (a smooth 22.2 Hz note acquires only after 0.2 … 0.9 s, by polarity); from
-25 Hz smooth harmonic notes acquire in both polarities within 2.5 cycles. Drop A (27.5) and low B (30.9) are inside.
+**Range: fundamentals from 26 Hz to about 400 Hz.** Drop A (27.5) and low B (30.9) are well inside. Below 26 Hz the
+period comes too close to the 1/22 s loss deadline, and one polarity may not acquire at all (a smooth 22.2 Hz note
+acquires in one polarity after 0.2 s and never in the other; a bridge-pickup pluck double-triggers once at 25.0 and
+25.25 Hz, clean from 25.5). Inside it, smooth harmonic notes acquire in both polarities and every phase within 1.7
+cycles at 26 … 31 Hz, 2.0 at 98 Hz and 2.7 at 400 Hz (measured worst).
 
 The analog octaver of the OC-2 family, not a pitch shifter: it follows the string's zero crossings and divides
 them, so nothing waits for a window. The dry is never touched: each output sample is its input sample plus the sub,
@@ -28,7 +30,8 @@ the same sub on every channel (`latencySamples() == 0`). There is no dry level �
   decaying follower cannot hand the acquisition to the hum under it), and the raw input itself has just swung that
   way, past a quarter of its own recent peak (so the band filters' ringing after a source has stopped cannot finish
   the proof). That peak forgets in about 50 ms, so a much quieter note after a loud one, or a note after a DC pulse,
-  is acquired too (a 40 dB drop: about 100 ms after the switch, the loud note's loss included). One cycle of anything, at any bass pitch, phase or ramp, has at most two swings one way and one the other,
+  is acquired too: a 40 dB drop has its sub 133 … 160 ms after the switch, a 20 dB drop 62 … 82 ms (16 phases and
+  polarities; the loud note's loss included). One cycle of anything, at any bass pitch, phase or ramp, has at most two swings one way and one the other,
   and makes no sub. The comparator's floor rides 20 dB under the band's own level.
 - **The note's life.** The period is the longest of the last three edge intervals, and it sets deadlines only once
   two intervals in a row agree within a quarter (a note's first interval can be a partial attack cycle). An edge a
@@ -63,7 +66,8 @@ re-designed every sample while they travel (at most 0.48 % per sample at 44.1 kH
 is a click, and a swap every 16 samples was a staircase of 7.25 % steps). At both levels 0 the stage drops its tracker
 at the next 64-sample grid point and from then on does not touch the buffer (`isIdle()`, bit-exact dry, nothing
 computed); a wake is a restart through a 10 ms input door. A pause (`nch == 0`) runs the whole instrument as that much
-silence, and parks on the silent fixed point (a ten-minute pause in one call: about 1 ms).
+silence, and parks on the silent fixed point once it gets there — after 1.5 … 1.6 s of audio following a 0.5-peak
+note, at most about 1.8 s (a ten-minute pause in one call: about 1 ms of work).
 
 ### How soon it speaks (from silence, 2 ms attack; 16 onset phases × both polarities; 44.1, 48 and 96 kHz agree)
 

@@ -726,9 +726,10 @@ void humUnderTheGate()
     }
 }
 
-/** A note much quieter than the one before it — played at once, its phase restarting — and a quiet note after a DC
-    pulse: the source's own peak must forget the old signal (13d1d3f held it for ever: 0.004 after a 0.5 low B, or
-    0.01 after a +0.5 DC pulse, never acquired — the gate open, the sub exactly zero for ten seconds). */
+/** A note much quieter than the one before it — played at once, 8 restart phases x both polarities — and a quiet note
+    after a DC pulse: the source's own peak must forget the old signal (13d1d3f held it for ever: 0.004 after a 0.5 low
+    B, or 0.01 after a +0.5 DC pulse, never acquired — the gate open, the sub exactly zero for ten seconds). The bound
+    is the measured worst, 160.3 ms after the switch for the 40 dB drops (the loud note's loss included), plus 25 %. */
 void quietAfterLoud()
 {
     group ("a much quieter note after a loud one (and after a DC pulse) is acquired — the source's peak forgets");
@@ -736,18 +737,28 @@ void quietAfterLoud()
     {
         for (double q : { 0.004, 0.05, 0.005 })   // codex's case, 20 dB and 40 dB under
         {
-            Buf x (samples (fs, 3.0), 0.0f);
-            const std::size_t s0 = samples (fs, 0.5);
-            for (std::size_t i = 0; i < s0; ++i) x[i] = (float) (0.5 * std::sin (2.0 * kPi * kLowB * (double) i / fs));
-            fadeIn (x, fs, 0.002);
-            for (std::size_t i = s0; i < x.size(); ++i) x[i] = (float) (q * std::sin (2.0 * kPi * kLowE * (double) (i - s0) / fs));
-            const Buf y = subOf (fs, x, levels (1.0f, 0.0f));
-            const double steady = peakOf (y, fs, 2.0, 3.0);
-            std::size_t back = samples (fs, 0.5 + 1.25 / kLowB + 0.006);   // past the loud note's own fade
-            while (back < y.size() && y[back] == 0.0f) ++back;
-            const double ms = (double) (back - s0) / fs * 1000.0;
-            ok (steady > 0.5 * q && ms < 150.0 && badHalfPeriods (y, fs, 1.0, 3.0, fs / kLowE, 0.05) == 0,
-                fmt ("%.0f Hz: a %.3f low E right after a 0.5 low B ", fs, q) + fmt ("has its sub %.1f ms after the switch, and tracks", ms));
+            double lo = 1.0e9, hi = 0.0;
+            int bad = 0;
+            for (int c = 0; c < 16; ++c)
+            {
+                Buf x (samples (fs, 2.0), 0.0f);
+                const std::size_t s0 = samples (fs, 0.5);
+                for (std::size_t i = 0; i < s0; ++i) x[i] = (float) (0.5 * std::sin (2.0 * kPi * kLowB * (double) i / fs));
+                fadeIn (x, fs, 0.002);
+                for (std::size_t i = s0; i < x.size(); ++i)
+                    x[i] = (float) ((c < 8 ? q : -q) * std::sin (2.0 * kPi * kLowE * (double) (i - s0) / fs + (c % 8) * kPi / 4.0));
+                const Buf y = subOf (fs, x, levels (1.0f, 0.0f));
+                std::size_t back = samples (fs, 0.5 + 1.25 / kLowB + 0.006);   // past the loud note's own fade
+                while (back < y.size() && y[back] == 0.0f) ++back;
+                const double ms = (double) (back - s0) / fs * 1000.0;
+                lo = std::min (lo, ms);
+                hi = std::max (hi, ms);
+                if (! (peakOf (y, fs, 1.5, 2.0) > 0.5 * q && badHalfPeriods (y, fs, 1.0, 2.0, fs / kLowE, 0.05) == 0)) ++bad;
+            }
+            if (fs == 48000.0)
+                std::printf ("    a %.3f low E right after a 0.5 low B: its sub %.1f … %.1f ms after the switch (16 phases/polarities)\n", q, lo, hi);
+            ok (hi < 200.0 && bad == 0, fmt ("%.0f Hz: a %.3f low E right after a 0.5 low B ", fs, q)
+                                       + fmt ("has its sub by %.1f ms after the switch at every phase and polarity, and tracks", hi));
         }
         Buf d (samples (fs, 2.0), 0.0f);
         for (std::size_t i = samples (fs, 0.1); i < samples (fs, 0.12); ++i) d[i] = 0.5f;
@@ -760,31 +771,40 @@ void quietAfterLoud()
     }
 }
 
-/** The supported range starts at 25 Hz: smooth, harmonic notes (four partials, a band-limited saw) at 25, 27.5 (drop
-    A) and 30.9 Hz (low B) acquire in BOTH polarities within two and a half cycles. (Below it the 1/22 s deadline is too
-    close to the period: codex's 22.2 Hz saw acquires, but only after 0.2 … 0.9 s, depending on its polarity.) */
+/** The supported range is fundamentals from 26 Hz to about 400 Hz: smooth, harmonic notes (four partials, a
+    band-limited saw) at 26, 27.5 (drop A), 30.9 (low B), 98 and 400 Hz acquire in BOTH polarities, 4 phases each,
+    within the measured worst plus a margin — 1.8 cycles to 31 Hz, 2.2 at 98, 2.8 at 400 (measured over 16
+    phases/polarities: 1.66 / 1.68 / 2.04 / 2.66). 25 Hz is a margin row. Below the range the 1/22 s deadline is too
+    close to the period: codex's 22.2 Hz saw acquires in one polarity and never in the other. */
 void supportedRange()
 {
-    group ("the supported range starts at 25 Hz: smooth notes at 25 / 27.5 / 30.9 Hz acquire in both polarities");
+    group ("the supported range is 26 … 400 Hz: smooth notes acquire in both polarities and every phase, within the stated cycles");
+    const struct { double f, bound; } rows[] = { { 25.0, 1.8 }, { 26.0, 1.8 }, { 27.5, 1.8 }, { kLowB, 1.8 }, { 97.9989, 2.2 }, { 400.0, 2.8 } };
     for (double fs : { 44100.0, 48000.0, 96000.0 })
-        for (double f : { 25.0, 27.5, kLowB })
-            for (double sign : { 1.0, -1.0 })
+        for (const auto& r : rows)
+        {
+            const double f = r.f;
+            double worst = 0.0;
+            int bad = 0;
+            for (int c = 0; c < 8; ++c)
             {
                 Buf x (samples (fs, 1.5));
                 for (std::size_t i = 0; i < x.size(); ++i)
                 {
                     double v = 0.0;
-                    for (int k = 1; k <= 4; ++k) v += std::sin (2.0 * kPi * k * f * (double) i / fs) / k;
-                    x[i] = (float) (sign * 0.6 / kPi * v);
+                    for (int k = 1; k <= 4; ++k) v += std::sin (2.0 * kPi * k * f * (double) i / fs + k * (c % 4) * kPi / 2.0) / k;
+                    x[i] = (float) ((c < 4 ? 1.0 : -1.0) * 0.6 / kPi * v);
                 }
                 fadeIn (x, fs, 0.002);
                 const Buf y = subOf (fs, x, levels (1.0f, 0.0f));
                 std::size_t first = 0;
                 while (first < y.size() && y[first] == 0.0f) ++first;
-                const double cycles = (double) first * f / fs;
-                ok (cycles <= 2.5 && badHalfPeriods (y, fs, 0.4, 1.5, fs / f, 0.05) == 0,
-                    fmt ("%.0f Hz, %.1f Hz, ", fs, f) + fmt ("polarity %+.0f: the sub starts %.2f cycles in and tracks", sign, cycles));
+                worst = std::max (worst, (double) first * f / fs);
+                if (badHalfPeriods (y, fs, 0.4, 1.5, fs / f, 0.05) != 0) ++bad;
             }
+            ok (worst <= r.bound && bad == 0, fmt ("%.0f Hz, %.1f Hz: ", fs, f)
+                                              + fmt ("the sub starts by %.2f cycles (bound %.1f) in both polarities and tracks", worst, r.bound));
+        }
 }
 
 /** A sustained note right at the gate, whose follower ripples across the opening level (0.84 … 1.28 times it): it is
@@ -1147,7 +1167,8 @@ void pauseIsSilence()
     ok (same == cases, fmt ("after a pause, every sample equals the same stream after silence (%.0f of %.0f gap lengths)", same, cases));
     ok (heard == cases, "precondition: every return has its sub");
 
-    // A long pause parks: ten minutes in one call costs no more than its first second and a half.
+    // A long pause parks: ten minutes in one call costs only the audio time it takes to reach the silent fixed point
+    // (1.5 … 1.6 s after a 0.5-peak note; at most about 1.8 s, the source peak's decay from the input limit).
     oc::Octaver o;
     felitronics::test::run (o.prepare (fs, 64, 2));
     o.setParams (levels (1.0f, 1.0f));
