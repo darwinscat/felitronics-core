@@ -31,6 +31,7 @@ The guitar-amp modules — `nam` (the NeuralAmpModelerCore backend), `rigplayer`
 |---|---|---|
 | `delay` | tape-style echo: a gliding (repitching) head, a dark saturated loop, a stereo offset; the knob law (sync ladder, sync policy, DARK) | `TapeDelay`, `DelayLaw.h` (`divisionMs`, `timeMsFor`, `darkHzForPercent`) |
 | `reverb` | Freeverb (the published algorithm, matched to the behaviour the amps were voiced on) and the six-character amp room | `Freeverb`, `AmpReverb` |
+| `octave` | the bass amp's sub-octave: an OC-2-style tracker (band-limited comparator, per-polarity peak thresholds) and divider, −1 and −2, zero latency; the one-slider law | `Octaver`, `OctaveLaw.h` (`paramsForAmount`) |
 
 ## Mastering stages
 
