@@ -130,6 +130,39 @@ double peakDb (const std::vector<std::vector<double>>& x)
     for (const auto& c : x) for (double v : c) p = std::max (p, std::fabs (v));
     return 20.0 * std::log10 (std::max (p, 1e-12));
 }
+/** THE DOOR DEMO: one held A1, clean, and the slider in band pass going 0 -> 0.75 at 1.0 s and back to 0 at 3.5 s,
+    so the ladder's way in and out (its small pitch bend included) can be judged by ear on a sustained note. */
+std::vector<double> renderDoors (const std::vector<double>& note, double sr)
+{
+    ef::EnvelopeFilter f;
+    const int n = (int) note.size();
+    if (! f.prepare (sr, 64, 1)) return {};
+    ef::EnvelopeFilterParams menu;
+    menu.mode = ef::Mode::bandPass;
+    f.setParams (ef::paramsForAmount (0.0f, menu));
+    std::vector<float> io ((std::size_t) n);
+    for (int i = 0; i < n; ++i) io[(std::size_t) i] = (float) note[(std::size_t) i];
+    const int on = (int) (1.0 * sr) / 64 * 64, off = (int) (3.5 * sr) / 64 * 64;
+    for (int at = 0; at < n; at += 64)
+    {
+        if (at == on)  f.setParams (ef::paramsForAmount (0.75f, menu));
+        if (at == off) f.setParams (ef::paramsForAmount (0.0f, menu));
+        float* p[1] = { io.data() + at };
+        if (! f.process (p, 1, std::min (64, n - at))) return {};
+    }
+    return std::vector<double> (io.begin(), io.end());
+}
+
+std::vector<double> heldNote (double sr)
+{
+    std::vector<double> out ((std::size_t) (5.0 * sr), 0.0);
+    Rng rng;
+    pluck (out, sr, (int) (0.1 * sr), midiHz (33), 4.8, 0.7, false, rng);   // A1, 55 Hz, held
+    double peak = 0.0;
+    for (double v : out) peak = std::max (peak, std::fabs (v));
+    for (auto& v : out) v *= 0.4 / peak;
+    return out;
+}
 } // namespace
 
 int main (int argc, char** argv)
@@ -174,5 +207,16 @@ int main (int argc, char** argv)
             if (! felitronics::io::writeWav ((outDir / name).string(), out, in.sr, 24, false)) { std::fprintf (stderr, "cannot write %s\n", name.c_str()); return 1; }
             std::printf ("%-40s peak %6.2f dBFS\n", name.c_str(), peakDb (out));
         }
+    // The door demo, on its own held note.
+    {
+        const auto note = heldNote (48000.0);
+        const auto out  = renderDoors (note, 48000.0);
+        if (out.empty()) return 1;
+        if (! felitronics::io::writeWav ((outDir / "envfilter-dry-held-note.wav").string(), { note }, 48000.0, 24, false)
+            || ! felitronics::io::writeWav ((outDir / "envfilter-bandpass-doors.wav").string(), { out }, 48000.0, 24, false))
+            return 1;
+        std::printf ("%-40s peak %6.2f dBFS  (held A1; band pass, slider 0 -> 0.75 at 1.0 s -> 0 at 3.5 s)\n",
+                     "envfilter-bandpass-doors.wav", peakDb ({ out }));
+    }
     return 0;
 }
