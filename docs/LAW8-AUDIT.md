@@ -270,6 +270,24 @@ zero: no subnormal in any state at any block, and the silence holds; the heads s
 and `modules/reverb/tests/AmpReverbTests.cpp` (three minutes after a HALL at DECAY ×2: no subnormal in the room,
 the predelay or the chorus line, and once exact zero is reached it holds).
 
+### Added with the module: `envfilter::EnvelopeFilter` — gridded from the start
+
+**Recursive state.** The swept TPT state-variable filter's two integrators per channel
+(`envfilter::detail::SweptSvf`, `eq::Svf`'s update), the clean-lows split (`eq::DeterministicSvf`, a high pass),
+the envelope follower (`dynamics::EnvelopeFollower`, peak) and five glides: mix, sensitivity, keepLows, resonance
+(one-pole, double) and the cutoff smoother on log2(Hz). The mode crossfade is a counted linear door (clean, it
+lands by construction).
+**Verdict: flushed at the house 1e-15 on `core::StateGrid` (audio time), poison healed at the end of every call.**
+The follower, both filters' integrators and the split all decay geometrically toward zero on silence and would
+otherwise park in the subnormal band. The glides LAND (item 6): on their target once the update no longer moves
+them or once within 1e-9 × max(1, |target|) of it — the mix glides toward exactly zero when the slider goes to 0,
+and that landing is what puts the stage to sleep (~0.41 s at the 20 ms glide), so none of them can creep through
+the subnormals. A gap (law 11c) runs the same per-sample control step as silence and stops once the shared state
+stands still with the follower at exact zero.
+Tested in `modules/envfilter/tests/EnvelopeFilterTests.cpp` (a Q 12 band-pass ring, then 60 s of silence in
+512-sample calls and as ONE 61 s call: no subnormal in any state, exact zero from 1.5 s after the ring; and the
+fastest settings' 20 Hz Q 12 ring dies to exact zero). Removing the flush turns all of them red.
+
 ## How these are tested
 
 State tests, in the style of `modules/dynamics/tests/DynamicsTests.cpp:61` — after a long silence the

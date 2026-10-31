@@ -31,6 +31,7 @@ The guitar-amp modules — `nam` (the NeuralAmpModelerCore backend), `rigplayer`
 |---|---|---|
 | `delay` | tape-style echo: a gliding (repitching) head, a dark saturated loop, a stereo offset; the knob law (sync ladder, sync policy, DARK) | `TapeDelay`, `DelayLaw.h` (`divisionMs`, `timeMsFor`, `darkHzForPercent`) |
 | `reverb` | Freeverb (the published algorithm, matched to the behaviour the amps were voiced on) and the six-character amp room | `Freeverb`, `AmpReverb` |
+| `envfilter` | the bass envelope filter (auto-wah, the Mu-Tron family): a peak follower places a resonant TPT SVF (low/band pass, up/down) on a log sweep, redesigned every sample; the clean lows kept by an exact complement of the input; amount 0 sleeps (bit-exact dry); the one-slider law | `EnvelopeFilter`, `EnvelopeFilterLaw.h` (`paramsForAmount`) |
 
 ## Mastering stages
 
