@@ -12,6 +12,7 @@
 #include <array>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <vector>
 
@@ -32,8 +33,12 @@ namespace felitronics::chorus
 // ATTENUATED, NOT EXCLUDED. The voice's band falls at LR4's 24 dB/oct under the crossover: -6 dB at it,
 // -24.6 dB an octave below, -48 two octaves below. So the low end is kept out of the voice by that much, not
 // absolutely, and the crossover's floor is 100 Hz: there the low B and E fundamentals (30.9, 41.2 Hz) enter the
-// voice at least 31 dB down, and the Side energy an octave under the crossover stays under -30 dB of the dry's
-// at every menu extreme (measured in BassChorusTests, the swing's sidebands included).
+// voice at least 31 dB down. THE SIDE, (L - R)/2, of a tone at f is at most the voice's own level there —
+// |HP4(f)| = (f/fc)^4 / (1 + (f/fc)^4), as energy re the tone's — at any rate and centre: the two voices can at
+// worst be opposite, never louder than one. Measured with the swing's sidebands included (BassChorusTests): at
+// the default 200 Hz the open strings' fundamentals read -76 dB (low B) to -28 dB (G2); at the 100 Hz floor
+// -52 to -9 dB — the upper strings are partly voiced there, by choice of crossover; at the top, 1 kHz, a tone
+// at the band's upper edge (499 Hz) reads -28.8 dB against its bound of -24.7.
 //
 // THE VOICE. The high band is written into a line and read back by a head that swings around `delayMs` by
 // `depthMs` on a SINE: the swing is the chorus's pitch wobble, peak frequency ratio 1 ± 2π·rate·depth. Sine
@@ -71,11 +76,15 @@ namespace felitronics::chorus
 //     are one-poles: neither moves the head's speed by a step; the crossover's coefficients follow per sample.
 //     The swing is held 1 ms clear of the write head by a SMOOTH minimum (a 1 ms quadratic knee), so a centre
 //     gliding into or out of that limit bends the head instead of kinking its speed (a hard min was a ~118-cent
-//     step at an LFO crest). The centre's floor, 4 ms, is the law's full depth plus that 1 ms: the slider is
-//     never capped by it.
+//     step at an LFO crest). The centre's floor, 5 ms, is the law's full depth plus that 1 ms plus the knee's
+//     1 ms: the slider's swing never reaches the knee, so it is never trimmed (a 4 ms floor eased the full 3 ms
+//     to 2.75 — 328 cents where 362 were set at 10 Hz).
 //   · MIX is a COUNTED linear ramp of kMixRampSeconds that lands exactly — on 0, which is what idles the stage.
+//     The stage stops ON the landing sample: the rest of that call is the input's own, untouched, and only the
+//     law-8 grid is moved on through it (a long offline call no longer runs its voice for nothing to the end).
 //   · THE DOOR: each lane's voice INPUT opens linearly over kDoorSeconds after prepare(), reset(), a wake or the
-//     lane's own return, so the filters and the line start from a fade instead of from a step in mid-note.
+//     lane's own return, so the filters and the line start from a fade instead of from a step in mid-note. Open,
+//     it passes the plain sample: no gain of 1 within an ulp is ever applied.
 //   · Law 8: the filters' state is flushed on core::StateGrid (audio time, 64 samples); what is written into
 //     the line is flushed per sample (core::flushDenormal) and the glides land, so nothing parks in the
 //     subnormal band. The line is not recursive: there is no feedback to sustain one.
@@ -98,7 +107,7 @@ struct BassChorusParams
     float mix         = 0.5f;     ///< the voice's level: 0 = the dry alone (the stage idles), 1 = the dry's level
     float rateHz      = 0.7f;     ///< the LFO, Hz (0.05 … 10)
     float crossoverHz = 200.0f;   ///< below it the voice falls at 24 dB/oct, Hz (100 … 1000)
-    float delayMs     = 8.0f;     ///< the centre of the head, ms (4 … 25)
+    float delayMs     = 8.0f;     ///< the centre of the head, ms (5 … 25)
 };
 
 namespace detail
@@ -202,7 +211,7 @@ public:
     static constexpr double kMinSampleRate  = 8000.0, kMaxSampleRate = 768000.0;
     static constexpr float  kHeadroomMs     = 1.0f;    ///< the head is held this far clear of the write head
     static constexpr float  kCapKneeMs      = 1.0f;    ///< the width of the smooth minimum that holds it there
-    static constexpr float  kMinDelayMs     = 4.0f,  kMaxDelayMs     = 25.0f;   ///< floor = the law's full depth + headroom
+    static constexpr float  kMinDelayMs     = 5.0f,  kMaxDelayMs     = 25.0f;   ///< floor = the law's full depth + headroom + knee
     static constexpr float  kMaxDepthMs     = 10.0f;
     static constexpr float  kMinRateHz      = 0.05f, kMaxRateHz      = 10.0f;
     static constexpr float  kMinCrossoverHz = 100.0f, kMaxCrossoverHz = 1000.0f;
@@ -342,7 +351,16 @@ public:
         while (done < numSamples)
         {
             const int seg = grid_.segment (numSamples - done);
-            run (io, numChannels, done, seg);
+            const int ran = run (io, numChannels, done, seg);
+            if (ran < seg)
+            {
+                // The mix ramp landed on zero at sample done + ran: from there on this call is the input's own.
+                // Its audio time still passes for the grid; the voice is restarted when it wakes.
+                grid_.skip (numSamples - done);
+                hp_.healPoison();
+                idle_ = true;
+                return true;
+            }
             done += seg;
             if (grid_.advance (seg))
                 hp_.flushDenormals();      // law 8, on audio time
@@ -356,6 +374,10 @@ public:
 
         return true;
     }
+
+    /** How many samples the voice path has run since construction — the witness that an idle stage computes
+        nothing, for the tests. */
+    std::uint64_t voicedSamples() const noexcept { return voiced_; }
 
     /** True when the line or a glide holds a subnormal — the law-8 witness for the tests. (The Svf's integrators
         are the eq module's, under its own flush contract.) */
@@ -419,8 +441,9 @@ private:
         live_[(std::size_t) ch] = false;
     }
 
-    /** Samples [off, off + n) of the call, n within one grid segment. nch == 0 runs only the shared clocks. */
-    void run (float* const* io, int nch, int off, int n) noexcept
+    /** Samples [off, off + n) of the call, n within one grid segment. nch == 0 runs only the shared clocks.
+        Returns how many it ran: fewer than n when the mix ramp lands on zero (that sample is not voiced). */
+    int run (float* const* io, int nch, int off, int n) noexcept
     {
         constexpr double kFloatMax = (double) std::numeric_limits<float>::max();
         const int    mask   = mask_;
@@ -444,6 +467,12 @@ private:
             if (phase_ >= 1.0)
                 phase_ -= 1.0;
 
+            if (! mix_.moving() && ! (mix_.to > 0.0))
+            {
+                n = i - off;   // landed on zero: stop here
+                break;
+            }
+
             if (nch == 0)
                 continue;   // a gap: nothing to voice, the clocks only
 
@@ -462,8 +491,8 @@ private:
                 // The voice's input: LR4's high half of the sample, through the lane's door. A sample that is not
                 // a number is not voiced — the dry keeps it.
                 float v = std::isfinite (in) ? in : 0.0f;
-                if (door < doorLen_)
-                    v *= (float) ++door * doorStep_;
+                if (door < doorLen_ && ++door < doorLen_)
+                    v *= (float) door * doorStep_;   // open, the plain sample: never a gain of 1 within an ulp
                 float h = hp_.processSample (ch + lane2, hp_.processSample (ch, v));
                 if (! std::isfinite (h))
                     h = 0.0f;               // an overflowing filter writes silence; its state heals at the call's end
@@ -494,12 +523,16 @@ private:
             writePos_ = (writePos_ + 1) & mask;
         }
 
+        if (nch > 0)
+            voiced_ += (std::uint64_t) n;
+
         if (nch == 0)
         {
             writePos_ = (int) (((long long) writePos_ + n) & (long long) mask);
             if (xoverMoved)
                 applyCrossover();   // a gap moves the glide sample by sample; the coefficients follow once
         }
+        return n;
     }
 
     double fs_ = 48000.0;
@@ -529,6 +562,7 @@ private:
     std::array<bool, kMaxChannels> live_ { false, false };   // carried by a call since the last clear (law 11a)
     bool idle_  = true;
     bool dirty_ = false;   // the lines were written since they were last cleared
+    std::uint64_t voiced_ = 0;   // the odometer: samples the voice path has run
 };
 
 } // namespace felitronics::chorus

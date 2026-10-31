@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-core — see LICENSE.
 
-// chorus::BassChorus and its one-slider law. The effect: amount 0 is the dry bit for bit and computes nothing;
-// the voice's band is LR4's high half, so it and the band it leaves sum flat; the lows stay mono and in phase
-// with the dry; the measured pitch deviation is the set one; no knob clicks, the slider included. The stage
+// chorus::BassChorus and its one-slider law. The effect: amount 0 is the dry bit for bit and computes nothing,
+// from the very sample the mix lands; the voice's band is LR4's high half, so it and the band it leaves sum
+// flat; the lows stay centred — the Side a tone under the crossover makes is bounded by the voice's own LR4
+// attenuation there; the measured pitch deviation is the set one, the full depth on the lowest centre too; the
+// two voices in quadrature; no knob clicks, the slider included. The stage
 // contract: the law-11 properties at the module's own width ceiling, prepare binds and a refused one disarms,
 // law 8a re-slicing, reset is a restart, a stopped channel drops its voice (11a), a pause is silence (11c),
 // poison, law 8, no allocation. At 44.1, 48 and 96 kHz.
@@ -141,7 +143,7 @@ struct A_BassChorus
     static double blockObservable (T&) { return 0.0; }
     static bool prep (T& s)
     {
-        // A 2 ms centre at full mix, so the short fixtures hear the voice.
+        // The lowest centre (5 ms) at full mix, so the short fixtures hear the voice.
         s.setParams ({ 1.0f, 1.0f, 3.0f, 150.0f, 2.0f });
         return s.prepare (test::law11::kFs, test::law11::kMaxBlock, 2);
     }
@@ -202,8 +204,9 @@ void theLaw()
     const BassChorusParams wild { BassChorus::kMaxDepthMs, 1.0f, BassChorus::kMaxRateHz, 200.0f, BassChorus::kMaxDelayMs };
     approx (chorus::pitchDeviationCents (wild), 1713.0, 1.0, "10 Hz x 10 ms: 1713 cents flat, the larger of the two (+844 sharp)");
     const BassChorusParams capped { BassChorus::kMaxDepthMs, 1.0f, 1.0f, 200.0f, BassChorus::kMinDelayMs };
-    approx (chorus::pitchDeviationCents (capped), -1200.0 * std::log2 (1.0 - 2.0 * kPi * 1.0 * 0.003), 1e-3,
-            "depth 10 ms on the 4 ms centre: the swing as the stage holds it, 3 ms");
+    const double held = (double) (BassChorus::kMinDelayMs - BassChorus::kHeadroomMs) * 0.001;
+    approx (chorus::pitchDeviationCents (capped), -1200.0 * std::log2 (1.0 - 2.0 * kPi * 1.0 * held), 1e-3,
+            "depth 10 ms on the lowest centre: the swing as the stage holds it, the centre less the headroom");
 }
 
 //==============================================================================
@@ -362,7 +365,7 @@ void splitAndSumFlat()
 //==============================================================================
 void lowsMonoInPhase()
 {
-    group ("the lows stay mono and in phase with the dry: L == R below the crossover (stereo bus, amount 1)");
+    group ("the lows stay with the dry: two and three octaves under the crossover L ~ R ~ dry (stereo bus, amount 1)");
     for (double fs : kRates)
     {
         BassChorus s;
@@ -416,7 +419,7 @@ std::vector<double> deviation (const Buf& v, int start, double fs, double f0)
 
 void pitchDeviation()
 {
-    group ("the voice's pitch deviation is the set one, measured on a 1 kHz sine; the two voices in opposite phase");
+    group ("the voice's pitch deviation is the set one, measured on a 1 kHz sine; the two voices in quadrature");
     struct Case { double fs; float rate; float depth; };
     for (const Case c : { Case { 44100.0, 2.0f, 3.0f }, Case { 48000.0, 0.7f, 1.5f }, Case { 96000.0, 2.0f, 3.0f }, Case { 48000.0, 5.0f, 0.5f } })
     {
@@ -625,6 +628,9 @@ void resetAndStops()
     int pausesEqual = 0, pausesMoved = 0, cases = 0;
     for (int gap : pz::kGaps)
     {
+        // A one-sample pause would compare A with itself (B's silence would be empty): nothing to learn.
+        if (gap < 2)
+            continue;
         BassChorus A, B, C;
         for (auto* s : { &A, &B, &C })
         {
@@ -658,8 +664,7 @@ void resetAndStops()
         test::run (A.process (nullptr, 0, gap));
         Buf zl ((std::size_t) gap, 0.0f), zr = zl;
         float* zio[2] = { zl.data(), zr.data() };
-        if (gap > 1)
-            test::run (B.process (zio, 2, gap - 1));
+        test::run (B.process (zio, 2, gap - 1));
         test::run (B.process (nullptr, 0, 1));
         std::vector<Buf> outs;
         for (auto* s : { &A, &B, &C })
@@ -872,44 +877,146 @@ void tailBound()
         }
 }
 
+double lr4HighDb (double f, double fc)
+{
+    const double r4 = std::pow (f / fc, 4.0);
+    return 20.0 * std::log10 (r4 / (1.0 + r4));
+}
+
+/** Side = (L - R)/2, as energy re the dry's, over seconds 1 … 4 of a lone tone at `f` on both sides at amount 1:
+    every sideband the swing makes is in it, because nothing else is. */
+double sideDb (double fs, double f, float xover, float rate, float centre)
+{
+    BassChorus s;
+    BassChorusParams menu;
+    menu.crossoverHz = xover;
+    menu.rateHz = rate;
+    menu.delayMs = centre;
+    s.setParams (chorus::paramsForAmount (1.0f, menu));
+    test::run (s.prepare (fs, 512, 2));
+    const int N = (int) (4.0 * fs);
+    const Buf dry = tone (N, f, fs, 0.5f);
+    Buf l = dry, r = dry;
+    render (s, l, &r, 512);
+    double es = 0.0, ed = 0.0;
+    for (int i = (int) fs; i < N; ++i)
+    {
+        const double side = 0.5 * ((double) l[(std::size_t) i] - (double) r[(std::size_t) i]);
+        es += side * side;
+        ed += (double) dry[(std::size_t) i] * (double) dry[(std::size_t) i];
+    }
+    return 10.0 * std::log10 (std::max (es, 1e-300) / ed);
+}
+
 void lowBandSide()
 {
-    group ("the low band's Side energy, sidebands included, at the menu's extremes (amount 1): attenuated, not excluded");
+    group ("Side = (L - R)/2 of a tone under the crossover: at most the voice's own LR4 attenuation there, any setting");
     const double fs = 48000.0;
-    struct Case { float xover, rate, centre; };
-    for (const Case c : { Case { BassChorus::kMinCrossoverHz, BassChorus::kMaxRateHz, BassChorus::kMinDelayMs },
-                          Case { BassChorus::kMinCrossoverHz, BassChorus::kMinRateHz, BassChorus::kMaxDelayMs },
-                          Case { BassChorus::kMinCrossoverHz, 0.7f, 8.0f }, Case { 200.0f, BassChorus::kMaxRateHz, 8.0f } })
+    struct Set { float rate, centre; };
+    int cases = 0, held = 0;
+    double worstMargin = -1e9;
+    for (const float xover : { BassChorus::kMinCrossoverHz, 200.0f, BassChorus::kMaxCrossoverHz })
+        for (const Set m : { Set { BassChorus::kMaxRateHz, BassChorus::kMaxDelayMs }, Set { BassChorus::kMaxRateHz, BassChorus::kMinDelayMs },
+                             Set { BassChorus::kMinRateHz, BassChorus::kMaxDelayMs } })
+            for (const double f : { 0.499 * xover, 0.25 * xover })   // the band's upper edge, and an octave under it
+            {
+                const double got = sideDb (fs, f, xover, m.rate, m.centre), bound = lr4HighDb (f, xover);
+                ++cases;
+                held += got <= bound + 0.2 ? 1 : 0;
+                worstMargin = std::max (worstMargin, got - bound);
+            }
+    ok (held == cases, "Side <= the LR4 high half's level at the tone (+0.2 dB) in " + std::to_string (held) + "/" + std::to_string (cases)
+                       + " cases: crossover 100 / 200 / 1000 Hz, rate and centre at their extremes, tones at 0.499 and 0.25 of the crossover"
+                       + " (closest: " + num (worstMargin, 3) + " dB from the bound)");
+    const double edge = sideDb (fs, 499.0, BassChorus::kMaxCrossoverHz, BassChorus::kMaxRateHz, BassChorus::kMaxDelayMs);
+    ok (edge <= lr4HighDb (499.0, 1000.0) + 0.2, "the band's upper edge at the top crossover — 499 Hz under 1 kHz, 10 Hz, 25 ms: "
+                                                 + num (edge, 3) + " dB (bound " + num (lr4HighDb (499.0, 1000.0), 3) + ")");
+
+    // What the guarantee is FOR: the bass's open-string fundamentals, at the default crossover and at its floor.
+    for (const float xover : { 200.0f, BassChorus::kMinCrossoverHz })
+        for (const double f : { 30.87, 41.20, 55.00, 73.42, 98.00 })
+        {
+            const double got = sideDb (fs, f, xover, BassChorus::kMaxRateHz, BassChorus::kMaxDelayMs), bound = lr4HighDb (f, (double) xover);
+            ok (got <= bound + 0.2, "open string at " + num (f) + " Hz, crossover " + num (xover) + " Hz: Side " + num (got, 3)
+                                    + " dB re the dry (bound " + num (bound, 3) + ")");
+        }
+}
+
+void fullDepthAtFloor()
+{
+    group ("the centre's floor leaves the slider's full depth whole: 3 ms at amount 1 on the lowest centre");
+    BassChorusParams lo = chorus::paramsForAmount (1.0f), mid = lo;
+    lo.rateHz = mid.rateHz = BassChorus::kMaxRateHz;
+    lo.delayMs = BassChorus::kMinDelayMs;
+    mid.delayMs = 12.0f;
+    approx (chorus::pitchDeviationCents (lo), chorus::pitchDeviationCents (mid), 1e-3,
+            "the read-out at 10 Hz on the lowest centre is the one on a 12 ms centre (" + num (chorus::pitchDeviationCents (mid)) + " cents)");
+
+    const double fs = 48000.0, want = 2.0 * kPi * 2.0 * 0.003;
+    BassChorusParams p = chorus::paramsForAmount (1.0f);
+    p.rateHz = 2.0f;
+    p.delayMs = BassChorus::kMinDelayMs;
+    BassChorus s;
+    s.setParams (p);
+    test::run (s.prepare (fs, 512, 1));
+    const int N = (int) (1.4 * fs);
+    const Buf x = tone (N, 1000.0, fs, 0.5f);
+    Buf y = x;
+    render (s, y, nullptr, 512);
+    Buf v ((std::size_t) N);
+    for (std::size_t i = 0; i < v.size(); ++i)
+        v[i] = y[i] - x[i];
+    const auto d = deviation (v, (int) (0.3 * fs), fs, 1000.0);
+    const double peak = *std::max_element (d.begin(), d.end());
+    approx (peak, want, 0.02 * want, "measured on the stage at 2 Hz on the lowest centre: +" + num (100.0 * peak, 4) + " % (set "
+                                     + num (100.0 * want, 4) + " %, the full 3 ms)");
+}
+
+void nanAmountIgnored()
+{
+    group ("a non-finite amount changes nothing when the caller passes the stage's own params() as the menu");
+    BassChorus a, b;
+    for (auto* st : { &a, &b })
+    {
+        st->setParams (chorus::paramsForAmount (0.9f, st->params()));
+        test::run (st->prepare (48000.0, 512, 2));
+    }
+    a.setParams (chorus::paramsForAmount (std::numeric_limits<float>::quiet_NaN(), a.params()));
+    a.setParams (chorus::paramsForAmount (std::numeric_limits<float>::infinity(), a.params()));
+    const auto pa = a.params(), pb = b.params();
+    ok (core::sameBits (pa.depthMs, pb.depthMs) && core::sameBits (pa.mix, pb.mix) && core::sameBits (pa.rateHz, pb.rateHz)
+            && core::sameBits (pa.crossoverHz, pb.crossoverHz) && core::sameBits (pa.delayMs, pb.delayMs) && core::sameBits (pa.mix, 0.9f),
+        "after amount 0.9, NaN and +inf leave every knob where it was (mix " + num (pa.mix) + ", depth " + num (pa.depthMs) + " ms)");
+    Buf l1 = plus (tone (20000, 997.0, 48000.0, 0.5f), noise (20000, 51u, 0.1f)), r1 = noise (20000, 52u, 0.3f), l2 = l1, r2 = r1;
+    render (a, l1, &r1, 512);
+    render (b, l2, &r2, 512);
+    ok (bitsEqual (l1, l2) && bitsEqual (r1, r2), "...and the sound is the same bits as a stage never handed them");
+}
+
+void idleStopsAtTheLanding()
+{
+    group ("amount 0 in mid-call: the voice stops on the sample the mix ramp lands, the rest of the call is untouched");
+    for (double fs : kRates)
     {
         BassChorus s;
-        s.setParams ({ 3.0f, 1.0f, c.rate, c.xover, c.centre });
+        s.setParams (chorus::paramsForAmount (0.8f, s.params()));
         test::run (s.prepare (fs, 512, 2));
-        const int N = (int) (4.0 * fs);
-        const Buf dry = plus (plus (tone (N, 30.87, fs, 0.4f), tone (N, 41.2, fs, 0.4f, 1.0)), tone (N, 2000.0, fs, 0.2f, 2.0));
-        Buf l = dry, r = dry;
+        Buf l = tone ((int) (0.2 * fs), 997.0, fs, 0.5f), r = l;
         render (s, l, &r, 512);
-        // The protected band: an octave under the crossover, through LR4's low half — every sideband the swing
-        // puts there is counted, not only the carrier.
-        eq::DeterministicCrossover2 bs, bd;
-        bs.prepare (fs, 1);
-        bd.prepare (fs, 1);
-        bs.setFrequency (0.5f * c.xover);
-        bd.setFrequency (0.5f * c.xover);
-        double es = 0.0, ed = 0.0;
-        for (int i = 0; i < N; ++i)
-        {
-            float sl = 0.0f, sh = 0.0f, dl = 0.0f, dh = 0.0f;
-            bs.processSample (0, l[(std::size_t) i] - r[(std::size_t) i], sl, sh);
-            bd.processSample (0, dry[(std::size_t) i], dl, dh);
-            if (i >= (int) fs)
-            {
-                es += (double) sl * sl;
-                ed += (double) dl * dl;
-            }
-        }
-        const double db = 10.0 * std::log10 (es / ed);
-        ok (db <= -30.0, "Side under " + num (0.5 * c.xover) + " Hz (B0 + E1 in, crossover " + num (c.xover) + " Hz, " + num (c.rate)
-                         + " Hz, centre " + num (c.centre) + " ms): " + num (db, 3) + " dB re the dry's band (<= -30)");
+        const auto before = s.voicedSamples();
+        s.setParams (chorus::paramsForAmount (0.0f, s.params()));
+        const int N = (int) (10.0 * fs), ramp = (int) (BassChorus::kMixRampSeconds * fs + 0.5);
+        Buf x = plus (tone (N, 997.0, fs, 0.5f), noise (N, 61u, 0.1f)), y = noise (N, 62u, 0.3f);
+        const Buf x0 = x, y0 = y;
+        float* io[2] = { x.data(), y.data() };
+        test::run (s.process (io, 2, N));    // one call, ten seconds
+        const auto ran = s.voicedSamples() - before;
+        ok (ran < (std::uint64_t) ramp, "voiced " + std::to_string (ran) + " of " + std::to_string (N) + " samples (the ramp is "
+                                        + std::to_string (ramp) + "), " + khz (fs));
+        bool untouched = s.isIdle();
+        for (std::size_t i = (std::size_t) ramp; i < (std::size_t) N; ++i)
+            untouched = untouched && core::sameBits (x[i], x0[i]) && core::sameBits (y[i], y0[i]);
+        ok (untouched, "...idle, and every sample from the landing on is the input's own, " + khz (fs));
     }
 }
 
@@ -956,6 +1063,9 @@ int main()
     returningLane();
     tailBound();
     lowBandSide();
+    fullDepthAtFloor();
+    nanAmountIgnored();
+    idleStopsAtTheLanding();
     noAllocation();
     return felitronics::test::report();
 }

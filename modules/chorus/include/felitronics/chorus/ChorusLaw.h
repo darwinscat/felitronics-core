@@ -24,15 +24,18 @@ namespace felitronics::chorus
 // RATE then means the same thing at every slider position, and the wobble scales with it as a pedal's does
 // (faster is more pitch). The menu must not expose depth or mix; they are the slider's.
 //
-// A non-finite amount is IGNORED: `menu` comes back untouched, so an adapter that passes the stage's current
-// `params()` as the menu changes nothing. A finite one is clamped to 0 … 1.
+// A non-finite amount is IGNORED — on one condition the caller keeps: it passes the stage's CURRENT knobs,
+// `stage.params()`, as `menu`. Then `menu` comes back untouched and `setParams (paramsForAmount (NaN,
+// stage.params()))` changes nothing. A menu kept apart from the stage, or the default `{}`, would come back with
+// ITS depth and mix, which is not "ignored"; so the slider's call is always the one above. A finite amount is
+// clamped to 0 … 1.
 //==============================================================================
 
 inline constexpr float kDepthMsAtFull = 3.0f;   ///< the swing at amount 1: 23 cents peak at the 0.7 Hz default
 inline constexpr float kMixAtFull     = 1.0f;   ///< the voice at the dry's level at amount 1
 
-static_assert (kDepthMsAtFull + BassChorus::kHeadroomMs <= BassChorus::kMinDelayMs,
-               "the centre's floor must leave the slider's full depth uncapped");
+static_assert (kDepthMsAtFull + BassChorus::kHeadroomMs + BassChorus::kCapKneeMs <= BassChorus::kMinDelayMs,
+               "the centre's floor must keep the slider's full depth out of the smooth minimum's knee");
 
 /** The slider's law: `amount` sets `depthMs` and `mix`; every other field is `menu`'s. */
 inline BassChorusParams paramsForAmount (float amount, BassChorusParams menu = {}) noexcept
