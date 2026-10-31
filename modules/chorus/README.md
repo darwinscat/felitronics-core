@@ -33,12 +33,14 @@ BassChorus::tailSeconds();                       // 71 ms: the voice's tail at a
 - **Voice band:** LR4's high half — -6.02 dB at the crossover, -24.6 dB an octave below, -48 two octaves
   below. With the head held still, the voice plus LR4's low half of the same input sums flat to 4e-6 dB from
   20 Hz to 20 kHz. **The lows are attenuated in the voice, not excluded:** the crossover's floor is 100 Hz,
-  where the low B and E fundamentals enter the voice at least 31 dB down; the Side energy an octave under the
-  crossover, sidebands included, measures -37 dB to -60 dB re the dry's at the menu's extremes.
-- **The swing:** a sine LFO (0.05 … 10 Hz), depth 0 … 10 ms of head travel around a 4 … 25 ms centre. The
+  where the low B and E fundamentals enter the voice at least 31 dB down. The Side, `(L − R)/2`, of a tone at
+  `f` is at most the voice's own level there, `(f/fc)⁴ / (1 + (f/fc)⁴)` as energy re the tone's, at any rate
+  and centre (sidebands included, measured): the open strings' fundamentals read -76 dB (low B) to -28 dB (G2)
+  at the default 200 Hz crossover, -52 to -9 dB at the 100 Hz floor.
+- **The swing:** a sine LFO (0.05 … 10 Hz), depth 0 … 10 ms of head travel around a 5 … 25 ms centre. The
   head is held 1 ms clear of the write head by a smooth minimum (a 1 ms knee), so a centre gliding into that
-  limit bends the head instead of kinking its speed. The centre's 4 ms floor is the law's full depth plus that
-  1 ms: the slider is never capped by it. The frequency ratio swings by ±2π·rate·depth; the flat excursion is
+  limit bends the head instead of kinking its speed. The centre's 5 ms floor is the law's full depth plus that
+  1 ms plus the knee: the slider's full 3 ms is never trimmed. The frequency ratio swings by ±2π·rate·depth; the flat excursion is
   the larger in cents.
 - **Quadrature, not opposite phases:** opposite voices spread wider, but their mono sum is a standing comb that
   breathes like a flanger; quadrature voices still swing when a PA or a DI sums the pair. An adapter that wants
@@ -53,13 +55,15 @@ BassChorus::tailSeconds();                       // 71 ms: the voice's tail at a
 `paramsForAmount (amount, menu)` owns two fields, `depthMs = 3 · amount` and `mix = amount`: the wobble and
 the voice's level rise together, linearly. Rate, crossover and centre delay are the menu's and pass through
 untouched — a menu RATE then means the same at every slider position, and the wobble scales with it as a
-pedal's does. The menu must not expose depth or mix. A non-finite amount is ignored (`menu` comes back
-untouched, so passing the stage's `params()` changes nothing); a finite one is clamped to 0..1.
+pedal's does. The menu must not expose depth or mix. A non-finite amount is ignored on the condition the call
+keeps: the caller passes the stage's current `params()` as the menu, so `menu` comes back untouched and nothing
+changes (a menu kept apart, or the default, would bring its own depth and mix). A finite one is clamped to 0..1.
 `pitchDeviationCents (params)` is the face's read-out: a pure function, the flat excursion in cents (23.0 at
 amount 1 and 0.7 Hz).
 
-**Amount 0 is mix 0, and at mix 0 the stage idles:** once the counted 20 ms mix ramp has landed on an exact
-zero, `process` returns with the buffer untouched and computes nothing. **A wake is a restart** — lines,
+**Amount 0 is mix 0, and at mix 0 the stage idles:** the voice stops on the very sample the counted 20 ms mix
+ramp lands on an exact zero — the rest of that call is the input's own — and from then on `process` returns
+with the buffer untouched and computes nothing (`voicedSamples()` is the odometer that shows it). **A wake is a restart** — lines,
 filters, LFO, write clock and law-8 grid back at zero, every knob on its target — and the voice opens through
 its 10 ms door.
 
