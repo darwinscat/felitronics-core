@@ -55,7 +55,7 @@ f.shownCutoffHz();                               // relaxed atomic, any thread �
 | `direction` | up / down | up | |
 | `mode` | lowPass / bandPass | lowPass | |
 | `resonance` | Q 0.5 … 12 | 4 | |
-| `keepLows` / `keepLowsHz` | 0 … 1 / 30 … 300 Hz | 1 / 150 | the clean lows |
+| `keepLows` / `keepLowsHz` | 0 … 1 / 80 … 300 Hz | 1 / 150 | the clean lows (under 80 Hz is keepLows 0) |
 | `mix` | 0 … 1 | 1 | **law-owned** — 0 = dry, and the stage goes idle |
 
 Everything glides (20 ms, one-pole, and lands) except the follower's attack/release, which retune at once.
@@ -63,11 +63,19 @@ Everything glides (20 ms, one-pole, and lands) except the follower's attack/rele
 **The doors never cross phase families.** Bypass and the low pass are in phase with the input; the band pass is in
 phase with its LR4 allpass, which is −1 at the corner, so any crossfade between the two has a hole there (a tone
 at the corner fell 7.5 dB through a 10 ms door at mix 0.1). The low pass has its own 10 ms door from the input. The
-band pass is reached by a ladder: a 25 ms crossfade to the same signal through the LR4 pair's allpass parked four
-octaves above the corner (≈ +1 over the bass), a 200 ms sweep of that allpass down to the corner (an exponential
+band pass is reached by a ladder: a 25 ms crossfade to the same signal through the LR4 pair's allpass parked at
+0.45 fs (≈ +1 over the bass and its harmonics), a 200 ms sweep of that allpass down to the corner (an exponential
 approach: the level holds, the phase turns), and a 25 ms crossfade to the band pass, now in phase with it; down in
-reverse. Turning the phase is heard as a small pitch bend: at most ~48 cents on 82/150/300 Hz tones (the first
-ladder, 70 ms long, bent them ~350 cents — a "zip"). Shorter is quicker and bends more; the render tool's door demo
+reverse. (A ceiling a few octaves above the corner was tried: it saved ~2 cents and notched a tone at that ceiling
+by 40 dB on every engage.) Turning the phase is heard as a small pitch bend, and it depends on the corner — the
+worst over 41 Hz … 2.4 kHz tones, through a wake or a disengage, at 48 kHz:
+
+| corner | 80 Hz | 100 Hz | 150 Hz (default) | 200 Hz | 300 Hz |
+|---|---|---|---|---|---|
+| bend | 95 cents | 77 | 50 | 38 | 25 |
+
+(The first ladder, 70 ms long, bent tones ~350 cents — a "zip". Below 80 Hz the bend climbs to 155 cents at 50 Hz
+and 257 at 30 Hz, which is one reason the corner stops at 80.) Shorter is quicker and bends more; the render tool's door demo
 lets the owner judge (WAVs for 70, 190, 250 and 400 ms were rendered). The door machine is a pure function, swept
 exhaustively by the tests: from every state toward every target it comes to rest where the target asks. Through a wake, a disengage and
 either mode change, a tone at or above the corner stays within 0.92 dB of the lower settled level (Q 4/12, mix
