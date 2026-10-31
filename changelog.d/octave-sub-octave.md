@@ -10,10 +10,11 @@
   (`latencySamples() == 0`, no dry level).
 
 The note's life is measured in its own periods.
-- Edges count only with the gate open, and a note is acquired only above the gate's opening level, so hum under the
-  gate proves nothing.
-- A lost note comes back after two rises and two falls, so no one-cycle click — sharp or smooth, any phase — makes a
-  sub.
+- Edges count only with the gate open.
+- A lost note comes back after two rises and two falls, each fresh twice over: the band's peak over the last period
+  stands at the gate's opening level, and the raw input itself has just swung that way. So hum under the gate proves
+  nothing, a note whose follower ripples across the gate still acquires, and no one-cycle click — any bass pitch,
+  phase, polarity or ramp — makes a sub.
 - Deadlines come only from a period confirmed by two agreeing intervals. An edge a quarter period late fades the sub
   out over 4 ms, after the filters, to an exact zero; two periods without one lose the note.
 - On reopening, the voices start primed at the new note's level.
@@ -40,5 +41,7 @@ Measured (`OctaverTests`, gcc 14 / MSVC / wasm):
 - **Weak fundamental:** tracks while the fundamental is no more than 11 dB (low B) … 21 dB (G2) under the 2nd
   harmonic in its worst phase.
 - **Muted note:** the sub is an exact zero 5/4 of a period + 4 ms after the note's last edge.
-- **Hum:** with 60 Hz hum at −80 / −65 dBFS, low B and E lock on their own edges and the hum alone passes bit-exact.
+- **Hum:** with 60 Hz hum at −80 / −65 dBFS, low B and E lock on their own edges and the hum alone passes bit-exact;
+  a loud G2 stopping dead over −58 dBFS hum leaves no sub 100 ms on.
+- **Near the gate:** a sustained low B whose follower ripples 0.84 … 1.28× the opening level is acquired within 90 ms.
 - **Retune:** TONE and SUB HP move at most 0.5 % per sample over their whole range.
