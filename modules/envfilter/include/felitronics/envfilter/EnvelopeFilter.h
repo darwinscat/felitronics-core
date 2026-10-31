@@ -63,19 +63,20 @@ namespace felitronics::envfilter
 // referenced to x; the band pass is referenced to the LR4 allpass, which is −1 at the corner. A crossfade between
 // the two families has a hole there — at mix 0.1 a tone at the corner fell 7.5 dB through a 10 ms door. So no door
 // ever crosses families. The x family has one door: the LOW-PASS DOOR (x ↔ the low pass, kDoorSeconds). The band
-// pass is reached by a LADDER of three counted stages, each phase-continuous: (1) a kDoorSeconds crossfade from
-// the x-family signal to the same signal through the LR4 pair's own allpass parked at the CEILING (0.45 fs, where
-// it is ≈ +1 over the bass); (2) that allpass's corner sweeps down to the clean-lows corner over
-// kCornerSweepSeconds (eased, on log2 Hz) — a pure allpass, so the level holds while the phase turns; (3) a
-// kDoorSeconds crossfade from it to the band pass, which now shares its phase. Down is the same in reverse. The
+// pass is reached by a LADDER of three counted stages, each phase-continuous: (1) a kRungSeconds crossfade from
+// the x-family signal to the same signal through the LR4 pair's own allpass parked at the CEILING (kLadderOctaves
+// above the corner, where it is ≈ +1 over the protected bass); (2) that allpass's corner sweeps down to the
+// clean-lows corner over kCornerSweepSeconds (an exponential approach on log2 Hz) — a pure allpass, so the level
+// holds while the phase turns, which is heard as a small pitch bend (≤ ~48 cents, see kCornerSweepSeconds); (3) a
+// kRungSeconds crossfade from it to the band pass, which now shares its phase. Down is the same in reverse. The
 // low-pass door stays open until the band pass is fully in, and the ladder comes down only once it is open again,
 // so a mode change never passes through dry. Measured over tones at and above the corner, cutoff at it and 10×
 // above, Q 4 and 12, mix 0.1 and 1, both modes: the weakest whole cycle through a wake, a disengage and either
 // mode change sits within 0.92 dB of the lower settled level. What remains is the two taps' own difference: at
-// the cutoff they are 90° apart, so the 10 ms crossing dips a tone there by 3.1 dB (pinned).
+// the cutoff they are 90° apart, so the crossing (a rung) dips a tone there by ~3 dB (pinned).
 //
 // AMOUNT 0 IS NOT THERE. When `mix` is set to 0 the doors close — the low-pass door, or the ladder down
-// (2·kDoorSeconds + kCornerSweepSeconds), all counted, landing exactly — and from the sample the last one lands
+// (2·kRungSeconds + kCornerSweepSeconds = 250 ms), all counted, landing exactly — and from the sample the last one lands
 // the stage is IDLE: process() returns with the buffer untouched (bit-exact dry, NaN payloads included) and
 // computes nothing. A wake is a RESTART: every state from silence, the grid re-anchored, the glides on their
 // targets, the doors opening from dry and the mix gliding in from 0 (the filters starting from silence on a
@@ -211,6 +212,38 @@ namespace detail
                     clear (c);
         }
     };
+    /** One step of a counted door toward `to`; returns whether it moved. */
+    inline bool stepToward (int& pos, int to) noexcept
+    {
+        if (pos == to)
+            return false;
+        pos += pos < to ? 1 : -1;
+        return true;
+    }
+
+    /** THE DOOR MACHINE, one sample (see THE DOORS in the stage's header). `lp` is the low-pass door (0 … door),
+        `lad` the band pass's ladder (0 … 2·rung + sweep: rung 1, the sweep, rung 2). The ladder climbs whenever the
+        band pass is wanted. It comes down once the low-pass door stands where it is going — or at once from
+        STRICTLY INSIDE rung 2, where the low-pass door is frozen and waiting for it would wait for ever (a mode
+        change to low pass, or the slider to 0, in the band pass's last rung froze both doors in a partial blend
+        that never idled); rung 2 crosses within one phase family whatever the low-pass door holds. At the TOP it
+        still waits: the low-pass door can move there, and opening it first is what keeps band pass -> low pass
+        from passing through dry. The low-pass door stays open until the band pass is fully in, and moves only
+        while the band pass is out of the picture (below rung 2) or wholly in it. Pure, so the tests sweep EVERY
+        state against every target: none is stuck. */
+    inline void stepDoors (int& lp, int& lad, int door, int rung, int sweep, bool engaged, bool lowPass,
+                           bool& lpMoved, bool& ladMoved) noexcept
+    {
+        const int top   = 2 * rung + sweep;
+        const int lpTo  = engaged && (lowPass || (lp == door && lad < top)) ? door : 0;
+        const int ladTo = engaged && ! lowPass ? top : 0;
+        ladMoved = false;
+        lpMoved  = false;
+        if (ladTo > lad || lp == lpTo || (lad > rung + sweep && lad < top))
+            ladMoved = stepToward (lad, ladTo);
+        if (lad <= rung + sweep || lad == top)
+            lpMoved = stepToward (lp, lpTo);
+    }
 } // namespace detail
 
 class EnvelopeFilter
@@ -235,11 +268,22 @@ public:
         ~0.9 dB between the 82 Hz peaks of |x|, and this pole is down 7.2 dB there. */
     static constexpr double kSmoothSeconds = 0.004;
     static constexpr double kGlideSeconds  = 0.020;   ///< the hand's glides (one-pole time constant)
-    static constexpr double kDoorSeconds   = 0.010;   ///< every counted door's travel (linear, lands exactly)
-    /** The band pass's LADDER (see THE DOORS above): the allpass's corner travels from the ceiling (0.45 fs) to the
-        clean-lows corner, eased, on log2 Hz. Long enough that a tone at the corner, whose phase the travel turns by
-        half a cycle, bends by a few Hz rather than tens. */
-    static constexpr double kCornerSweepSeconds = 0.050;
+    static constexpr double kDoorSeconds   = 0.010;   ///< the low-pass door's travel (linear, counted, lands exactly)
+    /** The band pass's LADDER (see THE DOORS above). Its allpass turns a bass tone's phase by up to ~320° (−96° at
+        82 Hz, −180° at the 150 Hz corner, −319° at 600 Hz), and turning it is a PITCH BEND: Δf = turn rate / 2π.
+        The first ladder (0.45 fs ceiling, a 50 ms smoothstep sweep, 10 ms rungs) bent 82/150/300 Hz tones by
+        309/339/292 cents. What sets the bend is the time the turn is spread over and how evenly: the ceiling sits
+        kLadderOctaves above the corner (so the sweep spends its time where bass phases turn, not in the treble),
+        the corner APPROACHES its target exponentially (shape kSweepShape: the rate falls with the distance left,
+        so the tones nearest the corner, which turn most, see the slowest travel), and the rungs are long enough
+        that the ceiling allpass's own small phase (≈ 2√2·f/ceiling) does not bend on the first rung. Measured
+        (EnvelopeFilterTests, 44.1/48/96 kHz): at most ~48 cents on a wake or a disengage, for 250 ms of ladder;
+        a click on the first rung loses 0.3–0.7 dB. Longer halves it again, at the cost of a slower band pass — the
+        owner's call by ear (the render tool's door demo). */
+    static constexpr double kCornerSweepSeconds = 0.200;
+    static constexpr double kRungSeconds        = 0.025;  ///< the ladder's first and last crossfades
+    static constexpr double kLadderOctaves      = 4.0;    ///< the ladder's ceiling above the corner (capped at 0.45 fs)
+    static constexpr double kSweepShape         = 4.0;    ///< the exponential approach's rate (e-folds over the sweep)
 
     /** Never above this share of the rate, whatever the range says: the prewarp's tan() runs away at Nyquist. */
     static constexpr double kMaxCutoffShare = 0.45;
@@ -275,8 +319,9 @@ public:
         glideC_  = 1.0 - detail::detExp (-1.0 / (kGlideSeconds * fs_));
         smoothC_ = 1.0 - detail::detExp (-1.0 / (kSmoothSeconds * fs_));
         doorLen_ = std::max (1, (int) (kDoorSeconds * fs_ + 0.5));
+        rungLen_ = std::max (1, (int) (kRungSeconds * fs_ + 0.5));
         sweepLen_ = std::max (1, (int) (kCornerSweepSeconds * fs_ + 0.5));
-        kfCeil_  = core::det::log2 (kMaxCutoffShare * fs_);
+        kfMax_   = core::det::log2 (kMaxCutoffShare * fs_);
         apSvf_.prepare (fs_, maxCh_);
         fMax_    = kMaxCutoffShare * fs_;
 
@@ -495,6 +540,14 @@ public:
     double currentMix() const noexcept { return mix_; }
     double currentResonance() const noexcept { return q_; }
 
+    /** The doors, in samples — the tests read them to see every edit settle. Audio thread only. The low-pass door
+        runs 0 … doorLength(), the band pass's ladder 0 … ladderLength(); steady: bypass idle, low pass
+        (doorLength, 0), band pass (0, ladderLength). */
+    int lowPassDoor()  const noexcept { return lpPos_; }
+    int ladder()       const noexcept { return ladPos_; }
+    int doorLength()   const noexcept { return doorLen_; }
+    int ladderLength() const noexcept { return 2 * rungLen_ + sweepLen_; }
+
     /** True when every swept-filter lane holds a finite state — the poison witness for the tests. */
     bool filterStateIsFinite() const noexcept
     {
@@ -586,17 +639,25 @@ private:
         its sweep, at the clean-lows corner above it, eased (smoothstep, on log2 Hz) in between. */
     void designAllpass() noexcept
     {
-        const int    into = std::min (std::max (ladPos_ - doorLen_, 0), sweepLen_);
+        const int    into = std::min (std::max (ladPos_ - rungLen_, 0), sweepLen_);
         const double c = (double) into / (double) sweepLen_;
-        const double e = c * c * (3.0 - 2.0 * c);
-        apSvf_.setParams (eq::FilterType::AllPass, core::det::exp2 (kfCeil_ + e * (kf_ - kfCeil_)), kApQ, 0.0);
+        const double e = ease (c);
+        const double span = std::min (kLadderOctaves, std::max (kfMax_ - kf_, 0.0));   // the ceiling, above the corner
+        apSvf_.setParams (eq::FilterType::AllPass, core::det::exp2 (kf_ + (1.0 - e) * span), kApQ, 0.0);
+    }
+
+    /** The sweep's shape, 0 -> 1: an exponential approach, normalised to land on 1 — fast while the corner is far
+        from its target, slow as it arrives. Per sample only while the ladder sweeps. */
+    static double ease (double c) noexcept
+    {
+        return (1.0 - detail::detExp (-kSweepShape * c)) / (1.0 - detail::detExp (-kSweepShape));
     }
 
     void refreshDoors() noexcept
     {
         lp_   = (double) lpPos_ / (double) doorLen_;
-        g_    = (double) std::min (ladPos_, doorLen_) / (double) doorLen_;
-        beta_ = (double) std::max (ladPos_ - doorLen_ - sweepLen_, 0) / (double) doorLen_;
+        g_    = (double) std::min (ladPos_, rungLen_) / (double) rungLen_;
+        beta_ = (double) std::max (ladPos_ - rungLen_ - sweepLen_, 0) / (double) rungLen_;
     }
 
     void refreshQ() noexcept
@@ -625,19 +686,9 @@ private:
         if (kfMoved)
             designSplits();
 
-        // THE DOORS (see the header). The ladder climbs whenever the band pass is wanted and comes down only once
-        // the low-pass door stands where it is going; the low-pass door stays open until the band pass is fully
-        // in, and moves only while the band pass is out of the picture or wholly in it.
         const bool engaged = mixTgt_ > 0.0;
-        const int  top     = 2 * doorLen_ + sweepLen_;
-        const int  lpTo    = engaged && (lowPass_ || (lpPos_ == doorLen_ && ladPos_ < top)) ? doorLen_ : 0;
-        const int  ladTo   = engaged && ! lowPass_ ? top : 0;
-        bool ladMoved = false;
-        if (ladTo > ladPos_ || lpPos_ == lpTo)
-            ladMoved = step (ladPos_, ladTo);
-        bool lpMoved = false;
-        if (ladPos_ <= doorLen_ + sweepLen_ || ladPos_ == top)
-            lpMoved = step (lpPos_, lpTo);
+        bool lpMoved = false, ladMoved = false;
+        detail::stepDoors (lpPos_, ladPos_, doorLen_, rungLen_, sweepLen_, engaged, lowPass_, lpMoved, ladMoved);
         if (ladMoved || lpMoved)
             refreshDoors();
         if (ladMoved || kfMoved)
@@ -725,7 +776,7 @@ private:
         refreshFloor();
         idle_   = ! (mixTgt_ > 0.0);
         lpPos_  = ! idle_ && lowPass_ ? doorLen_ : 0;
-        ladPos_ = ! idle_ && ! lowPass_ ? 2 * doorLen_ + sweepLen_ : 0;
+        ladPos_ = ! idle_ && ! lowPass_ ? 2 * rungLen_ + sweepLen_ : 0;
         refreshDoors();
         designSplits();
         designAllpass();
@@ -785,9 +836,9 @@ private:
     double k_ = 0.25, comp_ = 0.5;
     double lf_ = 0.0, cutoff_ = 150.0;
     float  envFloor_ = 0.0f;
-    int    lpPos_ = 1, ladPos_ = 0, doorLen_ = 1, sweepLen_ = 1;   // the doors, counted
+    int    lpPos_ = 1, ladPos_ = 0, doorLen_ = 1, rungLen_ = 1, sweepLen_ = 1;   // the doors, counted
     double lp_ = 1.0, g_ = 0.0, beta_ = 0.0;                        // ...as weights
-    double kfCeil_ = 14.4;   // log2 of the ladder allpass's ceiling, 0.45 fs (set by prepare)
+    double kfMax_ = 14.4;   // log2 of 0.45 fs, the ladder allpass's highest ceiling (set by prepare)
 
     double fs_ = 48000.0, fMax_ = 21600.0;
     double glideC_ = 1.0, smoothC_ = 1.0;

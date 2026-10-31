@@ -21,7 +21,7 @@ smoother; the hand's edits (direction, range, sensitivity) glide over 20 ms firs
 sweep, not a hit. The filter is redesigned every sample, so it never steps.
 
 The filter is a Cytomic TPT state-variable filter (`eq::Svf`'s equations), low-pass or band-pass, a mode change
-crossfading the two over 10 ms. Both are scaled by 1/√max(1, Q): at the cutoff they are equal at every Q and the
+crossing between them by the doors below. Both are scaled by 1/√max(1, Q): at the cutoff they are equal at every Q and the
 peak grows as √Q; the price is the low pass's passband, **−6.0 dB at Q 4 and −10.8 dB at Q 12** (pinned by the
 tests). KEEP LOWS (0..1) takes the band under `keepLowsHz` out of the filter and adds it back clean, so the note
 keeps its weight — and each mode has the split that cannot cancel it:
@@ -63,14 +63,18 @@ Everything glides (20 ms, one-pole, and lands) except the follower's attack/rele
 **The doors never cross phase families.** Bypass and the low pass are in phase with the input; the band pass is in
 phase with its LR4 allpass, which is −1 at the corner, so any crossfade between the two has a hole there (a tone
 at the corner fell 7.5 dB through a 10 ms door at mix 0.1). The low pass has its own 10 ms door from the input. The
-band pass is reached by a ladder: a 10 ms crossfade to the same signal through the LR4 pair's allpass parked at
-0.45 fs (≈ +1 over the bass), a 50 ms sweep of that allpass down to the corner (the level holds, the phase turns),
-and a 10 ms crossfade to the band pass, now in phase with it; down in reverse. Through a wake, a disengage and
+band pass is reached by a ladder: a 25 ms crossfade to the same signal through the LR4 pair's allpass parked four
+octaves above the corner (≈ +1 over the bass), a 200 ms sweep of that allpass down to the corner (an exponential
+approach: the level holds, the phase turns), and a 25 ms crossfade to the band pass, now in phase with it; down in
+reverse. Turning the phase is heard as a small pitch bend: at most ~48 cents on 82/150/300 Hz tones (the first
+ladder, 70 ms long, bent them ~350 cents — a "zip"). Shorter is quicker and bends more; the render tool's door demo
+lets the owner judge (WAVs for 70, 190, 250 and 400 ms were rendered). The door machine is a pure function, swept
+exhaustively by the tests: from every state toward every target it comes to rest where the target asks. Through a wake, a disengage and
 either mode change, a tone at or above the corner stays within 0.92 dB of the lower settled level (Q 4/12, mix
 0.1/1, cutoff at the corner and 10× above). What remains is the taps' own difference: at the cutoff the low pass
-and the band pass are 90° apart, so a mode change dips a tone there by 3.1 dB for the 10 ms crossing.
+and the band pass are 90° apart, so a mode change dips a tone there by ~3 dB for the 25 ms crossing.
 
-**Amount 0 is not there.** Setting `mix` to 0 closes the doors — 10 ms in low pass, the 70 ms ladder in band
+**Amount 0 is not there.** Setting `mix` to 0 closes the doors — 10 ms in low pass, the 250 ms ladder in band
 pass, all counted, landing exactly; from then on the stage is idle (`isIdle()`): it returns the buffer untouched —
 bit-exact, NaN payloads included — and computes nothing. A wake is a restart: every state from silence, the doors
 opening from dry, the mix gliding in.
@@ -78,7 +82,7 @@ opening from dry, the mix gliding in.
 Cost, measured on deb (gcc 14, i9-13900H) with the sweep moving and every glide at rest: 1.04 % of real time at
 48 kHz stereo — most of it the per-sample sweep's `core::det` log2/exp2/tan (the same bits on every row; 0.58 %
 with the system's three). Not a worst case: both modes' filters and splits always run, and while the corner glides
-(~0.4 s after an edit) or the ladder sweeps (50 ms) the splits or the allpass are redesigned every sample.
+(~0.4 s after an edit) or the ladder sweeps (200 ms) the splits or the allpass are redesigned every sample.
 
 ## `EnvelopeFilterLaw.h` — the one slider
 
@@ -98,9 +102,12 @@ tone (two burst levels, both directions, 44.1/48/96 kHz: 12 dB more moves it 1.7
 probe's gain matches the published cutoff's response within 0.01 dB) and follows an external key; the kernel at
 Q 12 with the cutoff flipping between 20 Hz and 0.45 fs every sample stays finite; a full-scale slap at the
 fastest settings peaks at −1.9 dBFS; no zipper (−150 dB above 6 kHz); the clean lows over 360 cases of cutoff ×
-Q × corner × mix × tone; the passband and mode levels. The stage: the law-11 properties, amount 0, slider and menu
-moves without a step, the hand's edits as sweeps (≥ 30 ms), re-slicing, 11a/11c (keyed too), reset, poison (an
-overflow healed at the end of its call), law 8, the 0.45 fs cap, allocation.
+Q × corner × mix × tone; the passband and mode levels; the doors (a tone at and above the corner within 2 dB of its
+settled level through every wake, disengage and mode change; the ladder's bend ≤ 55 cents at three rates; the door
+machine from every state toward every target). The stage: the law-11 properties, amount 0, slider and menu moves
+without a step, the hand's edits as sweeps (≥ 30 ms), re-slicing, 11a/11c (keyed too), reset, poison (an overflow
+healed at the end of its call), law 8, the 0.45 fs cap, allocation.
 
 `tools/EnvelopeFilterRender.cpp` (`felitronics_envfilter_render <outDir> [inDir]`) renders a bass DI —
-every `*.wav` in `inDir`, or a synthesised plucked-string line — at several slider positions to 24-bit WAVs.
+every `*.wav` in `inDir`, or a synthesised plucked-string line — at several slider positions to 24-bit WAVs, and
+the door demo: a held A1 with the slider going 0 → 0.75 → 0 in band pass.

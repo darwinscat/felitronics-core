@@ -243,7 +243,7 @@ void dryAtZero()
         for (int i = 0; i < n; ++i)
             if (! core::sameBits (io[0][(std::size_t) i], in[0][(std::size_t) i])) lastDiff = i;
         const double landMs = 1000.0 * (lastDiff - at) / fs;
-        const double ladderMs = 1000.0 * (2.0 * Stage::kDoorSeconds + Stage::kCornerSweepSeconds);
+        const double ladderMs = 1000.0 * (2.0 * Stage::kRungSeconds + Stage::kCornerSweepSeconds);
         okv (all && s.isIdle() && lastDiff > at && landMs <= ladderMs,
             "band pass, after a move to 0 the counted doors land and the stage idles: dry bit for bit " + fmt (landMs, 2)
             + " ms after the move (the ladder down: " + fmt (ladderMs, 0) + " ms) — " + fmt (fs, 0) + " Hz");
@@ -814,9 +814,9 @@ void levels()
         fixedCutoff (p, 1000.0f);
         p.keepLows = 0.0f; p.mix = 1.0f;
         s.setParams (p);
-        const int n = (int) (0.6 * fs), t = (int) (0.3 * fs) / 64 * 64;
+        const int n = (int) (0.8 * fs), t = (int) (0.3 * fs) / 64 * 64;
         std::vector<float> y ((std::size_t) n, 0.0f);
-        addBurst (y, fs, 0.0, 0.6, 0.01, 1000.0, 0.25);
+        addBurst (y, fs, 0.0, 0.8, 0.01, 1000.0, 0.25);
         for (int i = 0; i < n; i += 64)
         {
             if (i == t) { p.mode = ef::Mode::bandPass; s.setParams (p); }
@@ -824,9 +824,9 @@ void levels()
             run (s.process (qq, 1, std::min (64, n - i)));
         }
         const double settled = std::min (cycleDb (y, t - 480, 48), cycleDb (y, n - 960, 48));
-        const double dip = weakestCycleDb (y, t, t + (int) (0.15 * fs), 48) - settled;
+        const double dip = weakestCycleDb (y, t, t + (int) (0.35 * fs), 48) - settled;
         okv (dip >= -3.5 && dip <= -2.5, "Q " + fmt (q, 1) + ": through the mode change the tone at the cutoff dips " + fmt (dip)
-                                         + " dB (pinned -3 +- 0.5: the two taps are 90 degrees apart there, crossed over 10 ms)");
+                                         + " dB (pinned -3 +- 0.5: the two taps are 90 degrees apart there, crossed over a rung)");
     }
 }
 
@@ -903,6 +903,188 @@ void doorsKeepTheLevel()
     okv (disengage.margin >= -2.0, "disengage (-> amount 0): " + fmt (disengage.margin) + " dB (" + disengage.where + ")");
     okv (modeIn.margin >= -2.0, "mode door low pass -> band pass: " + fmt (modeIn.margin) + " dB (" + modeIn.where + ")");
     okv (modeOut.margin >= -2.0, "mode door band pass -> low pass: " + fmt (modeOut.margin) + " dB (" + modeOut.where + ")");
+}
+
+//==============================================================================
+// THE DOORS NEVER STICK. The two scenarios the review found — a mode change to low pass inside the band pass's last
+// 10 ms (A), and the slider to 0 inside an LP -> BP climb's last 10 ms (B) — and then the machine EXHAUSTIVELY:
+// from every steady (engaged, mode), every edit to another, at every position of that transition, every second
+// edit must settle to the asked mode's steady door positions.
+void doorsNeverStick()
+{
+    group ("the doors never stick: every edit at every door position settles");
+    const double fs = 48000.0;
+    const int stage3 = (int) ((Stage::kRungSeconds + Stage::kCornerSweepSeconds + 0.005) * fs);   // 5 ms into stage 3
+    {
+        // (A) bypass -> band pass, then low pass 5 ms into stage 3: after 100 ms the output IS a stage that went
+        // straight to low pass at the same instant.
+        Params p = ef::paramsForAmount (0.0f, voice (ef::Mode::bandPass, ef::Direction::up, 6.0f));
+        Stage a, b;
+        for (Stage* s : { &a, &b }) { run (s->prepare (fs, 64, 1)); s->setParams (p); }
+        const int n = (int) (1.0 * fs), t0 = 4800, t1 = t0 + stage3 / 16 * 16;
+        std::vector<float> ya ((std::size_t) n, 0.0f);
+        addBurst (ya, fs, 0.0, 1.0, 0.01, 98.0, 0.4);
+        std::vector<float> yb = ya;
+        for (int i = 0; i < n; i += 16)
+        {
+            if (i == t0)
+            {
+                Params on = ef::paramsForAmount (0.8f, voice (ef::Mode::bandPass, ef::Direction::up, 6.0f));
+                a.setParams (on);
+                on.mode = ef::Mode::lowPass; b.setParams (on);
+            }
+            if (i == t1) { Params lp = ef::paramsForAmount (0.8f, voice (ef::Mode::lowPass, ef::Direction::up, 6.0f)); a.setParams (lp); }
+            float* qa[1] = { ya.data() + i }; float* qb[1] = { yb.data() + i };
+            run (a.process (qa, 1, std::min (16, n - i))); run (b.process (qb, 1, std::min (16, n - i)));
+        }
+        const int from = t1 + a.ladderLength() + a.doorLength() + 480;   // the whole way down, plus 10 ms
+        ok (std::memcmp (ya.data() + from, yb.data() + from, (std::size_t) (n - from) * 4) == 0,
+            "(A) low pass asked 5 ms into the band pass's last rung: once the ladder is down the output is the always-low-pass "
+            "stage's, bit for bit");
+    }
+    {
+        // (B) low pass -> band pass, then the slider to 0 5 ms into stage 3: idle within 80 ms.
+        Stage s;
+        run (s.prepare (fs, 16, 1));
+        s.setParams (ef::paramsForAmount (0.8f, voice (ef::Mode::lowPass, ef::Direction::up, 6.0f)));
+        std::vector<float> z (16, 0.0f);
+        float* q[1] = { z.data() };
+        run (s.process (q, 1, 16));
+        s.setParams (ef::paramsForAmount (0.8f, voice (ef::Mode::bandPass, ef::Direction::up, 6.0f)));
+        for (int i = 0; i < stage3; i += 16) run (s.process (q, 1, 16));
+        s.setParams (ef::paramsForAmount (0.0f, voice (ef::Mode::bandPass, ef::Direction::up, 6.0f)));
+        int idleAt = -1;
+        for (int i = 0; i < (int) (0.3 * fs) && idleAt < 0; i += 16)
+        {
+            std::fill (z.begin(), z.end(), 0.0f);
+            run (s.process (q, 1, 16));
+            if (s.isIdle()) idleAt = i + 16;
+        }
+        const int bound = s.ladderLength() + s.doorLength() + 16;
+        okv (idleAt > 0 && idleAt <= bound, "(B) the slider to 0 5 ms into an LP -> BP climb's last rung: idle after "
+                                            + fmt (1000.0 * idleAt / fs, 1) + " ms (the ladder and the door: " + fmt (1000.0 * bound / fs, 0) + ")");
+    }
+
+    // EXHAUSTIVE: the door machine itself (detail::stepDoors, the one the stage runs), at several small lengths, from
+    // EVERY state — every low-pass door position against every ladder position, reachable or not — toward every
+    // (engaged, mode): it must come to rest, and where the target asks.
+    {
+        int states = 0, settled = 0;
+        std::string firstBad;
+        for (int door : { 1, 2, 3, 5 })
+            for (int rung : { 1, 2, 4 })
+                for (int sweep : { 1, 3, 6 })
+                {
+                    const int top = 2 * rung + sweep;
+                    for (int lp0 = 0; lp0 <= door; ++lp0)
+                        for (int lad0 = 0; lad0 <= top; ++lad0)
+                            for (int t = 0; t < 4; ++t)
+                            {
+                                const bool on = t >= 2, lowPass = (t & 1) == 0;
+                                int lp = lp0, lad = lad0, steps = 0;
+                                bool lm = true, dm = true;
+                                while ((lm || dm) && steps < 10 * (top + door) + 10)
+                                {
+                                    ef::detail::stepDoors (lp, lad, door, rung, sweep, on, lowPass, lm, dm);
+                                    ++steps;
+                                }
+                                const bool good = ! (lm || dm)
+                                               && (! on ? (lp == 0 && lad == 0) : lowPass ? (lp == door && lad == 0) : (lp == 0 && lad == top));
+                                ++states;
+                                if (good) ++settled;
+                                else if (firstBad.empty())
+                                    firstBad = " — first stuck: lengths (" + std::to_string (door) + ", " + std::to_string (rung) + ", "
+                                             + std::to_string (sweep) + "), from (" + std::to_string (lp0) + ", " + std::to_string (lad0)
+                                             + ") toward " + (on ? (lowPass ? "low pass" : "band pass") : "off") + ", rests at ("
+                                             + std::to_string (lp) + ", " + std::to_string (lad) + ")";
+                            }
+                }
+        okv (settled == states, std::to_string (settled) + " of " + std::to_string (states)
+                                + " (state, target) pairs of the door machine come to rest where the target asks" + firstBad);
+    }
+}
+
+//==============================================================================
+// THE LADDER'S PITCH BEND. Its allpass turns a bass tone's phase on the way in and out, which is heard as a bend.
+// Measured from half-period zero crossings (a pure tone; amplitude cannot move a crossing) of 82, 150 and 300 Hz
+// through a band-pass wake and a disengage (keepLows on, corner 150 Hz, cutoff far above, mix 0.1 so the last rung
+// adds no phase of its own), at three rates; and the first rung's crossfade on a broadband click.
+double bendCents (const std::vector<float>& y, int a, int b, double fs, double hz)
+{
+    double last = -1.0, worst = 0.0;
+    for (int i = a + 1; i < b; ++i)
+    {
+        const double y0 = y[(std::size_t) i - 1], y1 = y[(std::size_t) i];
+        if ((y0 < 0.0) != (y1 < 0.0))
+        {
+            const double t = (i - 1) + y0 / (y0 - y1);
+            if (last >= 0.0)
+                worst = std::max (worst, std::fabs (1200.0 * std::log2 (fs / (2.0 * (t - last)) / hz)));
+            last = t;
+        }
+    }
+    return worst;
+}
+
+void ladderBend()
+{
+    group ("the band pass's ladder: its pitch bend and its first rung on a click");
+    for (double fs : kRates)
+    {
+        double worst = 0.0, quiet = 0.0;
+        std::string where;
+        for (int dis = 0; dis < 2; ++dis)
+            for (double hz : { 82.41, 150.0, 300.0 })
+            {
+                Stage s;
+                run (s.prepare (fs, 64, 1));
+                Params p = voice (ef::Mode::bandPass);
+                fixedCutoff (p, 3000.0f);
+                p.keepLows = 1.0f; p.keepLowsHz = 150.0f; p.mix = dis ? 0.1f : 0.0f;
+                s.setParams (p);
+                const int n = (int) (1.2 * fs), t0 = (int) (0.3 * fs) / 64 * 64;
+                std::vector<float> y ((std::size_t) n);
+                for (int i = 0; i < n; ++i) y[(std::size_t) i] = (float) (0.25 * std::sin (2.0 * kPi * hz * i / fs));
+                for (int i = 0; i < n; i += 64)
+                {
+                    if (i == t0) { p.mix = dis ? 0.0f : 0.1f; s.setParams (p); }
+                    float* io[1] = { y.data() + i };
+                    run (s.process (io, 1, std::min (64, n - i)));
+                }
+                const double b = bendCents (y, t0, t0 + (int) (0.45 * fs), fs, hz);
+                quiet = std::max (quiet, bendCents (y, (int) (0.05 * fs), t0, fs, hz));
+                if (b > worst) { worst = b; where = std::string (dis ? "disengage, " : "wake, ") + fmt (hz, 0) + " Hz"; }
+            }
+        okv (worst <= 55.0 && quiet < 1.0, fmt (fs, 0) + " Hz: the largest bend through a band-pass wake or disengage is " + fmt (worst, 1)
+                                           + " cents (" + where + "; bound 55; the measurement's own floor " + fmt (quiet, 2) + ")");
+
+        // The first rung crossfades x with x through the ceiling allpass: a 2 ms white-noise click in its middle.
+        Stage s;
+        run (s.prepare (fs, 64, 1));
+        Params p = voice (ef::Mode::bandPass);
+        p.mix = 0.0f;
+        s.setParams (p);
+        const int n = (int) (0.5 * fs), t0 = (int) (0.2 * fs) / 64 * 64;
+        const int len = (int) (0.002 * fs), at = t0 + (int) (0.5 * Stage::kRungSeconds * fs) - len / 2;
+        std::vector<float> y ((std::size_t) n, 0.0f);
+        felitronics::test::law11::Rng r { 0xC11Cu };
+        double ein = 0.0;
+        for (int i = 0; i < len; ++i)
+        {
+            y[(std::size_t) (at + i)] = 0.5f * (float) (0.5 - 0.5 * std::cos (2.0 * kPi * (i + 0.5) / len)) * r.next();
+            ein += (double) y[(std::size_t) (at + i)] * y[(std::size_t) (at + i)];
+        }
+        for (int i = 0; i < n; i += 64)
+        {
+            if (i == t0) { p.mix = 1.0f; s.setParams (p); }
+            float* io[1] = { y.data() + i };
+            run (s.process (io, 1, std::min (64, n - i)));
+        }
+        double eout = 0.0;
+        for (int i = at - (int) (0.001 * fs); i < at + len + (int) (0.004 * fs); ++i) eout += (double) y[(std::size_t) i] * y[(std::size_t) i];
+        const double dip = 10.0 * std::log10 (eout / ein);
+        okv (dip >= -1.0, fmt (fs, 0) + " Hz: a click in the middle of the first rung keeps " + fmt (dip) + " dB of its energy (bound -1)");
+    }
 }
 
 //==============================================================================
@@ -1237,6 +1419,8 @@ int main()
     keepsLows();
     levels();
     doorsKeepTheLevel();
+    doorsNeverStick();
+    ladderBend();
     reslicing();
     stoppedChannelPauseReset();
     poisonAndLaw8();

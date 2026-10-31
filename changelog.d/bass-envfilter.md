@@ -6,12 +6,14 @@ dynamics house shape — places the cutoff of a resonant Cytomic TPT state-varia
 (150 Hz … 3 kHz by default): fully open when envelope + sensitivity reaches 0 dBFS, closed 30 dB below; UP rests
 low and a hit opens it, DOWN rests high and a hit pushes it down. The playing reaches the cutoff through a 4 ms
 smoother, the hand's edits (direction, range, sensitivity) glide 20 ms first, and the filter is redesigned every
-sample. Low pass or band pass (a 10 ms crossfade), both scaled by 1/√max(1, Q) (Q 0.5 … 12): the low pass's
+sample. Low pass or band pass, both scaled by 1/√max(1, Q) (Q 0.5 … 12): the low pass's
 passband sits at −6.0 dB at Q 4 and −10.8 dB at Q 12. `keepLows` takes the band under `keepLowsHz` (150 Hz) out
 of the filter and adds it back clean, with a split per mode that cannot cancel it: an exact complement in low pass
 (dry = the input), an in-phase LR4 pair in band pass (dry = its allpass). The doors never crossfade the two phase
-families: the low pass has a 10 ms door from the input, the band pass a 70 ms ladder (a crossfade to the LR4
-allpass parked at 0.45 fs, a 50 ms sweep of it down to the corner, a crossfade to the band pass), so a wake, a
+families: the low pass has a 10 ms door from the input, the band pass a 250 ms ladder (a 25 ms crossfade to the
+LR4 allpass parked four octaves above the corner, a 200 ms exponential sweep of it down to the corner — heard as a
+pitch bend of at most ~48 cents — and a 25 ms crossfade to the band pass); the door machine is a pure function,
+swept exhaustively by the tests (no state sticks), so a wake, a
 disengage and a mode change keep a tone at or above the corner within 0.92 dB of its settled level. Everything
 glides and lands; `mix` 0 closes the doors (counted), after which the stage is idle: the buffer is returned
 untouched and nothing is computed; a wake is a restart. Mono or stereo (linked), 8 … 768 kHz, zero latency, law 8/8a on `core::StateGrid`,
