@@ -58,15 +58,27 @@ f.shownCutoffHz();                               // relaxed atomic, any thread �
 | `keepLows` / `keepLowsHz` | 0 … 1 / 30 … 300 Hz | 1 / 150 | the clean lows |
 | `mix` | 0 … 1 | 1 | **law-owned** — 0 = dry, and the stage goes idle |
 
-Everything glides (20 ms, one-pole, and lands) except the follower's attack/release, which retune at once; the
-mode door and the engage door are counted 10 ms ramps.
+Everything glides (20 ms, one-pole, and lands) except the follower's attack/release, which retune at once.
 
-**Amount 0 is not there.** Setting `mix` to 0 closes the engage door (10 ms, counted, lands exactly); from then
-on the stage is idle (`isIdle()`): it returns the buffer untouched — bit-exact, NaN payloads included — and
-computes nothing. A wake is a restart: every state from silence, the door opening from dry, the mix gliding in.
+**The doors never cross phase families.** Bypass and the low pass are in phase with the input; the band pass is in
+phase with its LR4 allpass, which is −1 at the corner, so any crossfade between the two has a hole there (a tone
+at the corner fell 7.5 dB through a 10 ms door at mix 0.1). The low pass has its own 10 ms door from the input. The
+band pass is reached by a ladder: a 10 ms crossfade to the same signal through the LR4 pair's allpass parked at
+0.45 fs (≈ +1 over the bass), a 50 ms sweep of that allpass down to the corner (the level holds, the phase turns),
+and a 10 ms crossfade to the band pass, now in phase with it; down in reverse. Through a wake, a disengage and
+either mode change, a tone at or above the corner stays within 0.92 dB of the lower settled level (Q 4/12, mix
+0.1/1, cutoff at the corner and 10× above). What remains is the taps' own difference: at the cutoff the low pass
+and the band pass are 90° apart, so a mode change dips a tone there by 3.1 dB for the 10 ms crossing.
 
-Cost, measured on deb (gcc 14, i9-13900H): 1.0 % of real time at 48 kHz stereo. Most of it is the per-sample
-sweep's `core::det` log2/exp2/tan (the same bits on every row); with the system's three it is 0.53 %.
+**Amount 0 is not there.** Setting `mix` to 0 closes the doors — 10 ms in low pass, the 70 ms ladder in band
+pass, all counted, landing exactly; from then on the stage is idle (`isIdle()`): it returns the buffer untouched —
+bit-exact, NaN payloads included — and computes nothing. A wake is a restart: every state from silence, the doors
+opening from dry, the mix gliding in.
+
+Cost, measured on deb (gcc 14, i9-13900H) with the sweep moving and every glide at rest: 1.04 % of real time at
+48 kHz stereo — most of it the per-sample sweep's `core::det` log2/exp2/tan (the same bits on every row; 0.58 %
+with the system's three). Not a worst case: both modes' filters and splits always run, and while the corner glides
+(~0.4 s after an edit) or the ladder sweeps (50 ms) the splits or the allpass are redesigned every sample.
 
 ## `EnvelopeFilterLaw.h` — the one slider
 

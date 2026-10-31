@@ -274,15 +274,16 @@ the predelay or the chorus line, and once exact zero is reached it holds).
 
 **Recursive state.** The swept TPT state-variable filter's two integrators per lane — four lanes, the low-pass
 path and the band-pass path per channel (`envfilter::detail::SweptSvf`, `eq::Svf`'s update) — the two clean-lows
-splits (`eq::DeterministicSvf`, a high pass, and `eq::DeterministicCrossover2`, LR4), the envelope follower
+splits (`eq::DeterministicSvf`, a high pass, and `eq::DeterministicCrossover2`, LR4), the doors' allpass
+(`eq::DeterministicSvf`, the LR4 pair's own), the envelope follower
 (`dynamics::EnvelopeFollower`, peak) and nine glides, one-pole in double: mix, sensitivity, keepLows, resonance,
 the direction blend, the range's two ends, the corner (log2 Hz) and the playing's cutoff smoother (log2 Hz). The
-mode door and the engage door are counted linear ramps (clean, they land by construction).
+low-pass door and the band pass's three-stage ladder are counted linear ramps (clean, they land by construction).
 **Verdict: flushed at the house 1e-15 on `core::StateGrid` (audio time), poison healed at the end of every call.**
 The follower, the filters' integrators and both splits decay geometrically toward zero on silence and would
 otherwise park in the subnormal band. The glides LAND (item 6): on their target once the update no longer moves
 them or once within 1e-9 × max(1, |target|) of it, so none of them can creep through the subnormals; the stage
-goes idle on the ENGAGE DOOR's landing, which is counted and exact. A gap (law 11c) runs the same per-sample
+goes idle on the last counted door's landing, which is exact. A gap (law 11c) runs the same per-sample
 control step as silence and, when keyless, stops once the shared state stands still with the follower at exact
 zero.
 Tested in `modules/envfilter/tests/EnvelopeFilterTests.cpp` (a Q 12 band-pass ring, then 60 s of silence in

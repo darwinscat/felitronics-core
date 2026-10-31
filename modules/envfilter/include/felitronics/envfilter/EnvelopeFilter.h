@@ -55,17 +55,32 @@ namespace felitronics::envfilter
 //         half, and the band under the corner keeps at least the LR4 low share (−0.5 dB at half the corner,
 //         −1.9 at 0.7, −6 at the corner). Its dry is the same LR4 allpass (low + high), so a mix never notches
 //         the crossover the way x against an allpass would.
-//     The two modes run side by side and the mode door crossfades their outputs (and their dries), so a mode
-//     change is a crossfade of two live filters, never a restart. The corner glides (kGlideSeconds, on
-//     log2 Hz) with both splits redesigned while it moves.
-//   · THE MIX — out = dry + mix·(wet − dry), then through the ENGAGE DOOR: x + door·(that − x).
+//     The two modes run side by side, so a mode change is a crossfade of two live filters, never a restart. The
+//     corner glides (kGlideSeconds, on log2 Hz) with both splits redesigned while it moves.
+//   · THE MIX — each mode's out = its dry + mix·(its wet − its dry).
 //
-// AMOUNT 0 IS NOT THERE. When `mix` is set to 0 the engage door closes — a COUNTED kDoorSeconds ramp that lands
-// exactly — and from the sample it lands the stage is IDLE: process() returns with the buffer untouched (bit-exact
-// dry, NaN payloads included) and computes nothing. A wake is a RESTART: every state from silence, the grid
-// re-anchored, the glides on their targets, the door opening from dry over kDoorSeconds and the mix gliding in
-// from 0 (the filters starting from silence on a sounding note are faded in, not heard). The one-slider law
-// that maps a face's slider onto these knobs is EnvelopeFilterLaw.h.
+// THE DOORS — HOW THE STAGE GETS FROM ONE PHASE TO THE OTHER WITHOUT A HOLE. Bypass and the low pass are
+// referenced to x; the band pass is referenced to the LR4 allpass, which is −1 at the corner. A crossfade between
+// the two families has a hole there — at mix 0.1 a tone at the corner fell 7.5 dB through a 10 ms door. So no door
+// ever crosses families. The x family has one door: the LOW-PASS DOOR (x ↔ the low pass, kDoorSeconds). The band
+// pass is reached by a LADDER of three counted stages, each phase-continuous: (1) a kDoorSeconds crossfade from
+// the x-family signal to the same signal through the LR4 pair's own allpass parked at the CEILING (0.45 fs, where
+// it is ≈ +1 over the bass); (2) that allpass's corner sweeps down to the clean-lows corner over
+// kCornerSweepSeconds (eased, on log2 Hz) — a pure allpass, so the level holds while the phase turns; (3) a
+// kDoorSeconds crossfade from it to the band pass, which now shares its phase. Down is the same in reverse. The
+// low-pass door stays open until the band pass is fully in, and the ladder comes down only once it is open again,
+// so a mode change never passes through dry. Measured over tones at and above the corner, cutoff at it and 10×
+// above, Q 4 and 12, mix 0.1 and 1, both modes: the weakest whole cycle through a wake, a disengage and either
+// mode change sits within 0.92 dB of the lower settled level. What remains is the two taps' own difference: at
+// the cutoff they are 90° apart, so the 10 ms crossing dips a tone there by 3.1 dB (pinned).
+//
+// AMOUNT 0 IS NOT THERE. When `mix` is set to 0 the doors close — the low-pass door, or the ladder down
+// (2·kDoorSeconds + kCornerSweepSeconds), all counted, landing exactly — and from the sample the last one lands
+// the stage is IDLE: process() returns with the buffer untouched (bit-exact dry, NaN payloads included) and
+// computes nothing. A wake is a RESTART: every state from silence, the grid re-anchored, the glides on their
+// targets, the doors opening from dry and the mix gliding in from 0 (the filters starting from silence on a
+// sounding note are faded in, not heard). The one-slider law that maps a face's slider onto these knobs is
+// EnvelopeFilterLaw.h.
 //
 // CONTRACT (DSP-ARCHITECTURE.md §2).
 //   · prepare(sampleRate, maxBlock, maxChannels): maxChannels 1 or 2, the rate 8 kHz … 768 kHz, maxBlock >= 1
@@ -83,11 +98,11 @@ namespace felitronics::envfilter
 //     digital silence at a live width (law 11c). AN EXTERNAL KEY IS STILL CONSUMED: the programme stopped, not
 //     the key. A keyless gap stops computing once the shared state stands still.
 //   · reset() is a stream RESTART: every state cleared, the audio-time grid re-anchored, and the next call
-//     starts the glides ON their targets and the engage door open — a fresh stage does not fade in.
+//     starts the glides ON their targets and the doors where the mode puts them — a fresh stage does not fade in.
 //   · GLIDES. mix, sensitivity, resonance, keepLows, the direction, the range's ends and keepLowsHz glide over
-//     kGlideSeconds (one-pole, in double, and they LAND — LAW8-AUDIT.md item 6); the mode door and the engage
-//     door are counted and land exactly. Only the follower's attack/release retune at once.
-//   · Law 8: the follower, the swept filters' integrators and both splits are flushed at the house 1e-15 on the
+//     kGlideSeconds (one-pole, in double, and they LAND — LAW8-AUDIT.md item 6); the doors are counted and land
+//     exactly. Only the follower's attack/release retune at once.
+//   · Law 8: the follower, the swept filters' integrators, both splits and the ladder's allpass are flushed at the house 1e-15 on the
 //     core::StateGrid (64 samples of AUDIO time, law 8a), so the output does not depend on how the caller
 //     slices the stream. The glides land rather than creep, so none of them reaches the subnormal band.
 //   · POISON: a non-finite INPUT sample is not fed to the detector, the splits or the filters (they hear silence
@@ -220,8 +235,11 @@ public:
         ~0.9 dB between the 82 Hz peaks of |x|, and this pole is down 7.2 dB there. */
     static constexpr double kSmoothSeconds = 0.004;
     static constexpr double kGlideSeconds  = 0.020;   ///< the hand's glides (one-pole time constant)
-    static constexpr double kModeSeconds   = 0.010;   ///< the low-pass ↔ band-pass crossfade (linear, counted)
-    static constexpr double kDoorSeconds   = 0.010;   ///< the engage door, in and out (linear, counted)
+    static constexpr double kDoorSeconds   = 0.010;   ///< every counted door's travel (linear, lands exactly)
+    /** The band pass's LADDER (see THE DOORS above): the allpass's corner travels from the ceiling (0.45 fs) to the
+        clean-lows corner, eased, on log2 Hz. Long enough that a tone at the corner, whose phase the travel turns by
+        half a cycle, bends by a few Hz rather than tens. */
+    static constexpr double kCornerSweepSeconds = 0.050;
 
     /** Never above this share of the rate, whatever the range says: the prewarp's tan() runs away at Nyquist. */
     static constexpr double kMaxCutoffShare = 0.45;
@@ -256,8 +274,10 @@ public:
 
         glideC_  = 1.0 - detail::detExp (-1.0 / (kGlideSeconds * fs_));
         smoothC_ = 1.0 - detail::detExp (-1.0 / (kSmoothSeconds * fs_));
-        modeLen_ = std::max (1, (int) (kModeSeconds * fs_ + 0.5));
         doorLen_ = std::max (1, (int) (kDoorSeconds * fs_ + 0.5));
+        sweepLen_ = std::max (1, (int) (kCornerSweepSeconds * fs_ + 0.5));
+        kfCeil_  = core::det::log2 (kMaxCutoffShare * fs_);
+        apSvf_.prepare (fs_, maxCh_);
         fMax_    = kMaxCutoffShare * fs_;
 
         cleared_ = false;
@@ -356,7 +376,7 @@ public:
         kfTgt_  = core::det::log2 ((double) keepHz_);
     }
 
-    /** 0 = dry: the engage door closes and the stage goes idle; 1 = all filter. */
+    /** 0 = dry: the doors close and the stage goes idle; 1 = all filter. */
     void setMix (float m) noexcept
     {
         if (std::isfinite (m))
@@ -431,9 +451,9 @@ public:
 
                 const bool moving = controlStep (k);
 
-                if (doorPos_ == 0 && ! (mixTgt_ > 0.0))
+                if (lpPos_ == 0 && ladPos_ == 0 && ! (mixTgt_ > 0.0))
                 {
-                    goIdle();   // the engage door has landed shut: from this sample on the call is dry
+                    goIdle();   // the last door has landed shut: from this sample on the call is dry
                     publish();
                     return true;
                 }
@@ -459,6 +479,7 @@ public:
         svf_.heal();    // the poison half keeps the call's clock (law 8a)
         splitLp_.healPoison();
         splitBp_.healPoison();
+        apSvf_.healPoison();
         publish();
         return true;
     }
@@ -496,6 +517,7 @@ public:
 
 private:
     static constexpr double kSplitQ    = 0.5;                      // critically damped: the flattest complement
+    static constexpr double kApQ       = 0.70710678118654752440;   // the LR4 pair's sum is this allpass
     static constexpr double kPi        = 3.14159265358979323846;
     static constexpr double kDbPerLog2 = 6.0205999132796239042;    // 20·log10(2)
     static constexpr double kLandTol   = 1.0e-9;                   // a glide this close (× max(1,|target|)) lands
@@ -560,6 +582,23 @@ private:
         splitBp_.setFrequency ((float) hz);
     }
 
+    /** The ladder's allpass — the LR4 pair's own (2nd order, Q 1/√2) — at the ceiling while the ladder is below
+        its sweep, at the clean-lows corner above it, eased (smoothstep, on log2 Hz) in between. */
+    void designAllpass() noexcept
+    {
+        const int    into = std::min (std::max (ladPos_ - doorLen_, 0), sweepLen_);
+        const double c = (double) into / (double) sweepLen_;
+        const double e = c * c * (3.0 - 2.0 * c);
+        apSvf_.setParams (eq::FilterType::AllPass, core::det::exp2 (kfCeil_ + e * (kf_ - kfCeil_)), kApQ, 0.0);
+    }
+
+    void refreshDoors() noexcept
+    {
+        lp_   = (double) lpPos_ / (double) doorLen_;
+        g_    = (double) std::min (ladPos_, doorLen_) / (double) doorLen_;
+        beta_ = (double) std::max (ladPos_ - doorLen_ - sweepLen_, 0) / (double) doorLen_;
+    }
+
     void refreshQ() noexcept
     {
         k_    = 1.0 / q_;
@@ -586,12 +625,23 @@ private:
         if (kfMoved)
             designSplits();
 
-        const bool modeMoved = step (modePos_, lowPass_ ? modeLen_ : 0);
-        if (modeMoved)
-            wLp_ = (double) modePos_ / (double) modeLen_;
-        const bool doorMoved = step (doorPos_, mixTgt_ > 0.0 ? doorLen_ : 0);
-        if (doorMoved)
-            door_ = (double) doorPos_ / (double) doorLen_;
+        // THE DOORS (see the header). The ladder climbs whenever the band pass is wanted and comes down only once
+        // the low-pass door stands where it is going; the low-pass door stays open until the band pass is fully
+        // in, and moves only while the band pass is out of the picture or wholly in it.
+        const bool engaged = mixTgt_ > 0.0;
+        const int  top     = 2 * doorLen_ + sweepLen_;
+        const int  lpTo    = engaged && (lowPass_ || (lpPos_ == doorLen_ && ladPos_ < top)) ? doorLen_ : 0;
+        const int  ladTo   = engaged && ! lowPass_ ? top : 0;
+        bool ladMoved = false;
+        if (ladTo > ladPos_ || lpPos_ == lpTo)
+            ladMoved = step (ladPos_, ladTo);
+        bool lpMoved = false;
+        if (ladPos_ <= doorLen_ + sweepLen_ || ladPos_ == top)
+            lpMoved = step (lpPos_, lpTo);
+        if (ladMoved || lpMoved)
+            refreshDoors();
+        if (ladMoved || kfMoved)
+            designAllpass();
 
         const float env = follower_.process (k);
         const bool lfMoved = glide (lf_, cutoffTarget (env), smoothC_);
@@ -599,11 +649,10 @@ private:
             design();
 
         return mixMoved || sensMoved || keepMoved || qMoved || dirMoved || loMoved || hiMoved || kfMoved
-            || modeMoved || doorMoved || lfMoved;
+            || ladMoved || lpMoved || lfMoved;
     }
 
-    /** One channel's sample: both modes' splits and filters, the clean lows back, the mode door, the mix, the
-        engage door. A non-finite input is not this stage's to change, and not for its state to hear: everything
+    /** One channel's sample: both modes' splits and filters, the clean lows back, the mix, the doors. A non-finite input is not this stage's to change, and not for its state to hear: everything
         runs on a plain zero there (one path, so the state is exactly what a zero would have left) and the
         sample goes out as it came. */
     float channelStep (int ch, float xin) noexcept
@@ -627,10 +676,13 @@ private:
         const double wetBp = keep_ * (double) l4 + comp_ * bp;
         const double dryBp = (double) l4 + (double) h4;
 
-        const double wet = wetBp + wLp_ * (wetLp - wetBp);
-        const double dry = dryBp + wLp_ * (x - dryBp);
-        const double mixed = dry + mix_ * (wet - dry);
-        return finite ? (float) (x + door_ * (mixed - x)) : xin;
+        // THE DOORS: the low-pass door from x, the ladder's allpass over that, the band pass across.
+        const double mixedLp = x + mix_ * (wetLp - x);
+        const double mixedBp = dryBp + mix_ * (wetBp - dryBp);
+        const double rx = x + lp_ * (mixedLp - x);
+        const double ap = (double) apSvf_.processSample (ch, (float) rx);
+        const double xr = rx + g_ * (ap - rx);
+        return finite ? (float) (xr + beta_ * (mixedBp - xr)) : xin;
     }
 
     void stopChannel (int ch) noexcept
@@ -641,6 +693,7 @@ private:
         svf_.clear (2 + ch);
         splitLp_.resetChannel (ch);
         splitBp_.resetChannel (ch);
+        apSvf_.resetChannel (ch);
         live_[ch] = false;
     }
 
@@ -649,14 +702,15 @@ private:
         follower_.reset();
         splitLp_.reset();
         splitBp_.reset();
+        apSvf_.reset();
         for (int c = 0; c < detail::SweptSvf::kLanes; ++c)
             svf_.clear (c);
         for (int ch = 0; ch < kMaxChannels; ++ch)
             live_[ch] = false;
     }
 
-    /** The glides on their targets, the follower empty, the cutoff at rest, the engage door open — a fresh
-        stream. */
+    /** The glides on their targets, the follower empty, the cutoff at rest, the doors where the mode puts them —
+        a fresh stream. */
     void prime() noexcept
     {
         mix_  = mixTgt_;
@@ -669,12 +723,12 @@ private:
         kf_   = kfTgt_;
         refreshQ();
         refreshFloor();
+        idle_   = ! (mixTgt_ > 0.0);
+        lpPos_  = ! idle_ && lowPass_ ? doorLen_ : 0;
+        ladPos_ = ! idle_ && ! lowPass_ ? 2 * doorLen_ + sweepLen_ : 0;
+        refreshDoors();
         designSplits();
-        modePos_ = lowPass_ ? modeLen_ : 0;
-        wLp_     = (double) modePos_ / (double) modeLen_;
-        idle_    = ! (mixTgt_ > 0.0);
-        doorPos_ = idle_ ? 0 : doorLen_;
-        door_    = (double) doorPos_ / (double) doorLen_;
+        designAllpass();
         follower_.reset();
         lf_ = cutoffTarget (0.0f);
         design();
@@ -683,15 +737,17 @@ private:
     }
 
     /** Out of idle: a RESTART — every state from silence, the grid re-anchored, the glides on their targets —
-        with the engage door opening from dry over kDoorSeconds and the mix gliding in from 0, so the filters'
+        with the doors opening from dry and the mix gliding in from 0, so the filters'
         own start from silence is faded in rather than heard. */
     void wake() noexcept
     {
         clearAll();
         prime();
-        doorPos_ = 0;
-        door_    = 0.0;
-        mix_     = 0.0;
+        lpPos_  = 0;
+        ladPos_ = 0;
+        refreshDoors();
+        designAllpass();
+        mix_    = 0.0;
         idle_    = false;
     }
 
@@ -709,6 +765,7 @@ private:
         svf_.flush();
         splitLp_.flushDenormals();
         splitBp_.flushDenormals();
+        apSvf_.flushDenormals();
     }
 
     void publish() noexcept { shownHz_.store ((float) cutoff_, std::memory_order_relaxed); }
@@ -728,8 +785,9 @@ private:
     double k_ = 0.25, comp_ = 0.5;
     double lf_ = 0.0, cutoff_ = 150.0;
     float  envFloor_ = 0.0f;
-    int    modePos_ = 1, modeLen_ = 1, doorPos_ = 1, doorLen_ = 1;
-    double wLp_ = 1.0, door_ = 1.0;
+    int    lpPos_ = 1, ladPos_ = 0, doorLen_ = 1, sweepLen_ = 1;   // the doors, counted
+    double lp_ = 1.0, g_ = 0.0, beta_ = 0.0;                        // ...as weights
+    double kfCeil_ = 14.4;   // log2 of the ladder allpass's ceiling, 0.45 fs (set by prepare)
 
     double fs_ = 48000.0, fMax_ = 21600.0;
     double glideC_ = 1.0, smoothC_ = 1.0;
@@ -737,6 +795,7 @@ private:
     dynamics::EnvelopeFollower      follower_;
     eq::DeterministicSvf            splitLp_;   // the low-pass mode's complement split
     eq::DeterministicCrossover2     splitBp_;   // the band-pass mode's LR4 split
+    eq::DeterministicSvf            apSvf_;     // the ladder's allpass (the LR4 pair's own)
     detail::SweptSvf                svf_;
     core::StateGrid                 grid_;
 

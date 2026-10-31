@@ -243,9 +243,10 @@ void dryAtZero()
         for (int i = 0; i < n; ++i)
             if (! core::sameBits (io[0][(std::size_t) i], in[0][(std::size_t) i])) lastDiff = i;
         const double landMs = 1000.0 * (lastDiff - at) / fs;
-        okv (all && s.isIdle() && lastDiff > at && landMs <= 1000.0 * Stage::kDoorSeconds,
-            "after a move to 0 the engage door (counted) lands and the stage idles: dry bit for bit " + fmt (landMs, 2)
-            + " ms after the move (the door: 10 ms) — " + fmt (fs, 0) + " Hz");
+        const double ladderMs = 1000.0 * (2.0 * Stage::kDoorSeconds + Stage::kCornerSweepSeconds);
+        okv (all && s.isIdle() && lastDiff > at && landMs <= ladderMs,
+            "band pass, after a move to 0 the counted doors land and the stage idles: dry bit for bit " + fmt (landMs, 2)
+            + " ms after the move (the ladder down: " + fmt (ladderMs, 0) + " ms) — " + fmt (fs, 0) + " Hz");
     }
 }
 
@@ -758,6 +759,27 @@ void keyInput()
 }
 
 //==============================================================================
+// THE DOORS KEEP THE LEVEL. Every door is a crossfade, and a crossfade of two signals that disagree in phase near
+// the clean-lows corner (the band pass's LR4 allpass is -1 there, the bypass and the low pass's dry are +1) has a
+// hole in it. A sustained tone AT the corner (150 Hz) and just above it (213.3 Hz), keepLows on, Q 4 and 12, mix
+// 0.1 and 1, both modes: through a wake, a disengage and the mode door both ways, the weakest whole-cycle RMS must
+// stay within 2 dB of the lower of the two settled levels either side of the move. Periods are whole samples
+// (320 and 225 at 48 kHz), so a one-period window is exactly one cycle.
+double weakestCycleDb (const std::vector<float>& y, int a, int b, int period)
+{
+    double acc = 0.0, worst = 1e300;
+    for (int i = a; i < a + period; ++i) acc += (double) y[(std::size_t) i] * y[(std::size_t) i];
+    for (int i = a; i + period <= b; ++i)
+    {
+        worst = std::min (worst, acc);
+        acc += (double) y[(std::size_t) (i + period)] * y[(std::size_t) (i + period)] - (double) y[(std::size_t) i] * y[(std::size_t) i];
+    }
+    return 10.0 * std::log10 (std::max (worst, 1e-300) / period);
+}
+
+double cycleDb (const std::vector<float>& y, int at, int period) { return weakestCycleDb (y, at, at + period, period); }
+
+//==============================================================================
 // LEVELS the 1/sqrt(Q) scaling sets — pinned, not changed: the owner judges them by ear.
 void levels()
 {
@@ -801,18 +823,86 @@ void levels()
             float* qq[1] = { y.data() + i };
             run (s.process (qq, 1, std::min (64, n - i)));
         }
-        double steady = 0.0, low = 1e9;
-        for (int i = t - 4800; i < t; ++i) steady = std::max (steady, (double) std::fabs (y[(std::size_t) i]));
-        for (int c = 0; c < 20; ++c)   // per 1 kHz cycle through the door and past it
-        {
-            double pk = 0.0;
-            for (int i = t + c * 48; i < t + (c + 1) * 48; ++i) pk = std::max (pk, (double) std::fabs (y[(std::size_t) i]));
-            low = std::min (low, pk);
-        }
-        const double dip = dbOf (low / steady);
-        okv (dip >= -6.0, "Q " + fmt (q, 1) + ": through the 10 ms mode door the tone at the cutoff dips " + fmt (dip)
-                          + " dB (bound -6: the taps are 90 degrees apart there, and the band pass's LR4 allpass adds ~25)");
+        const double settled = std::min (cycleDb (y, t - 480, 48), cycleDb (y, n - 960, 48));
+        const double dip = weakestCycleDb (y, t, t + (int) (0.15 * fs), 48) - settled;
+        okv (dip >= -3.5 && dip <= -2.5, "Q " + fmt (q, 1) + ": through the mode change the tone at the cutoff dips " + fmt (dip)
+                                         + " dB (pinned -3 +- 0.5: the two taps are 90 degrees apart there, crossed over 10 ms)");
     }
+}
+
+void doorsKeepTheLevel()
+{
+    group ("engage, disengage, wake and the mode door keep a tone near the corner within 2 dB of its settled level");
+    const double fs = 48000.0;
+    const int periods[] = { 320, 225 };
+    struct Worst { double margin = 1e9; std::string where; };
+    Worst wake, disengage, modeIn, modeOut;
+    const auto note = [] (Worst& w, double m, const std::string& where) { if (m < w.margin) { w.margin = m; w.where = where; } };
+
+    for (auto mode : { ef::Mode::lowPass, ef::Mode::bandPass })
+        for (float cutoff : { 150.0f, 1500.0f })
+        for (float q : { 4.0f, 12.0f })
+            for (float mix : { 0.1f, 1.0f })
+                for (int period : periods)
+                {
+                    Params p = voice (mode, ef::Direction::up, q);
+                    fixedCutoff (p, cutoff);
+                    p.keepLows = 1.0f; p.keepLowsHz = 150.0f; p.mix = 0.0f;
+                    Stage s;
+                    run (s.prepare (fs, 64, 1));
+                    s.setParams (p);
+                    const int n = (int) (2.0 * fs), t0 = (int) (0.3 * fs) / 64 * 64, t1 = (int) (1.2 * fs) / 64 * 64;
+                    std::vector<float> y ((std::size_t) n);
+                    for (int i = 0; i < n; ++i) y[(std::size_t) i] = (float) (0.25 * std::sin (2.0 * kPi * i / period));
+                    for (int i = 0; i < n; i += 64)
+                    {
+                        if (i == t0) { p.mix = mix; s.setParams (p); }
+                        if (i == t1) { p.mix = 0.0f; s.setParams (p); }
+                        float* io[1] = { y.data() + i };
+                        run (s.process (io, 1, std::min (64, n - i)));
+                    }
+                    const double before = cycleDb (y, t0 - 4 * period, period), settled = cycleDb (y, t1 - 4 * period, period),
+                                 after = cycleDb (y, n - 4 * period, period);
+                    const std::string where = std::string (mode == ef::Mode::lowPass ? "low pass" : "band pass") + ", cutoff "
+                                            + fmt (cutoff, 0) + ", Q " + fmt (q, 0)
+                                            + ", mix " + fmt (mix, 1) + ", tone " + fmt (fs / period, 1) + " Hz";
+                    note (wake, weakestCycleDb (y, t0, t0 + (int) (0.3 * fs), period) - std::min (before, settled), where);
+                    note (disengage, weakestCycleDb (y, t1, t1 + (int) (0.3 * fs), period) - std::min (settled, after), where);
+                }
+
+    for (float cutoff : { 150.0f, 1500.0f })
+        for (float q : { 4.0f, 12.0f })
+            for (float mix : { 0.1f, 1.0f })
+                for (int period : periods)
+                {
+                    Params p = voice (ef::Mode::lowPass, ef::Direction::up, q);
+                    fixedCutoff (p, cutoff);
+                    p.keepLows = 1.0f; p.keepLowsHz = 150.0f; p.mix = mix;
+                    Stage s;
+                    run (s.prepare (fs, 64, 1));
+                    s.setParams (p);
+                    const int n = (int) (2.0 * fs), t0 = (int) (0.5 * fs) / 64 * 64, t1 = (int) (1.2 * fs) / 64 * 64;
+                    std::vector<float> y ((std::size_t) n);
+                    for (int i = 0; i < n; ++i) y[(std::size_t) i] = (float) (0.25 * std::sin (2.0 * kPi * i / period));
+                    for (int i = 0; i < n; i += 64)
+                    {
+                        if (i == t0) { p.mode = ef::Mode::bandPass; s.setParams (p); }
+                        if (i == t1) { p.mode = ef::Mode::lowPass; s.setParams (p); }
+                        float* io[1] = { y.data() + i };
+                        run (s.process (io, 1, std::min (64, n - i)));
+                    }
+                    const double lp = cycleDb (y, t0 - 4 * period, period), bp = cycleDb (y, t1 - 4 * period, period),
+                                 lp2 = cycleDb (y, n - 4 * period, period);
+                    const std::string where = "cutoff " + fmt (cutoff, 0) + ", Q " + fmt (q, 0) + ", mix " + fmt (mix, 1)
+                                            + ", tone " + fmt (fs / period, 1) + " Hz";
+                    note (modeIn, weakestCycleDb (y, t0, t0 + (int) (0.3 * fs), period) - std::min (lp, bp), where);
+                    note (modeOut, weakestCycleDb (y, t1, t1 + (int) (0.3 * fs), period) - std::min (bp, lp2), where);
+                }
+
+    okv (wake.margin >= -2.0, "wake (amount 0 -> on): the weakest cycle sits " + fmt (wake.margin) + " dB from the lower settled level (" + wake.where + ")");
+    okv (disengage.margin >= -2.0, "disengage (-> amount 0): " + fmt (disengage.margin) + " dB (" + disengage.where + ")");
+    okv (modeIn.margin >= -2.0, "mode door low pass -> band pass: " + fmt (modeIn.margin) + " dB (" + modeIn.where + ")");
+    okv (modeOut.margin >= -2.0, "mode door band pass -> low pass: " + fmt (modeOut.margin) + " dB (" + modeOut.where + ")");
 }
 
 //==============================================================================
@@ -1146,6 +1236,7 @@ int main()
     noZipper();
     keepsLows();
     levels();
+    doorsKeepTheLevel();
     reslicing();
     stoppedChannelPauseReset();
     poisonAndLaw8();
