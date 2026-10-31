@@ -13,6 +13,7 @@
 #include <law11c_pause.h>
 
 #include <felitronics/chorus/BassChorus.h>
+#include <felitronics/chorus/ChorusLaw.h>
 #include <felitronics/eq/Crossover2.h>
 
 #include <algorithm>
@@ -176,9 +177,9 @@ void contract()
 void theLaw()
 {
     group ("the one-slider law: amount drives depth and mix together; the menu's knobs are left alone");
-    namespace law = chorus::law;
     const BassChorusParams menu { 9.0f, 0.9f, 2.5f, 333.0f, 12.0f };
-    const auto p0 = law::paramsFor (0.0f, menu), ph = law::paramsFor (0.5f, menu), p1 = law::paramsFor (1.0f, menu);
+    const auto p0 = chorus::paramsForAmount (0.0f, menu), ph = chorus::paramsForAmount (0.5f, menu),
+               p1 = chorus::paramsForAmount (1.0f, menu);
     ok (! (p0.mix > 0.0f) && ! (p0.depthMs > 0.0f), "amount 0: mix 0 and depth 0");
     approx (ph.mix, 0.5, 1e-7, "amount 0.5: mix 0.5");
     approx (ph.depthMs, 1.5, 1e-6, "amount 0.5: depth 1.5 ms");
@@ -186,15 +187,23 @@ void theLaw()
     approx (p1.depthMs, 3.0, 0.0, "amount 1: depth 3 ms");
     ok (core::sameBits (ph.rateHz, 2.5f) && core::sameBits (ph.crossoverHz, 333.0f) && core::sameBits (ph.delayMs, 12.0f),
         "the menu's rate, crossover and centre delay pass through untouched");
-    const auto pn = law::paramsFor (std::numeric_limits<float>::quiet_NaN(), menu), pb = law::paramsFor (7.0f, menu);
-    ok (! (pn.mix > 0.0f) && core::sameBits (pb.mix, 1.0f) && core::sameBits (pb.depthMs, 3.0f), "NaN is no effect; past 1 is 1");
+    const auto pn = chorus::paramsForAmount (std::numeric_limits<float>::quiet_NaN(), menu), pb = chorus::paramsForAmount (7.0f, menu),
+               pm = chorus::paramsForAmount (-std::numeric_limits<float>::infinity(), menu);
+    ok (core::sameBits (pn.mix, menu.mix) && core::sameBits (pn.depthMs, menu.depthMs) && core::sameBits (pm.mix, menu.mix),
+        "a non-finite amount is ignored: the menu (the stage's current params) comes back untouched");
+    ok (core::sameBits (pb.mix, 1.0f) && core::sameBits (pb.depthMs, 3.0f), "past 1 is 1");
 
-    BassChorus s;
-    test::run (s.prepare (48000.0, 64, 2));
-    s.setRateHz (0.7f);
-    s.setAmount (1.0f);
-    approx (s.pitchDeviationCents(), 1200.0 * std::log2 (1.0 + 2.0 * kPi * 0.7 * 0.003), 1e-3,
-            "amount 1 at the default 0.7 Hz: the published peak deviation (22.7 cents)");
+    // The read-out: a pure function of the knobs, the LARGER (flat) excursion.
+    BassChorusParams d = chorus::paramsForAmount (1.0f);
+    d.rateHz = 0.7f;
+    const double x = 2.0 * kPi * 0.7 * 0.003;
+    approx (chorus::pitchDeviationCents (d), -1200.0 * std::log2 (1.0 - x), 1e-3,
+            "amount 1 at the default 0.7 Hz: the flat excursion, 23.0 cents (the sharp one is 22.7)");
+    const BassChorusParams wild { BassChorus::kMaxDepthMs, 1.0f, BassChorus::kMaxRateHz, 200.0f, BassChorus::kMaxDelayMs };
+    approx (chorus::pitchDeviationCents (wild), 1713.0, 1.0, "10 Hz x 10 ms: 1713 cents flat, the larger of the two (+844 sharp)");
+    const BassChorusParams capped { BassChorus::kMaxDepthMs, 1.0f, 1.0f, 200.0f, BassChorus::kMinDelayMs };
+    approx (chorus::pitchDeviationCents (capped), -1200.0 * std::log2 (1.0 - 2.0 * kPi * 1.0 * 0.003), 1e-3,
+            "depth 10 ms on the 4 ms centre: the swing as the stage holds it, 3 ms");
 }
 
 //==============================================================================
@@ -204,7 +213,7 @@ void amountZero()
     for (double fs : kRates)
     {
         BassChorus s;
-        s.setAmount (0.0f);
+        s.setParams (chorus::paramsForAmount (0.0f, s.params()));
         test::run (s.prepare (fs, 512, 2));
         Buf l = plus (noise ((int) fs, 11u, 0.7f), tone ((int) fs, 61.0, fs, 0.3f)), r = noise ((int) fs, 13u, 0.7f);
         l[100] = std::numeric_limits<float>::quiet_NaN();
@@ -224,12 +233,12 @@ void amountZero()
 
         // From a full chorus down to 0: the mix lands on an exact 0, the stage idles, the dry is bit-exact.
         BassChorus c;
-        c.setAmount (0.8f);
+        c.setParams (chorus::paramsForAmount (0.8f, c.params()));
         test::run (c.prepare (fs, 512, 2));
         Buf a = tone ((int) (0.5 * fs), 997.0, fs, 0.5f), b = a;
         render (c, a, &b, 512);
         ok (! c.isIdle(), "precondition: at 0.8 the stage runs");
-        c.setAmount (0.0f);
+        c.setParams (chorus::paramsForAmount (0.0f, c.params()));
         int landed = -1;
         for (int k = 0; k < (int) (2.0 * fs) / 512 && landed < 0; ++k)
         {
@@ -239,12 +248,36 @@ void amountZero()
             if (c.isIdle())
                 landed = (k + 1) * 512;
         }
-        ok (landed > 0 && landed < (int) (0.6 * fs), "...down to 0 it idles once the mix glide lands, after "
-                                                       + num (1000.0 * landed / fs) + " ms (< 600)");
+        ok (landed > 0 && landed <= (int) (0.025 * fs) + 512, "...down to 0 it idles once the counted mix ramp lands, after "
+                                                       + num (1000.0 * landed / fs) + " ms (the 20 ms ramp and the block it ends in)");
         Buf x = plus (tone (4096, 997.0, fs, 0.5f), noise (4096, 5u, 0.2f)), y = noise (4096, 6u, 0.2f);
         const Buf x0 = x, y0 = y;
         render (c, x, &y, 300);
         ok (bitsEqual (x, x0) && bitsEqual (y, y0), "...and from then on the dry comes back bit for bit, " + khz (fs));
+
+        // A wake is a restart: two stages with different pasts, idled at different grid phases, wake into the
+        // same programme with the same bits.
+        BassChorus wa, wb;
+        for (auto* st : { &wa, &wb })
+        {
+            st->setParams (chorus::paramsForAmount (0.7f, st->params()));
+            test::run (st->prepare (fs, 512, 2));
+        }
+        Buf h1 = noise (7777, 41u, 0.8f), h2 = noise (7777, 42u, 0.8f), g1 = tone (12345, 300.0, fs, 0.9f), g2 = g1;
+        render (wa, h1, &h2, 512);
+        render (wb, g1, &g2, 100);
+        for (auto* st : { &wa, &wb })
+            st->setParams (chorus::paramsForAmount (0.0f, st->params()));
+        Buf q1 (3333, 0.1f), q2 (3333, 0.1f), q3 (5000, 0.1f), q4 (5000, 0.1f);
+        render (wa, q1, &q2, 512);
+        render (wb, q3, &q4, 77);
+        ok (wa.isIdle() && wb.isIdle(), "precondition: both idle, " + khz (fs));
+        Buf w1 = plus (tone (20000, 997.0, fs, 0.5f), noise (20000, 43u, 0.1f)), w2 = noise (20000, 44u, 0.3f), w3 = w1, w4 = w2;
+        for (auto* st : { &wa, &wb })
+            st->setParams (chorus::paramsForAmount (0.6f, st->params()));
+        render (wa, w1, &w2, 512);
+        render (wb, w3, &w4, 512);
+        ok (bitsEqual (w1, w3) && bitsEqual (w2, w4), "a wake from idle is a restart: different pasts, the same bits after, " + khz (fs));
     }
 }
 
@@ -254,7 +287,7 @@ void splitAndSumFlat()
     group ("depth 0: the voice and the band it leaves sum flat, ±0.1 dB 20 Hz – 20 kHz; the voice IS LR4's high half");
     struct Case { double fs; float delayMs; float xover; };
     for (const Case c : { Case { 44100.0, 10.0f, 200.0f }, Case { 48000.0, 8.0f, 200.0f }, Case { 96000.0, 8.0f, 200.0f },
-                          Case { 48000.0, 8.0f, 40.0f },   Case { 48000.0, 8.0f, 500.0f }, Case { 48000.0, 8.0f, 1000.0f } })
+                          Case { 48000.0, 8.0f, 100.0f },   Case { 48000.0, 8.0f, 500.0f }, Case { 48000.0, 8.0f, 1000.0f } })
     {
         BassChorus s;
         s.setParams ({ 0.0f, 1.0f, 0.7f, c.xover, c.delayMs });
@@ -305,7 +338,7 @@ void splitAndSumFlat()
         auto voiceIr = [fs] (float delayMs)
         {
             BassChorus s;
-            s.setParams ({ 0.0f, 1.0f, 0.7f, 40.0f, delayMs });
+            s.setParams ({ 0.0f, 1.0f, 0.7f, BassChorus::kMinCrossoverHz, delayMs });
             test::run (s.prepare (fs, 512, 1));
             Buf warm ((std::size_t) fs, 0.0f);
             render (s, warm, nullptr, 512);
@@ -321,7 +354,7 @@ void splitAndSumFlat()
         const auto whole = voiceIr (8.0f), half = voiceIr ((float) (384.5 / 48.0));   // 384 and 384.5 samples
         const double loss5 = magDb (half, 5000.0, fs) - magDb (whole, 5000.0, fs);
         const double loss10 = magDb (half, 10000.0, fs) - magDb (whole, 10000.0, fs);
-        ok (loss5 > -0.1 && loss5 < 0.01, "at 5 kHz the half-sample read loses " + num (loss5, 3) + " dB (> -0.1; a linear read loses 0.6)");
+        ok (loss5 > -0.1 && loss5 < 0.01, "at 5 kHz the half-sample read loses " + num (loss5, 3) + " dB (> -0.1; a linear read loses 0.47)");
         ok (loss10 > -0.7 && loss10 < 0.01, "at 10 kHz it loses " + num (loss10, 3) + " dB (> -0.7; a linear read loses 2.0)");
     }
 }
@@ -335,7 +368,7 @@ void lowsMonoInPhase()
         BassChorus s;
         BassChorusParams menu;
         menu.crossoverHz = 200.0f;
-        s.setParams (chorus::law::paramsFor (1.0f, menu));
+        s.setParams (chorus::paramsForAmount (1.0f, menu));
         test::run (s.prepare (fs, 512, 2));
         const int N = (int) (3.0 * fs);
         const Buf dry = plus (plus (tone (N, 25.0, fs, 0.4f), tone (N, 50.0, fs, 0.4f, 1.0)), tone (N, 1000.0, fs, 0.3f, 2.0));
@@ -427,9 +460,27 @@ void pitchDeviation()
             syy += dr[k] * dr[k];
         }
         const double corr = sxy / std::sqrt (sxx * syy);
-        ok (corr < -0.99, "the two voices swing in opposite phase (correlation " + num (corr, 4) + "), " + at);
-        approx (s.pitchDeviationCents(), 1200.0 * std::log2 (1.0 + *lmax), 0.02 * s.pitchDeviationCents(),
-                "the published deviation is the measured one (" + num (s.pitchDeviationCents()) + " cents), " + at);
+        // A quarter of the LFO's period later the right voice's deviation is the left one's: the voices are in
+        // QUADRATURE, so their mono sum still swings instead of folding into a standing comb.
+        const auto quarter = (std::size_t) std::lround (1000.0 / (4.0 * (double) c.rate));   // in cycles of the tone
+        double best = 0.0;
+        for (int sign : { -1, 1 })
+        {
+            double qxy = 0.0, qxx = 0.0, qyy = 0.0;
+            for (std::size_t k = quarter; k + quarter < std::min (dl.size(), dr.size()); ++k)
+            {
+                const double a = dl[k], b = dr[sign > 0 ? k + quarter : k - quarter];
+                qxy += a * b;
+                qxx += a * a;
+                qyy += b * b;
+            }
+            best = std::max (best, qxy / std::sqrt (qxx * qyy));
+        }
+        ok (std::fabs (corr) < 0.1 && best > 0.98, "the two voices swing in quadrature (correlation " + num (corr, 3)
+                                                     + ", " + num (best, 4) + " a quarter period apart), " + at);
+        const double cents = std::max (1200.0 * std::log2 (1.0 + *lmax), -1200.0 * std::log2 (1.0 + *lmin));
+        approx (chorus::pitchDeviationCents (p), cents, 0.02 * cents,
+                "the published deviation is the measured flat excursion (" + num (cents) + " cents), " + at);
     }
 }
 
@@ -460,7 +511,7 @@ void noClicks()
         const double f = 997.0;
         const float  A = 0.5f;
         BassChorus s;
-        s.setAmount (0.0f);
+        s.setParams (chorus::paramsForAmount (0.0f, s.params()));
         test::run (s.prepare (fs, 64, 2));
 
         struct Ev { double at; int what; float v; };   // what: 0 amount, 1 rate, 2 crossover, 3 centre, 4 depth
@@ -478,7 +529,7 @@ void noClicks()
                 const Ev& ev = evs[e++];
                 switch (ev.what)
                 {
-                    case 0: s.setAmount (ev.v); break;
+                    case 0: s.setParams (chorus::paramsForAmount (ev.v, s.params())); break;
                     case 1: s.setRateHz (ev.v); break;
                     case 2: s.setCrossoverHz (ev.v); break;
                     case 3: s.setDelayMs (ev.v); break;
@@ -577,7 +628,7 @@ void resetAndStops()
         BassChorus A, B, C;
         for (auto* s : { &A, &B, &C })
         {
-            s->setAmount (0.6f);
+            s->setParams (chorus::paramsForAmount (0.6f, s->params()));
             test::run (s->prepare (fs, 512, 2));
             Buf l = tone (9600, 997.0, fs, 0.5f), r = l;
             render (*s, l, &r, 512);
@@ -597,14 +648,19 @@ void resetAndStops()
         ok (rest, "precondition: drained to exact rest");
         for (auto* s : { &A, &B, &C })
         {
-            s->setAmount (0.9f);   // the glides are in flight through the gap
+            s->setParams (chorus::paramsForAmount (0.9f, s->params()));   // the glides are in flight through the gap
             s->setRateHz (3.0f);
             s->setCrossoverHz (400.0f);
         }
+        // A pauses for `gap`; B hears gap - 1 samples of silence and then pauses for one, so its lanes stop as A's
+        // do (each lane's line and door are its own, dropped at the stop, law 11a) and only the SHARED clocks can
+        // tell the two apart — which a pause must move exactly as silence does (law 11c).
         test::run (A.process (nullptr, 0, gap));
         Buf zl ((std::size_t) gap, 0.0f), zr = zl;
         float* zio[2] = { zl.data(), zr.data() };
-        test::run (B.process (zio, 2, gap));
+        if (gap > 1)
+            test::run (B.process (zio, 2, gap - 1));
+        test::run (B.process (nullptr, 0, 1));
         std::vector<Buf> outs;
         for (auto* s : { &A, &B, &C })
         {
@@ -630,8 +686,8 @@ void poisonAndLaw8()
     const double fs = 48000.0;
     {
         BassChorus a, b;
-        a.setAmount (1.0f);
-        b.setAmount (1.0f);
+        a.setParams (chorus::paramsForAmount (1.0f, a.params()));
+        b.setParams (chorus::paramsForAmount (1.0f, b.params()));
         test::run (a.prepare (fs, 512, 2));
         test::run (b.prepare (fs, 512, 2));
         Buf l = tone (24000, 997.0, fs, 0.5f), r = l;
@@ -659,7 +715,7 @@ void poisonAndLaw8()
     }
     {
         BassChorus s;
-        s.setAmount (1.0f);
+        s.setParams (chorus::paramsForAmount (1.0f, s.params()));
         test::run (s.prepare (fs, 512, 1));
         Buf l = tone (4096, 997.0, fs, 0.5f);
         render (s, l, nullptr, 512);
@@ -668,7 +724,12 @@ void poisonAndLaw8()
             big[i] = (i & 1u) ? -3.0e38f : 3.0e38f;
         render (s, big, nullptr, 512);
         Buf after = tone (48000, 997.0, fs, 0.5f);
+        const Buf afterDry = after;
         render (s, after, nullptr, 512);
+        bool noNaN = true;
+        for (std::size_t i = 0; i < after.size(); ++i)
+            noNaN = noNaN && ! (std::isfinite (afterDry[i]) && std::isnan (after[i]));
+        ok (noNaN, "while the line replays the +-3e38 burst, no finite dry sample comes out as NaN (overflow is +-inf at worst)");
         // The line still replays what the burst wrote until the head has passed it; after that, nothing is left.
         const auto from = (std::size_t) (BassChorus::tailSeconds() * fs) + 512u;
         bool finite = true;
@@ -677,11 +738,11 @@ void poisonAndLaw8()
         ok (finite, "after a block of +-3e38 (the filters overflow), every sample past the line's reach is finite: no state was poisoned");
     }
 
-    group ("law 8: a minute of silence after a chorus leaves no subnormal anywhere, and the silence is exact");
+    group ("law 8: a minute of silence after a chorus leaves no subnormal in the lines or the glides, and the silence is exact");
     for (double fs8 : kRates)
     {
         BassChorus s;
-        s.setAmount (1.0f);
+        s.setParams (chorus::paramsForAmount (1.0f, s.params()));
         test::run (s.prepare (fs8, 512, 2));
         Buf l = plus (tone ((int) (0.5 * fs8), 997.0, fs8, 0.5f), tone ((int) (0.5 * fs8), 41.2, fs8, 0.5f)), r = l;
         render (s, l, &r, 512);
@@ -702,6 +763,156 @@ void poisonAndLaw8()
     }
 }
 
+
+//==============================================================================
+// Review round 1.
+
+void depthCapCrossing()
+{
+    group ("the depth cap: a centre gliding into and out of the swing's limit bends the head with no pitch step");
+    for (double fs : { 48000.0, 96000.0 })
+    {
+        const double f = 997.0;
+        const float  A = 0.5f;
+        const double w = 2.0 * kPi * f / fs;
+        // Dry plus a voice up to 30 % sharp: 0.5 Hz x 10 ms on the LFO, plus a centre gliding ~21 ms at up to
+        // ~0.1 sample per sample, doubled while the cap makes the swing follow the centre.
+        const double bound = 1.25 * (double) A * (std::pow (2.0 * std::sin (0.5 * w), 3.0) + std::pow (2.0 * std::sin (0.5 * w * 1.3), 3.0));
+        double worst = 0.0;
+        for (int trial = 0; trial < 8; ++trial)   // the crossings land at eight different LFO phases
+        {
+            BassChorus s;
+            s.setParams ({ BassChorus::kMaxDepthMs, 1.0f, 0.5f, 200.0f, BassChorus::kMaxDelayMs });
+            test::run (s.prepare (fs, 64, 1));
+            const int down = ((int) ((0.3 + 0.13 * trial) * fs) / 64) * 64, up = down + ((int) (0.8 * fs) / 64) * 64;
+            const int N = up + (int) (0.8 * fs);
+            Buf y = tone (N, f, fs, A);
+            for (int pos = 0; pos < N; pos += 64)
+            {
+                if (pos == down) s.setDelayMs (BassChorus::kMinDelayMs);   // into the cap
+                if (pos == up)   s.setDelayMs (BassChorus::kMaxDelayMs);   // and out of it
+                float* io[1] = { y.data() + pos };
+                test::run (s.process (io, 1, std::min (64, N - pos)));
+            }
+            worst = std::max (worst, maxThirdDiff (y, down));
+        }
+        ok (worst <= bound, "centre 25 -> min -> 25 ms with depth 10 ms: largest third difference " + num (worst, 3)
+                            + " <= the smooth bound " + num (bound, 3) + ", " + khz (fs));
+    }
+}
+
+void returningLane()
+{
+    group ("a lane that comes back after a narrow stretch or a gap fades its voice in: no step 10 ms later");
+    const double fs = 48000.0, f = 1000.0;
+    const double steady = 0.5 * 2.0 * std::sin (kPi * f / fs);   // the steady voice's own largest step
+    for (int how = 0; how < 2; ++how)
+    {
+        BassChorus s;
+        s.setParams ({ 0.0f, 1.0f, 0.7f, 200.0f, 10.0f });
+        test::run (s.prepare (fs, 64, 2));
+        Buf l = tone (14400, f, fs, 0.5f), r = l;
+        render (s, l, &r, 64);
+        if (how == 0)
+        {
+            Buf m = tone (9600, f, fs, 0.5f);
+            render (s, m, nullptr, 64);                  // the right lane stops for 0.2 s
+        }
+        else
+            test::run (s.process (nullptr, 0, 9600));    // both stop: a 0.2 s gap
+
+        // The right lane comes back on a cosine crest (its first sample is 0.5). After mono calls the left one
+        // never stopped and carries on its tone without a seam (24000 samples are 500 whole cycles); after a gap
+        // it comes back on the crest too.
+        Buf rr = tone (4800, f, fs, 0.5f, 0.5 * kPi), rl = how == 0 ? tone (4800, f, fs, 0.5f) : rr;
+        const Buf dryL = rl, dryR = rr;
+        render (s, rl, &rr, 64);
+        double worstL = 0.0, worstR = 0.0;
+        for (std::size_t i = 1; i < dryR.size(); ++i)
+        {
+            const auto step = [i] (const Buf& y, const Buf& d)
+            { return std::fabs (((double) y[i] - d[i]) - ((double) y[i - 1] - d[i - 1])); };
+            worstL = std::max (worstL, step (rl, dryL));
+            worstR = std::max (worstR, step (rr, dryR));
+        }
+        const std::string what = how == 0 ? "after mono calls" : "after a zero-width gap";
+        ok (worstR <= 1.05 * steady, "the returning right voice's largest step " + num (worstR, 3) + " <= its steady "
+                                     + num (steady, 3) + " x 1.05, " + what);
+        ok (worstL <= 1.05 * steady, "the left voice's largest step " + num (worstL, 3) + ", " + what);
+    }
+}
+
+void tailBound()
+{
+    group ("tailSeconds(): the head's reach plus the high pass's ring, down to -100 dB of the input's peak");
+    for (double fs : kRates)
+        for (int glide = 0; glide < 2; ++glide)
+        {
+            const float lo = BassChorus::kMinCrossoverHz;
+            BassChorus s;
+            s.setParams ({ BassChorus::kMaxDepthMs, 1.0f, 0.5f, glide != 0 ? 1000.0f : lo, BassChorus::kMaxDelayMs });
+            test::run (s.prepare (fs, 512, 2));
+            const int N = (int) fs;
+            Buf l = plus (tone (N, (double) lo, fs, 0.5f), noise (N, 31u, 0.4f)), r = plus (tone (N, (double) lo, fs, 0.5f, 1.0), noise (N, 32u, 0.4f));
+            double peak = 0.0;
+            for (std::size_t i = 0; i < l.size(); ++i)
+                peak = std::max ({ peak, (double) std::fabs (l[i]), (double) std::fabs (r[i]) });
+            render (s, l, &r, 512);
+            if (glide != 0)
+                s.setCrossoverHz (lo);   // the corner glides down as the input stops
+            const int T = (int) std::ceil ((double) BassChorus::tailSeconds() * fs);
+            Buf zl ((std::size_t) (T + 8192), 0.0f), zr = zl;
+            render (s, zl, &zr, 512);
+            double after = 0.0;
+            for (std::size_t i = (std::size_t) T; i < zl.size(); ++i)
+                after = std::max ({ after, (double) std::fabs (zl[i]), (double) std::fabs (zr[i]) });
+            ok (after <= 1.0e-5 * peak, "after " + num (1000.0 * BassChorus::tailSeconds(), 3) + " ms of silence the voice is "
+                                        + num (20.0 * std::log10 (std::max (after, 1e-30) / peak), 3) + " dB re the input's peak (<= -100), "
+                                        + (glide != 0 ? "crossover gliding 1000 -> " : "crossover ") + num (lo) + " Hz, " + khz (fs));
+        }
+}
+
+void lowBandSide()
+{
+    group ("the low band's Side energy, sidebands included, at the menu's extremes (amount 1): attenuated, not excluded");
+    const double fs = 48000.0;
+    struct Case { float xover, rate, centre; };
+    for (const Case c : { Case { BassChorus::kMinCrossoverHz, BassChorus::kMaxRateHz, BassChorus::kMinDelayMs },
+                          Case { BassChorus::kMinCrossoverHz, BassChorus::kMinRateHz, BassChorus::kMaxDelayMs },
+                          Case { BassChorus::kMinCrossoverHz, 0.7f, 8.0f }, Case { 200.0f, BassChorus::kMaxRateHz, 8.0f } })
+    {
+        BassChorus s;
+        s.setParams ({ 3.0f, 1.0f, c.rate, c.xover, c.centre });
+        test::run (s.prepare (fs, 512, 2));
+        const int N = (int) (4.0 * fs);
+        const Buf dry = plus (plus (tone (N, 30.87, fs, 0.4f), tone (N, 41.2, fs, 0.4f, 1.0)), tone (N, 2000.0, fs, 0.2f, 2.0));
+        Buf l = dry, r = dry;
+        render (s, l, &r, 512);
+        // The protected band: an octave under the crossover, through LR4's low half — every sideband the swing
+        // puts there is counted, not only the carrier.
+        eq::DeterministicCrossover2 bs, bd;
+        bs.prepare (fs, 1);
+        bd.prepare (fs, 1);
+        bs.setFrequency (0.5f * c.xover);
+        bd.setFrequency (0.5f * c.xover);
+        double es = 0.0, ed = 0.0;
+        for (int i = 0; i < N; ++i)
+        {
+            float sl = 0.0f, sh = 0.0f, dl = 0.0f, dh = 0.0f;
+            bs.processSample (0, l[(std::size_t) i] - r[(std::size_t) i], sl, sh);
+            bd.processSample (0, dry[(std::size_t) i], dl, dh);
+            if (i >= (int) fs)
+            {
+                es += (double) sl * sl;
+                ed += (double) dl * dl;
+            }
+        }
+        const double db = 10.0 * std::log10 (es / ed);
+        ok (db <= -30.0, "Side under " + num (0.5 * c.xover) + " Hz (B0 + E1 in, crossover " + num (c.xover) + " Hz, " + num (c.rate)
+                         + " Hz, centre " + num (c.centre) + " ms): " + num (db, 3) + " dB re the dry's band (<= -30)");
+    }
+}
+
 //==============================================================================
 void noAllocation()
 {
@@ -711,15 +922,15 @@ void noAllocation()
     Buf l (1024, 0.25f), r (1024, -0.25f);
     float* lr[2] = { l.data(), r.data() };
     const long long before = alloc::count.load();
-    s.setAmount (0.7f);
+    s.setParams (chorus::paramsForAmount (0.7f, s.params()));
     s.setParams ({ 3.0f, 0.9f, 2.0f, 300.0f, 12.0f });
     test::run (s.process (lr, 2, 1024));
     test::run (s.process (lr, 1, 1024));
     test::run (s.process (nullptr, 0, 1024));
-    s.setAmount (0.0f);
+    s.setParams (chorus::paramsForAmount (0.0f, s.params()));
     for (int k = 0; k < 200; ++k)
         test::run (s.process (lr, 2, 1024));   // down to idle
-    s.setAmount (0.5f);
+    s.setParams (chorus::paramsForAmount (0.5f, s.params()));
     test::run (s.process (lr, 2, 1024));       // and the wake
     s.reset();
     s.reset();
@@ -741,6 +952,10 @@ int main()
     reslicing();
     resetAndStops();
     poisonAndLaw8();
+    depthCapCrossing();
+    returningLane();
+    tailBound();
+    lowBandSide();
     noAllocation();
     return felitronics::test::report();
 }

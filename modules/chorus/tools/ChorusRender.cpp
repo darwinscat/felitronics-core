@@ -11,6 +11,7 @@
 // long held notes, 24 s) and written as `chorus-dry.wav`. Outputs: `chorus-amount-025.wav` … `-100.wav` at the
 // default menu (0.7 Hz, 200 Hz crossover), `chorus-amount-075-xover-500.wav`, and README.txt.
 #include <felitronics/chorus/BassChorus.h>
+#include <felitronics/chorus/ChorusLaw.h>
 #include <felitronics/io/Wav.h>
 
 #include <algorithm>
@@ -171,7 +172,7 @@ double peakDb (const Planes& p)
 Planes runChorus (const Planes& in, double fs, float amount, felitronics::chorus::BassChorusParams menu)
 {
     felitronics::chorus::BassChorus s;
-    s.setParams (felitronics::chorus::law::paramsFor (amount, menu));
+    s.setParams (felitronics::chorus::paramsForAmount (amount, menu));
     if (! s.prepare (fs, 512, 2))
         return {};
     const std::size_t n = in[0].size() + (std::size_t) (0.1 * fs);
@@ -221,8 +222,9 @@ int main (int argc, char** argv)
         "Bass chorus (felitronics::chorus::BassChorus) — listening renders, 24-bit stereo WAV.\n"
         "One slider, AMOUNT 0..1: depth 0..3 ms of head swing and the voice's level 0..1 (1 = the dry's level)\n"
         "rise together. Menu at its defaults unless named: rate 0.7 Hz, crossover 200 Hz, centre delay 8 ms.\n"
-        "Below the crossover nothing is voiced: the lows are the dry, mono and in phase. The two sides carry\n"
-        "two voices whose LFOs swing in opposite phase.\n\n";
+        "Below the crossover the voice falls at 24 dB/oct (-24.6 dB an octave down), so the lows stay the dry's,\n"
+        "centred and in phase: attenuated in the voice, not excluded. The two sides carry\n"
+        "two voices whose LFOs swing in quadrature (a quarter period apart), so a mono sum still swings.\n\n";
 
     struct Input { std::string stem; Planes ch; double fs; };
     std::vector<Input> inputs;
@@ -261,13 +263,23 @@ int main (int argc, char** argv)
         {
             char tag[16];
             std::snprintf (tag, sizeof tag, "%03d", (int) std::lround (amount * 100.0f));
+            const auto p = felitronics::chorus::paramsForAmount (amount, menu);
             char what[160];
             std::snprintf (what, sizeof what, "AFTER: amount %.2f (depth %.2f ms, mix %.2f, peak deviation %.1f cents).",
-                           (double) amount, (double) felitronics::chorus::law::depthMsFor (amount),
-                           (double) felitronics::chorus::law::mixFor (amount),
-                           1200.0 * std::log2 (1.0 + 2.0 * kPi * 0.7 * felitronics::chorus::law::depthMsFor (amount) * 0.001));
-            allOk &= write (dir + "/chorus" + in.stem + "-amount-" + tag + ".wav", runChorus (dry, in.fs, amount, menu), in.fs,
-                            readme, what);
+                           (double) amount, (double) p.depthMs, (double) p.mix,
+                           (double) felitronics::chorus::pitchDeviationCents (p));
+            const Planes out = runChorus (dry, in.fs, amount, menu);
+            allOk &= write (dir + "/chorus" + in.stem + "-amount-" + tag + ".wav", out, in.fs, readme, what);
+            if (amount > 0.99f && out.size() == 2)
+            {
+                // What a mono PA or a summed DI hears: (L + R) / 2 on both sides.
+                Planes mono = out;
+                for (std::size_t i = 0; i < mono[0].size(); ++i)
+                    mono[0][i] = mono[1][i] = 0.5 * (out[0][i] + out[1][i]);
+                allOk &= write (dir + "/chorus" + in.stem + "-amount-100-mono.wav", mono, in.fs, readme,
+                                "AFTER: amount 1.00 folded to mono, (L + R) / 2 on both sides — the quadrature voices still"
+                                " swing in the sum.");
+            }
         }
         menu.crossoverHz = 500.0f;
         allOk &= write (dir + "/chorus" + in.stem + "-amount-075-xover-500.wav", runChorus (dry, in.fs, 0.75f, menu), in.fs, readme,
