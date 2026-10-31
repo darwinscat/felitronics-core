@@ -11,6 +11,10 @@ target_link_libraries(app PRIVATE felitronics::octave)
 
 ## `Octaver`
 
+**Range: fundamentals from 25 Hz to about 400 Hz.** Below 25 Hz the period comes too close to the 1/22 s loss
+deadline for acquisition to be promised (a smooth 22.2 Hz note acquires only after 0.2 … 0.9 s, by polarity); from
+25 Hz smooth harmonic notes acquire in both polarities within 2.5 cycles. Drop A (27.5) and low B (30.9) are inside.
+
 The analog octaver of the OC-2 family, not a pitch shifter: it follows the string's zero crossings and divides
 them, so nothing waits for a window. The dry is never touched: each output sample is its input sample plus the sub,
 the same sub on every channel (`latencySamples() == 0`). There is no dry level — the amp has its own mix.
@@ -22,8 +26,9 @@ the same sub on every channel (`latencySamples() == 0`). There is no dry level �
   falls since the loss, each one fresh twice over: the band's peak over the last half to whole longest period stands
   at the gate's opening level (so a note whose follower ripples across that level still acquires, and a loud note's
   decaying follower cannot hand the acquisition to the hum under it), and the raw input itself has just swung that
-  way, past a quarter of its own peak (so the band filters' ringing after a source has stopped cannot finish the
-  proof). One cycle of anything, at any bass pitch, phase or ramp, has at most two swings one way and one the other,
+  way, past a quarter of its own recent peak (so the band filters' ringing after a source has stopped cannot finish
+  the proof). That peak forgets in about 50 ms, so a much quieter note after a loud one, or a note after a DC pulse,
+  is acquired too (a 40 dB drop: about 100 ms after the switch, the loud note's loss included). One cycle of anything, at any bass pitch, phase or ramp, has at most two swings one way and one the other,
   and makes no sub. The comparator's floor rides 20 dB under the band's own level.
 - **The note's life.** The period is the longest of the last three edge intervals, and it sets deadlines only once
   two intervals in a row agree within a quarter (a note's first interval can be a partial attack cycle). An edge a

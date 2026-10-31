@@ -39,7 +39,8 @@ namespace felitronics::octave
 // fresh twice over: the band's peak over the last half to whole longest period stands at the gate's opening level
 // (not the follower at the instant of the crossing — its ripple kept a steady note at 0.84 … 1.28 times the level
 // from ever acquiring, and its tail after a loud note let the hum under it in), and the raw input itself has just
-// swung that way — past a quarter of its own peak since the loss, DC taken off at 5 Hz — since the last counted
+// swung that way — past a quarter of its own recent peak (which forgets in ~50 ms: a peak held since the loss kept a
+// quieter note after a loud one, or any note after a DC pulse, from ever acquiring), DC taken off at 5 Hz — since the last counted
 // crossing of the other direction (filter ringing after a source has stopped is not the source swinging). What
 // plays under the gate, a DI's hum included, can neither prove a note nor set its period; the comparator's floor
 // rides 20 dB under the band's own level, so hum under a sounding note never squares up at all.
@@ -84,6 +85,10 @@ namespace felitronics::octave
 // 50 ms hold — longer than the lowest note's period, so a follower's ripple on a decaying low B cannot chatter it)
 // AND the note is locked and not dying. Between notes the sub is an exact zero. A gate down at −90 dBFS opens on a
 // DI's own noise floor and the tracker follows the hiss — the range stops at −90 for that reason; −50 is the default.
+//
+// RANGE. Fundamentals from 25 Hz (below drop A, 27.5) to about 400 Hz. Below 25 Hz a period comes too close to the
+// 1/22 s loss deadline for acquisition to be promised: a smooth 22.2 Hz note acquires, but only after 0.2 … 0.9 s
+// depending on its polarity. From 25 Hz smooth harmonic notes acquire in both polarities within 2.5 cycles (tested).
 //
 // MONOPHONIC. A chord has no one fundamental: the comparator follows whatever its sum crosses — usually the lowest
 // note when it is the loudest in the band, otherwise the beat pattern between the notes — and the sub comes out as
@@ -194,12 +199,14 @@ public:
     static constexpr double kTiltHz     = 50.0;
     static constexpr float  kHysteresis = 0.88f;
     static constexpr double kThresholdReleaseSeconds = 0.040;
-    static constexpr double kMinTrackHz = 22.0;    // 1/22 s between edges: lost, whatever the period was
+    static constexpr double kMinTrackHz = 22.0;    // 1/22 s between edges: lost, whatever the period was — so the
+                                                   // SUPPORTED range starts at 25 Hz (see RANGE)
     static constexpr double kMaxTrackHz = 480.0;   // an edge sooner than 1/480 s after the last: not a fundamental
     static constexpr float  kInputLimit = 4.0f;    // what the tracker reads: +12 dBFS; beyond is clamped
     static constexpr float  kFloorUnderBand = 0.1f; // the comparator's floor rides 20 dB under the band's own level
     static constexpr double kSourceHpHz     = 5.0;  // the raw input's own swing is read with its DC taken off here
-    static constexpr float  kSourceSwing    = 0.25f; // ...and must pass a quarter of its peak since the loss
+    static constexpr float  kSourceSwing    = 0.25f; // ...and must pass a quarter of its recent peak
+    static constexpr double kSourcePeakSeconds = 0.050; // that peak forgets with time: longer than the 5 Hz tail's 32 ms
 
     // The note's life, in its own periods.
     static constexpr int kDyingQuarters = 5;       // an edge 5/4 of a period late: the note is dying, the sub fades
@@ -248,6 +255,7 @@ public:
         ampCoeff_   = (float) (1.0 - detail::detExp (-1.0 / (kLevelGlideSeconds * fs_)));
         lostCoeff_  = (float) (1.0 - detail::detExp (-1.0 / (kLostReleaseSeconds * fs_)));
         sourceCoeff_ = (float) (1.0 - detail::detExp (-2.0 * core::kPi * kSourceHpHz / fs_));
+        sourceRel_   = (float) detail::detExp (-1.0 / (kSourcePeakSeconds * fs_));
         minPeriod_  = std::max (1, (int) std::floor (fs_ / kMaxTrackHz));
         maxPeriod_  = (int) std::ceil (fs_ / kMinTrackHz);
         freshLen_   = std::max (1, (maxPeriod_ + 1) / 2);
@@ -508,7 +516,7 @@ private:
             && (plusZero (cycleMax_) || cycleMax_ >= 1.0e-15f) && plusZero (amp_)
             && plusZero (ampTarget_) && plusZero (gateEnv_.stateWord())
             && plusZero (source_) && plusZero (freshNow_) && plusZero (freshBefore_)
-            && (plusZero (sourcePeak_) || sourcePeak_ >= 1.0e-15f)
+            && plusZero (sourcePeak_)
             && ! gateOpen_ && gateHold_ == 0 && lockPos_ == 0 && voicesQuiet_ && edgesSinceLoss_ == 0
             && sinceEdge_ > maxPeriod_
             && hpBand_.isAtRest() && lpBand_.isAtRest() && tone1_.isAtRest() && tone2_.isAtRest()
@@ -570,7 +578,7 @@ private:
         // quarter of its peak every cycle.
         source_ += sourceCoeff_ * (xin - source_);
         const float xs = xin - source_, axs = std::fabs (xs);
-        sourcePeak_ = axs > sourcePeak_ ? axs : sourcePeak_;
+        sourcePeak_ = axs > sourcePeak_ ? axs : sourcePeak_ * sourceRel_;   // forgets an old note in ~50 ms
         const float swing = std::max (gateOff_, kSourceSwing * sourcePeak_);
         if (xs > swing && sourceSide_ <= 0)       { sourceSide_ =  1; sourceRose_ = true; }
         else if (xs < -swing && sourceSide_ >= 0) { sourceSide_ = -1; sourceFell_ = true; }
@@ -793,7 +801,7 @@ private:
     float cycleMax_ = 0.0f, amp_ = 0.0f, ampTarget_ = 0.0f;
     float q1_ = -1.0f, q2_ = -1.0f;
     bool  high_ = false, gateOpen_ = false, voicesQuiet_ = true, sawLow_ = false;
-    float source_ = 0.0f, sourcePeak_ = 0.0f, freshNow_ = 0.0f, freshBefore_ = 0.0f, sourceCoeff_ = 0.0f;
+    float source_ = 0.0f, sourcePeak_ = 0.0f, freshNow_ = 0.0f, freshBefore_ = 0.0f, sourceCoeff_ = 0.0f, sourceRel_ = 0.0f;
     int   sourceSide_ = 0, freshPos_ = 0, freshLen_ = 1;
     bool  sourceRose_ = false, sourceFell_ = false;
     int   intervals_[3] { 0, 0, 0 };   // the last three edge intervals, newest first (0: none yet)

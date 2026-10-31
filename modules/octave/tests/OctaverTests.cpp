@@ -726,6 +726,67 @@ void humUnderTheGate()
     }
 }
 
+/** A note much quieter than the one before it — played at once, its phase restarting — and a quiet note after a DC
+    pulse: the source's own peak must forget the old signal (13d1d3f held it for ever: 0.004 after a 0.5 low B, or
+    0.01 after a +0.5 DC pulse, never acquired — the gate open, the sub exactly zero for ten seconds). */
+void quietAfterLoud()
+{
+    group ("a much quieter note after a loud one (and after a DC pulse) is acquired — the source's peak forgets");
+    for (double fs : { 44100.0, 48000.0, 96000.0 })
+    {
+        for (double q : { 0.004, 0.05, 0.005 })   // codex's case, 20 dB and 40 dB under
+        {
+            Buf x (samples (fs, 3.0), 0.0f);
+            const std::size_t s0 = samples (fs, 0.5);
+            for (std::size_t i = 0; i < s0; ++i) x[i] = (float) (0.5 * std::sin (2.0 * kPi * kLowB * (double) i / fs));
+            fadeIn (x, fs, 0.002);
+            for (std::size_t i = s0; i < x.size(); ++i) x[i] = (float) (q * std::sin (2.0 * kPi * kLowE * (double) (i - s0) / fs));
+            const Buf y = subOf (fs, x, levels (1.0f, 0.0f));
+            const double steady = peakOf (y, fs, 2.0, 3.0);
+            std::size_t back = samples (fs, 0.5 + 1.25 / kLowB + 0.006);   // past the loud note's own fade
+            while (back < y.size() && y[back] == 0.0f) ++back;
+            const double ms = (double) (back - s0) / fs * 1000.0;
+            ok (steady > 0.5 * q && ms < 150.0 && badHalfPeriods (y, fs, 1.0, 3.0, fs / kLowE, 0.05) == 0,
+                fmt ("%.0f Hz: a %.3f low E right after a 0.5 low B ", fs, q) + fmt ("has its sub %.1f ms after the switch, and tracks", ms));
+        }
+        Buf d (samples (fs, 2.0), 0.0f);
+        for (std::size_t i = samples (fs, 0.1); i < samples (fs, 0.12); ++i) d[i] = 0.5f;
+        for (std::size_t i = samples (fs, 0.3); i < d.size(); ++i) d[i] = (float) (0.01 * std::sin (2.0 * kPi * kLowE * (double) (i - samples (fs, 0.3)) / fs));
+        const Buf y = subOf (fs, d, levels (1.0f, 0.0f));
+        std::size_t back = samples (fs, 0.3);
+        while (back < y.size() && y[back] == 0.0f) ++back;
+        ok ((double) (back - samples (fs, 0.3)) / fs < 0.1 && badHalfPeriods (y, fs, 0.6, 2.0, fs / kLowE, 0.05) == 0,
+            fmt ("%.0f Hz: a 0.01 low E after a +0.5 DC pulse has its sub ", fs) + fmt ("%.1f ms in, and tracks", (double) (back - samples (fs, 0.3)) / fs * 1000.0));
+    }
+}
+
+/** The supported range starts at 25 Hz: smooth, harmonic notes (four partials, a band-limited saw) at 25, 27.5 (drop
+    A) and 30.9 Hz (low B) acquire in BOTH polarities within two and a half cycles. (Below it the 1/22 s deadline is too
+    close to the period: codex's 22.2 Hz saw acquires, but only after 0.2 … 0.9 s, depending on its polarity.) */
+void supportedRange()
+{
+    group ("the supported range starts at 25 Hz: smooth notes at 25 / 27.5 / 30.9 Hz acquire in both polarities");
+    for (double fs : { 44100.0, 48000.0, 96000.0 })
+        for (double f : { 25.0, 27.5, kLowB })
+            for (double sign : { 1.0, -1.0 })
+            {
+                Buf x (samples (fs, 1.5));
+                for (std::size_t i = 0; i < x.size(); ++i)
+                {
+                    double v = 0.0;
+                    for (int k = 1; k <= 4; ++k) v += std::sin (2.0 * kPi * k * f * (double) i / fs) / k;
+                    x[i] = (float) (sign * 0.6 / kPi * v);
+                }
+                fadeIn (x, fs, 0.002);
+                const Buf y = subOf (fs, x, levels (1.0f, 0.0f));
+                std::size_t first = 0;
+                while (first < y.size() && y[first] == 0.0f) ++first;
+                const double cycles = (double) first * f / fs;
+                ok (cycles <= 2.5 && badHalfPeriods (y, fs, 0.4, 1.5, fs / f, 0.05) == 0,
+                    fmt ("%.0f Hz, %.1f Hz, ", fs, f) + fmt ("polarity %+.0f: the sub starts %.2f cycles in and tracks", sign, cycles));
+            }
+}
+
 /** A sustained note right at the gate, whose follower ripples across the opening level (0.84 … 1.28 times it): it is
     acquired from its fresh level over a period, not at the instant of each crossing (0faf723 never acquired it: two
     seconds of exact zero, every rate, both polarities). */
@@ -1288,6 +1349,8 @@ int main()
     loneClick();
     humUnderTheGate();
     nearTheGate();
+    quietAfterLoud();
+    supportedRange();
     silenceBetweenNotes();
     latency();
     subHighPass();
