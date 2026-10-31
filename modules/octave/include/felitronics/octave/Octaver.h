@@ -90,7 +90,7 @@ namespace felitronics::octave
 // too close to the 1/22 s loss deadline for acquisition to be promised, and one polarity may not acquire at all: a
 // smooth 22.2 Hz note acquires in one polarity after 0.2 s and never in the other (ten seconds, every rate); a
 // bridge-pickup pluck double-triggers once at 25.0 and 25.25 Hz and is clean from 25.5. Inside the range smooth
-// harmonic notes acquire in both polarities and every phase within 1.7 cycles at 26 … 31 Hz, rising to 2.0 at 98 Hz
+// harmonic notes acquire in both polarities and every phase within 1.7 cycles at 26 … 31 Hz, rising to 2.1 at 98 Hz
 // and 2.7 at 400 Hz (measured worst; the tests bound 1.8 / 2.2 / 2.8).
 //
 // MONOPHONIC. A chord has no one fundamental: the comparator follows whatever its sum crosses — usually the lowest
