@@ -272,16 +272,18 @@ the predelay or the chorus line, and once exact zero is reached it holds).
 
 ### Added with the module: `chorus::BassChorus` — the eq flush on the grid, the line flushed per write
 
-**Recursive state.** The voice's high pass — two `eq::Svf` sections carried as lanes of one Svf — and the five
-parameter glides (depth, centre delay and mix as two one-poles in cascade, rate and crossover as one; mix and depth
-glide to zero). The line is NOT recursive: it holds the high pass's output and is only read back, never fed back.
+**Recursive state.** The voice's high pass — two `eq::Svf` sections carried as lanes of one Svf — and the parameter
+glides: depth and centre delay as two one-poles in cascade, rate and crossover as one (depth may glide to zero).
+The mix is a counted linear ramp, and the line is NOT recursive: it holds the high pass's output and is only read
+back, never fed back.
 **Verdict: flushed.** The Svf keeps the eq module's 1e-15 flush on `core::StateGrid` (audio time, 64 samples) and
 heals poison at the end of every call; what is written into the line goes through `core::flushDenormal`, so a
 stored value is zero or ≥ 1e-15. The glides land (item 6): each stage is put on its target once its residual is
-under a landing far below audibility (mix 1e-15, the heads 1e-9 of a sample, rate 1e-12 Hz, crossover 1e-6 Hz) or
-an update no longer moves it — so the mix reaches an exact zero, which is what lets the stage idle at amount 0.
+under a landing far below audibility (the heads 1e-9 of a sample, rate 1e-12 Hz, crossover 1e-3 Hz) or an update
+no longer moves it; the mix ramp is counted and lands on an exact zero, which is what lets the stage idle.
 Tested in `modules/chorus/tests/BassChorusTests.cpp` (a minute of silence after a full chorus at 44.1, 48 and
-96 kHz: no subnormal in the lines or any glide at any block, and the last second is exact zeros).
+96 kHz: no subnormal in the lines or the glides at any block, and the last second is exact zeros). The Svf's
+integrators are not visible to that test; they stand on the eq module's own flush contract.
 
 ## How these are tested
 
