@@ -181,6 +181,18 @@ public:
         return true;
     }
 
+    // Put column `c` where a constant input `u` held for ever leaves it: band-pass +0, low-pass `u`, whatever the
+    // filter type (the state of the trapezoidal integrators at DC is (0, u)). An owner that starts a voice mid-stream
+    // primes it to the value the voice would have been holding, so its first output is the response to the step
+    // that actually happens and not to a jump from silence.
+    void primeDc (int c, float u) noexcept
+    {
+        if (c < 0 || c >= ch)
+            return;
+        ic1[c] = 0.0f;
+        ic2[c] = u;
+    }
+
     // The POISON half alone, for an owner that runs it at the end of every call while the denormal half
     // rides the audio-time grid — see `eq::Biquad::healPoison()` for why the two halves have different
     // clocks. On a stream whose state stays finite this cannot change a bit, so it costs the grid's
