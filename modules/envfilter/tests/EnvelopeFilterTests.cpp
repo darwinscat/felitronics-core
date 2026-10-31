@@ -2,10 +2,12 @@
 // Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-core — see LICENSE.
 
 // envfilter::EnvelopeFilter and its one-slider law. The effect: the cutoff tracks the envelope (measured from the
-// audio with a probe tone, at two levels, both directions, three rates); stability at maximum resonance under the
-// fastest modulation and on a full-scale slap; no zipper in a swept output; the clean lows hold the low end. The
-// stage: the law-11 properties, amount 0 = bit-exact dry, a slider move glides without a step, re-slicing (8a),
-// a stopped channel and a pause (11a/11c), reset is a restart, poison, law 8, mono = stereo, no allocation.
+// audio with a probe tone, at two levels, both directions, three rates) or an external key; stability at maximum
+// resonance under the fastest modulation and on a full-scale slap; no zipper in a swept output; the clean lows hold
+// the band under their corner over a grid of cutoff x Q x corner x mix; the levels the 1/sqrt(Q) scaling sets. The
+// stage: the law-11 properties, amount 0 = bit-exact dry, slider and menu moves glide without a step, the hand's
+// edits travel as sweeps, re-slicing (8a), a stopped channel and a pause (11a/11c, keyed too), reset is a restart,
+// poison (an overflow healed at the end of its call), law 8, the 0.45 fs cap, mono = stereo, no allocation.
 #include <felitronics_test.h>
 #include <alloc_counter.h>   // installs the allocation counter
 #include <law11_call_contract.h>
@@ -56,6 +58,16 @@ void okv (bool cond, const std::string& msg)
 }
 
 double dbOf (double a) { return 20.0 * std::log10 (std::max (a, 1e-300)); }
+
+/** Pin the cutoff: both ends of the sweep at `hz`, so the envelope cannot move it. */
+void fixedCutoff (Params& p, float hz) { p.sweepLoHz = hz; p.sweepHiHz = hz; }
+
+/** The LR4 low share at `hz` for a corner `fc` — the band-pass mode's floor under its corner. */
+double lr4Low (double hz, double fc, double fs)
+{
+    const double w = std::tan (kPi * hz / fs) / std::tan (kPi * fc / fs);
+    return 1.0 / (1.0 + w * w * w * w);
+}
 
 /** Process a whole buffer in `block`-sized calls; false if any call was refused. */
 bool render (Stage& s, Buf& io, int block)
@@ -144,8 +156,12 @@ void sliderLaw()
     const auto pm = ef::paramsForAmount (0.6f, menu);
     ok (pm.mode == ef::Mode::bandPass && pm.direction == ef::Direction::down && pm.resonance == 7.0f
         && pm.keepLows == 0.3f && pm.sweepLoHz == 200.0f && pm.releaseMs == 300.0f, "the voice is the menu's, untouched");
-    ok (ef::paramsForAmount (std::numeric_limits<float>::quiet_NaN()).mix <= 0.0f && ef::paramsForAmount (-1.0f).mix <= 0.0f
-        && ef::paramsForAmount (2.0f).sensitivityDb == 18.0f, "a NaN or below-range amount is 0, above-range is 1");
+    Params last = ef::paramsForAmount (0.7f, menu);
+    const auto pn = ef::paramsForAmount (std::numeric_limits<float>::quiet_NaN(), last);
+    ok (pn.mix == last.mix && pn.sensitivityDb == last.sensitivityDb && pn.mode == last.mode,
+        "a non-finite amount changes nothing: the params passed in come back");
+    ok (ef::paramsForAmount (-1.0f).mix <= 0.0f && ef::paramsForAmount (2.0f).sensitivityDb == 18.0f,
+        "a finite amount is clamped: below range is 0, above range is 1");
 }
 
 //==============================================================================
@@ -201,7 +217,7 @@ void dryAtZero()
             render (s, io, 256);
             okv (std::memcmp (io[0].data(), in[0].data(), io[0].size() * 4) == 0
                 && (nch < 2 || std::memcmp (io[1].data(), in[1].data(), io[1].size() * 4) == 0)
-                && s.isAsleep(), "fresh at amount 0: every bit of the input comes back, asleep — "
+                && s.isIdle(), "fresh at amount 0: every bit of the input comes back, idle — "
                                  + fmt (fs, 0) + " Hz, " + std::to_string (nch) + " ch");
         }
 
@@ -227,9 +243,9 @@ void dryAtZero()
         for (int i = 0; i < n; ++i)
             if (! core::sameBits (io[0][(std::size_t) i], in[0][(std::size_t) i])) lastDiff = i;
         const double landMs = 1000.0 * (lastDiff - at) / fs;
-        okv (all && s.isAsleep() && lastDiff > at && landMs < 500.0,
-            "after a move to 0 the glide lands and the stage sleeps: dry bit for bit " + fmt (landMs, 0)
-            + " ms after the move (bound 500) — " + fmt (fs, 0) + " Hz");
+        okv (all && s.isIdle() && lastDiff > at && landMs <= 1000.0 * Stage::kDoorSeconds,
+            "after a move to 0 the engage door (counted) lands and the stage idles: dry bit for bit " + fmt (landMs, 2)
+            + " ms after the move (the door: 10 ms) — " + fmt (fs, 0) + " Hz");
     }
 }
 
@@ -282,7 +298,7 @@ void sliderGlides()
         s.setParams (p);
         std::vector<float> y ((std::size_t) n, 0.0f);
         addBurst (y, fs, 0.0, 2.6, 0.05, hz, amp);
-        const double ts[] = { 0.3, 0.7, 1.1, 1.5, 1.9 };
+        const double ts[] = { 0.3, 0.7, 1.1, 1.5, 1.9, 2.2 };
         std::size_t k = 0;
         for (int i = 0; i < n; i += 64)
         {
@@ -294,6 +310,7 @@ void sliderGlides()
                     case 1:  p.direction = ef::Direction::down; break;
                     case 2:  p.resonance = 12.0f; break;
                     case 3:  p.sweepLoHz = 400.0f; p.sweepHiHz = 1200.0f; break;
+                    case 4:  p.keepLowsHz = 40.0f; break;
                     default: p.keepLows = 0.0f; break;
                 }
                 s.setParams (p);
@@ -311,7 +328,7 @@ void sliderGlides()
                                             maxStep (y, t + (int) (0.25 * fs), t + (int) (0.35 * fs)));
             worst = std::max (worst, around / steady);
         }
-        okv (worst <= 1.25, "menu moves (mode, direction, Q 2 -> 12, range, keepLows): the largest step is "
+        okv (worst <= 1.25, "menu moves (mode, direction, Q 2 -> 12, range, corner 150 -> 40 Hz, keepLows): the largest step is "
                            + fmt (worst, 3) + "x the steady one (bound 1.25)");
     }
 }
@@ -413,7 +430,7 @@ void stability()
             f.design (hi ? gHi : gLo, k);
             double lp = 0.0, bp = 0.0;
             f.tick (0, i < n ? (double) r.next() : 0.0, lp, bp);
-            if ((i & 63) == 63) f.flush (1);
+            if ((i & 63) == 63) f.flush();
             finite = finite && std::isfinite (lp) && std::isfinite (bp);
             const double m = std::max (std::fabs (lp), std::fabs (bp));
             if (i < n) peak = std::max (peak, m); else if (i > n + tail / 2) tailPeak = std::max (tailPeak, m);
@@ -515,11 +532,76 @@ void noZipper()
 }
 
 //==============================================================================
-// THE CLEAN LOWS. A band pass driven wide open is the case that loses the note; keepLows 1 must hold the low end.
+// THE CLEAN LOWS. The band under the corner must survive whatever the swept filter does near it. A tone is run
+// through the stage with the cutoff PINNED (both ends of the sweep at one frequency) over a grid of cutoff x Q x
+// corner x mix x tone, both modes. The floors: low pass — the complement's band never drops (0.15 dB allowed for
+// the measurement); band pass — never below the LR4 low share at the tone (the band pass can only add to it). The
+// case that found the defect is in the grid: band pass, Q 12, corner 100 Hz, cutoff 104 Hz, a 98 Hz note.
+double toneGain (const Params& p, double fs, double hz, double seconds = 1.0)
+{
+    Stage s;
+    run (s.prepare (fs, 512, 1));
+    s.setParams (p);
+    const int n = (int) (seconds * fs);
+    std::vector<float> x ((std::size_t) n, 0.0f);
+    addBurst (x, fs, 0.0, seconds, 0.02, hz, 0.25);
+    std::vector<float> y = x;
+    float* io[1] = { y.data() };
+    run (s.process (io, 1, n));
+    const int a = (int) (0.65 * n), b = (int) (0.95 * n);
+    return dbOf (toneAmp (y, a, b, hz, fs) / toneAmp (x, a, b, hz, fs));
+}
+
 void keepsLows()
 {
-    group ("the clean lows: the low end stays within a stated dB, and without them it does not");
-    const double hzs[] = { 30.87, 41.2, 55.0, 73.42 };
+    group ("the clean lows hold the band under their corner, whatever the filter does beside it");
+    {
+        const double fs = 48000.0;
+        double worst[2] = { 1e9, 1e9 };
+        std::string where[2];
+        int cases = 0, bad = 0;
+        for (auto mode : { ef::Mode::lowPass, ef::Mode::bandPass })
+            for (float q : { 0.5f, 4.0f, 12.0f })
+                for (float corner : { 50.0f, 100.0f, 200.0f })
+                    for (double cf : { 0.5, 1.04, 1.5, 3.0, 10.0 })
+                        for (float mix : { 0.5f, 1.0f })
+                            for (double tf : { 0.5, 0.98 })
+                            {
+                                Params p = voice (mode, ef::Direction::up, q);
+                                fixedCutoff (p, (float) (cf * corner));
+                                p.keepLows = 1.0f; p.keepLowsHz = corner; p.mix = mix; p.sensitivityDb = 36.0f;
+                                const double hz = tf * corner;
+                                const double g = toneGain (p, fs, hz);
+                                const double floorDb = mode == ef::Mode::lowPass ? 0.0 : dbOf (lr4Low (hz, corner, fs));
+                                const double margin  = g - floorDb;
+                                const int m = mode == ef::Mode::lowPass ? 0 : 1;
+                                ++cases;
+                                if (margin < -0.15) ++bad;
+                                if (margin < worst[m])
+                                {
+                                    worst[m] = margin;
+                                    where[m] = "Q " + fmt (q, 1) + ", corner " + fmt (corner, 0) + ", cutoff " + fmt (cf * corner, 0)
+                                             + ", mix " + fmt (mix, 1) + ", tone " + fmt (hz, 0) + " Hz: " + fmt (g) + " dB";
+                                }
+                            }
+        okv (bad == 0, std::to_string (cases) + " cases: no tone under the corner falls more than 0.15 dB below its floor");
+        okv (worst[0] >= -0.15, "low pass: the closest case sits " + fmt (worst[0], 3) + " dB from 0 dB (" + where[0] + ")");
+        okv (worst[1] >= -0.15, "band pass: the closest case sits " + fmt (worst[1], 3) + " dB from the LR4 low share (" + where[1] + ")");
+    }
+
+    // The case itself, at every rate: it lost 13.6 dB before the band pass got its own split.
+    for (double fs : kRates)
+    {
+        Params p = voice (ef::Mode::bandPass, ef::Direction::up, 12.0f);
+        fixedCutoff (p, 104.0f);
+        p.keepLows = 1.0f; p.keepLowsHz = 100.0f; p.mix = 1.0f;
+        const double g = toneGain (p, fs, 98.0);
+        okv (g >= -1.0, fmt (fs, 0) + " Hz: band pass Q 12 at 104 Hz, corner 100 Hz, a 98 Hz note: " + fmt (g) + " dB (>= -1)");
+    }
+
+    // The default voice wide open (the slider at the top, Q 12): the open strings up to G2 stay, and without the
+    // clean lows they do not.
+    const double hzs[] = { 30.87, 41.2, 55.0, 73.42, 98.0 };
     for (double fs : kRates)
         for (auto mode : { ef::Mode::bandPass, ef::Mode::lowPass })
         {
@@ -527,26 +609,232 @@ void keepsLows()
             for (double hz : hzs)
                 for (float keep : { 1.0f, 0.0f })
                 {
-                    Stage s;
-                    run (s.prepare (fs, 256, 1));
                     Params p = ef::paramsForAmount (1.0f, voice (mode, ef::Direction::up, 12.0f));
                     p.keepLows = keep;
-                    s.setParams (p);
-                    const int n = (int) (1.5 * fs);
-                    std::vector<float> x ((std::size_t) n, 0.0f);
-                    addBurst (x, fs, 0.0, 1.5, 0.02, hz, 0.25);
-                    std::vector<float> y = x;
-                    float* io[1] = { y.data() };
-                    run (s.process (io, 1, n));
-                    const int a = (int) (0.8 * fs), b = (int) (1.4 * fs);
-                    const double g = dbOf (toneAmp (y, a, b, hz, fs) / toneAmp (x, a, b, hz, fs));
+                    const double g = toneGain (p, fs, hz, 1.5);
                     if (keep > 0.5f) worstKeep = std::max (worstKeep, std::fabs (g));
                     else             leastLoss = std::min (leastLoss, -g);
                 }
             const std::string tag = fmt (fs, 0) + " Hz " + (mode == ef::Mode::bandPass ? "band pass" : "low pass Q 12");
-            okv (worstKeep <= 1.5, tag + ": keepLows 1 holds 31 ... 73 Hz within " + fmt (worstKeep) + " dB of the input (bound 1.5)");
+            okv (worstKeep <= 1.5, tag + ": keepLows 1 (corner 150 Hz) holds 31 ... 98 Hz within " + fmt (worstKeep) + " dB (bound 1.5)");
             okv (leastLoss >= 9.0, tag + ": ...where keepLows 0 loses at least " + fmt (leastLoss, 1) + " dB (>= 9)");
         }
+}
+
+//==============================================================================
+// THE CORNER GLIDES. A corner retuned at once kept the old integrator state under new coefficients: on a
+// sustained note that was a step 4.4x the waveform's own.
+void cornerGlides()
+{
+    group ("the clean lows' corner glides: retuning it on a sustained note is not a step");
+    const double fs = 48000.0;
+    for (auto [from, to] : { std::pair<float, float> { 30.0f, 300.0f }, std::pair<float, float> { 300.0f, 30.0f } })
+    {
+        Stage s;
+        run (s.prepare (fs, 64, 1));
+        Params p = voice (ef::Mode::lowPass, ef::Direction::up, 4.0f);
+        fixedCutoff (p, 3000.0f);
+        p.keepLows = 1.0f; p.keepLowsHz = from; p.mix = 1.0f;
+        s.setParams (p);
+        const int n = (int) (1.2 * fs), t = (int) (0.5 * fs) / 64 * 64;
+        std::vector<float> y ((std::size_t) n, 0.0f);
+        addBurst (y, fs, 0.0, 1.2, 0.05, 98.0, 0.5);
+        for (int i = 0; i < n; i += 64)
+        {
+            if (i == t) { p.keepLowsHz = to; s.setParams (p); }
+            float* q[1] = { y.data() + i };
+            run (s.process (q, 1, std::min (64, n - i)));
+        }
+        const double around = maxStep (y, t, t + (int) (0.15 * fs));
+        const double steady = std::max (maxStep (y, t - (int) (0.1 * fs), t), maxStep (y, t + (int) (0.3 * fs), t + (int) (0.4 * fs)));
+        okv (around / steady <= 1.25, "corner " + fmt (from, 0) + " -> " + fmt (to, 0) + " Hz under a 98 Hz note: the largest step is "
+                                      + fmt (around / steady, 3) + "x the steady one (bound 1.25)");
+    }
+}
+
+//==============================================================================
+// THE HAND'S EDITS TRAVEL. A direction flip moves the rest 4.3 octaves; through the playing's 4 ms pole alone that
+// arrives in ~9 ms and is heard as a hit. It glides instead, as does a range edit: the cutoff covers 90 % of its
+// (log) travel no sooner than 30 ms after the edit.
+void handEditsTravel()
+{
+    group ("a direction flip and a range edit travel as sweeps, not hits");
+    const double fs = 48000.0;
+    for (int which = 0; which < 2; ++which)
+    {
+        Stage s;
+        run (s.prepare (fs, 16, 1));
+        Params p = voice (ef::Mode::lowPass, ef::Direction::up, 4.0f);
+        s.setParams (p);
+        std::vector<float> z (16, 0.0f);
+        float* q[1] = { z.data() };
+        run (s.process (q, 1, 16));
+        const double from = std::log2 ((double) s.shownCutoffHz());
+        if (which == 0) p.direction = ef::Direction::down; else p.sweepLoHz = 600.0f;
+        s.setParams (p);
+        const double to = which == 0 ? std::log2 (3000.0) : std::log2 (600.0);
+        int at = -1;
+        for (int k = 1; k <= 400 && at < 0; ++k)
+        {
+            std::fill (z.begin(), z.end(), 0.0f);
+            run (s.process (q, 1, 16));
+            if (std::fabs (std::log2 ((double) s.shownCutoffHz()) - from) >= 0.9 * std::fabs (to - from)) at = k * 16;
+        }
+        const double ms = 1000.0 * at / fs;
+        okv (at > 0 && ms >= 30.0, std::string (which == 0 ? "direction up -> down (150 -> 3000 Hz at rest)" : "range 150 -> 600 Hz")
+                                   + ": 90 % of the travel after " + fmt (ms, 1) + " ms (>= 30; the playing's pole alone: ~9)");
+    }
+}
+
+//==============================================================================
+// THE KEY. Keyed by the signal before a compressor or an octaver, the sweep follows the hand.
+void keyInput()
+{
+    group ("an external key drives the sweep; a self-key, a null key and a zero count are the keyless form");
+    const double fs = 48000.0;
+    const int n = 24000;
+    const Params p = ef::paramsForAmount (0.6f, voice (ef::Mode::bandPass, ef::Direction::up, 6.0f));
+    Buf prog (2, std::vector<float> ((std::size_t) n, 0.0f));
+    addBurst (prog[0], fs, 0.0, 0.5, 0.01, 82.4, 0.05); addBurst (prog[1], fs, 0.0, 0.5, 0.01, 82.4, 0.05);
+    Buf keyBuf (1, std::vector<float> ((std::size_t) n, 0.0f));
+    for (int b = 0; b < 3; ++b) addBurst (keyBuf[0], fs, 0.02 + 0.15 * b, 0.08, 0.002, 110.0, 0.6);
+
+    // Identities: io as its own key, a null key, a zero count — all the three-argument form, bit for bit.
+    {
+        Buf a = prog, b = prog, c = prog, d = prog;
+        Stage sa, sb, sc, sd;
+        for (Stage* s : { &sa, &sb, &sc, &sd }) { run (s->prepare (fs, 256, 2)); s->setParams (p); }
+        for (int at = 0; at < n; at += 256)
+        {
+            const int len = std::min (256, n - at);
+            float* pa[2] = { a[0].data() + at, a[1].data() + at };
+            float* pb[2] = { b[0].data() + at, b[1].data() + at };
+            float* pc[2] = { c[0].data() + at, c[1].data() + at };
+            float* pd[2] = { d[0].data() + at, d[1].data() + at };
+            const float* self[2] = { pb[0], pb[1] };
+            const float* kk[1] = { keyBuf[0].data() + at };
+            run (sa.process (pa, 2, len));
+            run (sb.process (pb, 2, len, self, 2));
+            run (sc.process (pc, 2, len, nullptr, 3));
+            run (sd.process (pd, 2, len, kk, 0));
+        }
+        bool same = true;
+        for (int ch = 0; ch < 2; ++ch)
+            same = same && std::memcmp (a[(std::size_t) ch].data(), b[(std::size_t) ch].data(), (std::size_t) n * 4) == 0
+                        && std::memcmp (a[(std::size_t) ch].data(), c[(std::size_t) ch].data(), (std::size_t) n * 4) == 0
+                        && std::memcmp (a[(std::size_t) ch].data(), d[(std::size_t) ch].data(), (std::size_t) n * 4) == 0;
+        ok (same, "io as its own key, a null key and a zero count: the keyless output, bit for bit");
+    }
+    // An external key moves the sweep exactly as the same signal would as the programme — and not as the
+    // programme does. The key's non-finite samples are silence to it.
+    {
+        Stage keyed, asProg, self;
+        for (Stage* s : { &keyed, &asProg, &self }) { run (s->prepare (fs, 256, 2)); s->setParams (p); }
+        Buf a = prog, kp = keyBuf, sp = prog;
+        Buf poisonedKey = keyBuf;
+        poisonedKey[0][700] = std::numeric_limits<float>::quiet_NaN(); poisonedKey[0][701] = std::numeric_limits<float>::infinity();
+        Buf kpz = keyBuf;
+        kpz[0][700] = 0.0f; kpz[0][701] = 0.0f;
+        kp = kpz;
+        bool track = true; double maxKeyed = 0.0, maxSelf = 0.0;
+        for (int at = 0; at < n; at += 256)
+        {
+            const int len = std::min (256, n - at);
+            float* pa[2] = { a[0].data() + at, a[1].data() + at };
+            const float* kk[1] = { poisonedKey[0].data() + at };
+            float* pk[1] = { kp[0].data() + at };
+            float* ps[2] = { sp[0].data() + at, sp[1].data() + at };
+            run (keyed.process (pa, 2, len, kk, 1));
+            run (asProg.process (pk, 1, len));
+            run (self.process (ps, 2, len));
+            track = track && core::sameBits (keyed.shownCutoffHz(), asProg.shownCutoffHz());
+            maxKeyed = std::max (maxKeyed, (double) keyed.shownCutoffHz());
+            maxSelf  = std::max (maxSelf, (double) self.shownCutoffHz());
+        }
+        ok (track, "keyed: the cutoff is, bit for bit, the one the key would set as the programme (its NaN/inf as silence)");
+        okv (maxKeyed > 4.0 * maxSelf, "the quiet programme alone opens it to " + fmt (maxSelf, 0) + " Hz; its key, to "
+                                       + fmt (maxKeyed, 0) + " Hz");
+    }
+}
+
+//==============================================================================
+// LEVELS the 1/sqrt(Q) scaling sets — pinned, not changed: the owner judges them by ear.
+void levels()
+{
+    group ("levels: the low pass's passband, and the two modes at the cutoff");
+    const double fs = 48000.0;
+    for (float q : { 4.0f, 12.0f })
+    {
+        Params p = voice (ef::Mode::lowPass, ef::Direction::up, q);
+        fixedCutoff (p, 3000.0f);
+        p.keepLows = 0.0f; p.mix = 1.0f;
+        const double g = toneGain (p, fs, 400.0, 0.5);
+        const double want = q < 5.0f ? -6.0 : -10.8;
+        okv (std::fabs (g - want) <= 0.3, "low pass Q " + fmt (q, 0) + " resting at 3 kHz: a 400 Hz tone at " + fmt (g)
+                                          + " dB (pinned " + fmt (want, 1) + " +- 0.3)");
+    }
+    for (float q : { 0.5f, 12.0f })
+    {
+        double g[2] {};
+        for (int m = 0; m < 2; ++m)
+        {
+            Params p = voice (m == 0 ? ef::Mode::lowPass : ef::Mode::bandPass, ef::Direction::up, q);
+            fixedCutoff (p, 1000.0f);
+            p.keepLows = 0.0f; p.mix = 1.0f;
+            g[m] = toneGain (p, fs, 1000.0, 0.5);
+        }
+        okv (std::fabs (g[0] - g[1]) <= 0.1, "Q " + fmt (q, 1) + ", a tone at the cutoff: low pass " + fmt (g[0]) + " dB, band pass "
+                                             + fmt (g[1]) + " dB (equal within 0.1; both Q/sqrt(max(1,Q)))");
+        // ...and across the mode door, on that tone: the taps are 90 degrees apart there, so the linear door dips.
+        Stage s;
+        run (s.prepare (fs, 64, 1));
+        Params p = voice (ef::Mode::lowPass, ef::Direction::up, q);
+        fixedCutoff (p, 1000.0f);
+        p.keepLows = 0.0f; p.mix = 1.0f;
+        s.setParams (p);
+        const int n = (int) (0.6 * fs), t = (int) (0.3 * fs) / 64 * 64;
+        std::vector<float> y ((std::size_t) n, 0.0f);
+        addBurst (y, fs, 0.0, 0.6, 0.01, 1000.0, 0.25);
+        for (int i = 0; i < n; i += 64)
+        {
+            if (i == t) { p.mode = ef::Mode::bandPass; s.setParams (p); }
+            float* qq[1] = { y.data() + i };
+            run (s.process (qq, 1, std::min (64, n - i)));
+        }
+        double steady = 0.0, low = 1e9;
+        for (int i = t - 4800; i < t; ++i) steady = std::max (steady, (double) std::fabs (y[(std::size_t) i]));
+        for (int c = 0; c < 20; ++c)   // per 1 kHz cycle through the door and past it
+        {
+            double pk = 0.0;
+            for (int i = t + c * 48; i < t + (c + 1) * 48; ++i) pk = std::max (pk, (double) std::fabs (y[(std::size_t) i]));
+            low = std::min (low, pk);
+        }
+        const double dip = dbOf (low / steady);
+        okv (dip >= -6.0, "Q " + fmt (q, 1) + ": through the 10 ms mode door the tone at the cutoff dips " + fmt (dip)
+                          + " dB (bound -6: the taps are 90 degrees apart there, and the band pass's LR4 allpass adds ~25)");
+    }
+}
+
+//==============================================================================
+void capAtLowRate()
+{
+    group ("the cutoff never passes 0.45 fs: 8 kHz with the sweep's top at 12 kHz");
+    Stage s;
+    run (s.prepare (8000.0, 64, 1));
+    Params p = voice (ef::Mode::bandPass, ef::Direction::up, 12.0f);
+    p.sweepHiHz = 12000.0f; p.sensitivityDb = 36.0f; p.mix = 1.0f;
+    s.setParams (p);
+    std::vector<float> x (8000, 0.0f);
+    addBurst (x, 8000.0, 0.0, 1.0, 0.01, 3000.0, 0.5);
+    double top = 0.0; bool finite = true;
+    for (int i = 0; i < 8000; i += 64)
+    {
+        float* q[1] = { x.data() + i };
+        run (s.process (q, 1, 64));
+        top = std::max (top, (double) s.shownCutoffHz());
+    }
+    for (float v : x) finite = finite && std::isfinite (v);
+    okv (top == 3600.0 && finite, "fully open it stands at " + fmt (top, 1) + " Hz (0.45 x 8000 = 3600), and the output is finite");
 }
 
 //==============================================================================
@@ -606,8 +894,10 @@ void stoppedChannelPauseReset()
     // 11c: two stages at rest, a glide put in flight (mix, resonance, direction, mode, range), then A pauses and
     // B hears silence for the same length; the shared state, and the next note, must be the same bits.
     using felitronics::test::law11c::kGaps;
+    std::vector<int> gaps (std::begin (kGaps), std::end (kGaps));
+    gaps.push_back ((int) (60.0 * fs));   // a whole minute: the gap stops computing once its state stands still
     int cases = 0, same = 0, moved = 0;
-    for (int gap : kGaps)
+    for (int gap : gaps)
     {
         Stage A, B, C;
         for (Stage* s : { &A, &B, &C })
@@ -637,6 +927,28 @@ void stoppedChannelPauseReset()
     ok (same == cases, "a pause is silence: the shared state and the next note are the same bits, all "
                        + std::to_string (cases) + " gaps (law 11c)");
     ok (moved == cases, "...and every gap MOVED the shared state (it is not a blind comparison)");
+
+    // A KEYED gap consumes its key: A pauses with the key, B hears silence at its width with the same key, C pauses
+    // without it. A and B agree bit for bit — the sweep followed the key through the gap — and C does not.
+    {
+        Stage A, B, C;
+        for (Stage* s : { &A, &B, &C }) { run (s->prepare (fs, 256, 2)); s->setParams (p); }
+        const int gap = 9601;
+        std::vector<float> key ((std::size_t) gap, 0.0f);
+        addBurst (key, fs, 0.0, gap / fs, 0.002, 110.0, 0.8);
+        const float* kk[1] = { key.data() };
+        run (A.process (nullptr, 0, gap, kk, 1));
+        Buf z (2, std::vector<float> ((std::size_t) gap, 0.0f));
+        float* zb[2] = { z[0].data(), z[1].data() };
+        run (B.process (zb, 2, gap, kk, 1));
+        run (C.process (nullptr, 0, gap));
+        Buf ta (2, std::vector<float> (4096, 0.0f));
+        addBurst (ta[0], fs, 0.0, 4096 / fs, 0.001, 150.0, 0.7); ta[1] = ta[0];
+        Buf tb = ta, tc = ta;
+        render (A, ta, 256); render (B, tb, 256); render (C, tc, 256);
+        ok (std::memcmp (ta[0].data(), tb[0].data(), 4096 * 4) == 0 && std::memcmp (ta[0].data(), tc[0].data(), 4096 * 4) != 0,
+            "a keyed gap is silence carrying that key (law 11c): the return matches it bit for bit, and differs from a keyless gap");
+    }
 
     // reset is a restart: two stages fed different programmes answer the same programme alike after reset().
     {
@@ -685,19 +997,33 @@ void poisonAndLaw8()
                                       "bits of the same stream with zeros there (" + std::to_string (differ) + " differ)");
     }
     {
+        // AN OVERFLOW HEALED AT THE END OF ITS CALL. A band pass pinned at fs/4 with Q 12 is fed a 3e38 sine at its
+        // centre for the call's last 40 samples — AFTER the call's last grid boundary (640), so the grid's flush
+        // cannot be what heals it. The call's own output proves the filter went non-finite; the end-of-call heal
+        // must leave a finite state, and the next call must be clean from its first sample.
         Stage s;
-        run (s.prepare (fs, 256, 1)); s.setParams (p);
-        std::vector<float> big (512);
-        for (int i = 0; i < 512; ++i) big[(std::size_t) i] = i % 2 ? 3.0e38f : -3.0e38f;
-        float* q[1] = { big.data() };
-        run (s.process (q, 1, 512));
-        std::vector<float> after (4800, 0.0f);
-        addBurst (after, fs, 0.0, 0.1, 0.002, 98.0, 0.5);
+        run (s.prepare (fs, 1024, 1));
+        Params q = voice (ef::Mode::bandPass, ef::Direction::up, 12.0f);
+        fixedCutoff (q, 12000.0f);
+        q.keepLows = 0.0f; q.mix = 1.0f;
+        s.setParams (q);
+        std::vector<float> big (680, 0.0f);
+        addBurst (big, fs, 0.0, 640.0 / fs, 0.001, 440.0, 0.3);
+        const float ring[4] = { 0.0f, 3.0e38f, 0.0f, -3.0e38f };
+        for (int i = 640; i < 680; ++i) big[(std::size_t) i] = ring[i & 3];
+        float* qq[1] = { big.data() };
+        run (s.process (qq, 1, 680));
+        bool blewUp = false;
+        for (int i = 640; i < 680; ++i) blewUp = blewUp || ! std::isfinite (big[(std::size_t) i]);
+        ok (blewUp, "precondition: finite input overflowed the filter after the call's last grid boundary (its output went non-finite)");
+        ok (s.filterStateIsFinite(), "the end-of-call heal leaves the filter state finite");
+        std::vector<float> after (300, 0.0f);
+        addBurst (after, fs, 0.0, 300.0 / fs, 0.001, 98.0, 0.5);
         float* r[1] = { after.data() };
-        run (s.process (r, 1, 4800));
+        run (s.process (r, 1, 300));
         bool finite = true;
         for (float v : after) finite = finite && std::isfinite (v);
-        ok (finite, "a finite +-3e38 that overflows the filter is healed at the end of its call: the next call is finite");
+        ok (finite, "...and the next call is finite from its first sample");
     }
     // Law 8: a resonant ring, then a minute of silence — in blocks, and as ONE call (the 8a case: a whole-file
     // call must flush inside itself).
@@ -785,6 +1111,13 @@ void noAllocation()
     run (s.process (lr, 2, 1024));
     run (s.process (lr, 1, 1024));
     run (s.process (nullptr, 0, 1024));
+    const float* kk[1] = { l.data() };
+    run (s.process (lr, 2, 1024, kk, 1));
+    run (s.process (nullptr, 0, 1024, kk, 1));
+    Params moved = ef::paramsForAmount (0.9f, voice (ef::Mode::lowPass, ef::Direction::down));
+    moved.keepLowsHz = 60.0f; moved.sweepLoHz = 300.0f;
+    s.setParams (moved);
+    run (s.process (lr, 2, 1024));
     s.setParams (ef::paramsForAmount (0.0f));
     run (s.process (lr, 2, 1024));
     for (int k = 0; k < 40; ++k) run (s.process (lr, 2, 1024));   // glides out and sleeps
@@ -793,7 +1126,7 @@ void noAllocation()
     s.reset(); s.reset();
     run (s.process (lr, 2, 1024));
     felitronics::test::okNoAlloc (alloc::count.load() == before,
-                                  "no allocation: setParams, process (stereo, mono, pause, sleep, wake), reset");
+                                  "no allocation: setParams, process (stereo, mono, keyed, pause, keyed pause, idle, wake), reset");
 }
 } // namespace
 
@@ -804,10 +1137,15 @@ int main()
     contract();
     dryAtZero();
     sliderGlides();
+    cornerGlides();
+    handEditsTravel();
     tracking();
+    keyInput();
     stability();
+    capAtLowRate();
     noZipper();
     keepsLows();
+    levels();
     reslicing();
     stoppedChannelPauseReset();
     poisonAndLaw8();

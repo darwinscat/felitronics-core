@@ -272,18 +272,19 @@ the predelay or the chorus line, and once exact zero is reached it holds).
 
 ### Added with the module: `envfilter::EnvelopeFilter` — gridded from the start
 
-**Recursive state.** The swept TPT state-variable filter's two integrators per channel
-(`envfilter::detail::SweptSvf`, `eq::Svf`'s update), the clean-lows split (`eq::DeterministicSvf`, a high pass),
-the envelope follower (`dynamics::EnvelopeFollower`, peak) and five glides: mix, sensitivity, keepLows, resonance
-(one-pole, double) and the cutoff smoother on log2(Hz). The mode crossfade is a counted linear door (clean, it
-lands by construction).
+**Recursive state.** The swept TPT state-variable filter's two integrators per lane — four lanes, the low-pass
+path and the band-pass path per channel (`envfilter::detail::SweptSvf`, `eq::Svf`'s update) — the two clean-lows
+splits (`eq::DeterministicSvf`, a high pass, and `eq::DeterministicCrossover2`, LR4), the envelope follower
+(`dynamics::EnvelopeFollower`, peak) and nine glides, one-pole in double: mix, sensitivity, keepLows, resonance,
+the direction blend, the range's two ends, the corner (log2 Hz) and the playing's cutoff smoother (log2 Hz). The
+mode door and the engage door are counted linear ramps (clean, they land by construction).
 **Verdict: flushed at the house 1e-15 on `core::StateGrid` (audio time), poison healed at the end of every call.**
-The follower, both filters' integrators and the split all decay geometrically toward zero on silence and would
+The follower, the filters' integrators and both splits decay geometrically toward zero on silence and would
 otherwise park in the subnormal band. The glides LAND (item 6): on their target once the update no longer moves
-them or once within 1e-9 × max(1, |target|) of it — the mix glides toward exactly zero when the slider goes to 0,
-and that landing is what puts the stage to sleep (~0.41 s at the 20 ms glide), so none of them can creep through
-the subnormals. A gap (law 11c) runs the same per-sample control step as silence and stops once the shared state
-stands still with the follower at exact zero.
+them or once within 1e-9 × max(1, |target|) of it, so none of them can creep through the subnormals; the stage
+goes idle on the ENGAGE DOOR's landing, which is counted and exact. A gap (law 11c) runs the same per-sample
+control step as silence and, when keyless, stops once the shared state stands still with the follower at exact
+zero.
 Tested in `modules/envfilter/tests/EnvelopeFilterTests.cpp` (a Q 12 band-pass ring, then 60 s of silence in
 512-sample calls and as ONE 61 s call: no subnormal in any state, exact zero from 1.5 s after the ring; and the
 fastest settings' 20 Hz Q 12 ring dies to exact zero). Removing the flush turns all of them red.

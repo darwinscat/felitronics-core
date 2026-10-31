@@ -1,22 +1,31 @@
 ### envfilter — a new module: `EnvelopeFilter`, the bass amp's envelope filter (auto-wah), and its one-slider law
 
 `felitronics::envfilter` — header-only, JUCE-free, no heap; depends on `core`, `dynamics` and `eq`. A peak
-`dynamics::EnvelopeFollower` on the loudest channel (attack 3 ms, release 120 ms by default) places the cutoff
-of a resonant Cytomic TPT state-variable filter on a log-frequency sweep (150 Hz … 3 kHz by default): fully
-open when envelope + sensitivity reaches 0 dBFS, closed 30 dB below; UP rests low and a hit opens it, DOWN rests
-high and a hit pushes it down. The cutoff passes one 4 ms smoother and the filter is redesigned every sample.
-Low-pass and band-pass come from one state and crossfade over 10 ms; both are scaled by 1/√max(1, Q) (Q 0.5 … 12).
-`keepLows` takes everything under `keepLowsHz` (100 Hz) out of the filter and adds it back clean; the lows are
-the exact complement `x − HP(x)`, so the dry/wet mix never notches the bass. mix, sensitivity, resonance and
-keepLows glide (20 ms) and land; `mix` 0 puts the stage to sleep: the buffer is returned untouched and nothing is
-computed. Mono or stereo (linked), 8 … 768 kHz, zero latency, law 8/8a on `core::StateGrid`, law 11.
+`dynamics::EnvelopeFollower` on the loudest channel — or on an external key, `process (io, nch, n, key, nk)`, the
+dynamics house shape — places the cutoff of a resonant Cytomic TPT state-variable filter on a log-frequency sweep
+(150 Hz … 3 kHz by default): fully open when envelope + sensitivity reaches 0 dBFS, closed 30 dB below; UP rests
+low and a hit opens it, DOWN rests high and a hit pushes it down. The playing reaches the cutoff through a 4 ms
+smoother, the hand's edits (direction, range, sensitivity) glide 20 ms first, and the filter is redesigned every
+sample. Low pass or band pass (a 10 ms crossfade), both scaled by 1/√max(1, Q) (Q 0.5 … 12): the low pass's
+passband sits at −6.0 dB at Q 4 and −10.8 dB at Q 12. `keepLows` takes the band under `keepLowsHz` (150 Hz) out
+of the filter and adds it back clean, with a split per mode that cannot cancel it: an exact complement in low pass
+(dry = the input), an in-phase LR4 pair in band pass (dry = its allpass). Everything glides and lands; `mix` 0
+closes a counted 10 ms engage door, after which the stage is idle: the buffer is returned untouched and nothing is
+computed; a wake is a restart. Mono or stereo (linked), 8 … 768 kHz, zero latency, law 8/8a on `core::StateGrid`,
+law 11 (an external key is consumed through a gap). About 1 % of real time at 48 kHz stereo (deb, i9-13900H).
 
 `EnvelopeFilterLaw.h` — `paramsForAmount (amount, menu)`: mix rises 0 → 1 over the slider's lower half,
-sensitivity −6 → +18 dB over the whole travel; everything else is the menu's.
+sensitivity −6 → +18 dB over the whole travel; `mix` and `sensitivityDb` are law-owned, everything else is the
+menu's; a non-finite amount returns `menu` unchanged.
+
+`core` — DetMath.h's cost note names the two stages that put `core::det` on a per-sample path deliberately
+(`delay::TapeDelay`, `envfilter::EnvelopeFilter`), with the measured price.
 
 Measured (`felitronics_envfilter_tests`, 44.1 / 48 / 96 kHz): 12 dB more input moves the cutoff 1.729 oct, the
 law's number, and a probe tone's gain under each burst matches the published cutoff's analytic response within
 0.01 dB; the kernel at Q 12 with its cutoff flipped between 20 Hz and 0.45 fs every sample stays finite (largest
-tap 22.6 on ±1 noise); a 0 dBFS slap at the fastest settings peaks at −0.55 dBFS; a swept output holds −150 dB
-of energy above 6 kHz (a cutoff held for 32 samples: −105); keepLows 1 holds 31 … 73 Hz within 1.23 dB of the
-input, where 0 loses 43 dB in band-pass.
+tap 22.6 on ±1 noise); a swept output holds −150 dB of energy above 6 kHz (a cutoff held for 32 samples: −105);
+over 360 cases of cutoff × Q × corner × mix × tone the band under the corner never drops below its floor (0 dB in
+low pass, the LR4 low share in band pass) — the band pass parked at 104 Hz over a 100 Hz corner that took a 98 Hz
+note down 13.6 dB now gives it +2.4 dB; a corner retuned under a sustained note, a direction flip and a range
+edit move without a step (≤ 1.04× the steady step; the flip takes 51 ms to cover 90 % of its travel).
