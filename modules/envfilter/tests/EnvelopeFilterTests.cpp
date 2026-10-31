@@ -834,7 +834,7 @@ void doorsKeepTheLevel()
 {
     group ("engage, disengage, wake and the mode door keep a tone near the corner within 2 dB of its settled level");
     const double fs = 48000.0;
-    const int periods[] = { 320, 225 };
+    const int periods[] = { 320, 225, 20 };   // 150 Hz (the corner), 213.3 Hz, and 2400 Hz (where a 4-octave ceiling sat)
     struct Worst { double margin = 1e9; std::string where; };
     Worst wake, disengage, modeIn, modeOut;
     const auto note = [] (Worst& w, double m, const std::string& where) { if (m < w.margin) { w.margin = m; w.where = where; } };
@@ -845,6 +845,13 @@ void doorsKeepTheLevel()
             for (float mix : { 0.1f, 1.0f })
                 for (int period : periods)
                 {
+                    // 2.4 kHz is in the grid for the LADDER (rung 1 once crossfaded against an allpass that is -1 at a
+                    // ceiling there). The low pass has no ladder: its door is x against the low pass, and a tone far
+                    // above that cutoff, where the low pass answers -10 dB nearly opposite in phase, meets the plain
+                    // comb any dry/wet blend of it has — a static mix setting gives the same response, so it says
+                    // nothing about the door.
+                    if (mode == ef::Mode::lowPass && period == 20)
+                        continue;
                     Params p = voice (mode, ef::Direction::up, q);
                     fixedCutoff (p, cutoff);
                     p.keepLows = 1.0f; p.keepLowsHz = 150.0f; p.mix = 0.0f;
@@ -1031,32 +1038,42 @@ void ladderBend()
     group ("the band pass's ladder: its pitch bend and its first rung on a click");
     for (double fs : kRates)
     {
-        double worst = 0.0, quiet = 0.0;
-        std::string where;
-        for (int dis = 0; dis < 2; ++dis)
-            for (double hz : { 82.41, 150.0, 300.0 })
-            {
-                Stage s;
-                run (s.prepare (fs, 64, 1));
-                Params p = voice (ef::Mode::bandPass);
-                fixedCutoff (p, 3000.0f);
-                p.keepLows = 1.0f; p.keepLowsHz = 150.0f; p.mix = dis ? 0.1f : 0.0f;
-                s.setParams (p);
-                const int n = (int) (1.2 * fs), t0 = (int) (0.3 * fs) / 64 * 64;
-                std::vector<float> y ((std::size_t) n);
-                for (int i = 0; i < n; ++i) y[(std::size_t) i] = (float) (0.25 * std::sin (2.0 * kPi * hz * i / fs));
-                for (int i = 0; i < n; i += 64)
+        // Rows per corner, each with its own measured bound: the bend grows as the corner falls, because the
+        // harmonics octaves above a low corner are crossed while the sweep is still fast. A 30 Hz request is held at
+        // the menu's floor (80 Hz) and must bend like 80.
+        struct Row { float corner; double bound; const char* what; };
+        const Row rows[] = { { 150.0f, 55.0, "the default corner, 150 Hz" }, { 80.0f, 105.0, "the lowest corner, 80 Hz" },
+                             { 30.0f, 105.0, "a 30 Hz request (held at 80 Hz)" } };
+        for (const auto& row : rows)
+        {
+            double worst = 0.0, quiet = 0.0;
+            std::string where;
+            for (int dis = 0; dis < 2; ++dis)
+                for (double hz : { 41.2, 82.41, 150.0, 300.0, 600.0, 1200.0, 2400.0 })
                 {
-                    if (i == t0) { p.mix = dis ? 0.0f : 0.1f; s.setParams (p); }
-                    float* io[1] = { y.data() + i };
-                    run (s.process (io, 1, std::min (64, n - i)));
+                    Stage s;
+                    run (s.prepare (fs, 64, 1));
+                    Params p = voice (ef::Mode::bandPass);
+                    fixedCutoff (p, 3000.0f);
+                    p.keepLows = 1.0f; p.keepLowsHz = row.corner; p.mix = dis ? 0.1f : 0.0f;
+                    s.setParams (p);
+                    const int n = (int) (1.2 * fs), t0 = (int) (0.3 * fs) / 64 * 64;
+                    std::vector<float> y ((std::size_t) n);
+                    for (int i = 0; i < n; ++i) y[(std::size_t) i] = (float) (0.25 * std::sin (2.0 * kPi * hz * i / fs));
+                    for (int i = 0; i < n; i += 64)
+                    {
+                        if (i == t0) { p.mix = dis ? 0.0f : 0.1f; s.setParams (p); }
+                        float* io[1] = { y.data() + i };
+                        run (s.process (io, 1, std::min (64, n - i)));
+                    }
+                    const double b = bendCents (y, t0, t0 + (int) (0.45 * fs), fs, hz);
+                    quiet = std::max (quiet, bendCents (y, (int) (0.05 * fs), t0, fs, hz));
+                    if (b > worst) { worst = b; where = std::string (dis ? "disengage, " : "wake, ") + fmt (hz, 0) + " Hz"; }
                 }
-                const double b = bendCents (y, t0, t0 + (int) (0.45 * fs), fs, hz);
-                quiet = std::max (quiet, bendCents (y, (int) (0.05 * fs), t0, fs, hz));
-                if (b > worst) { worst = b; where = std::string (dis ? "disengage, " : "wake, ") + fmt (hz, 0) + " Hz"; }
-            }
-        okv (worst <= 55.0 && quiet < 1.0, fmt (fs, 0) + " Hz: the largest bend through a band-pass wake or disengage is " + fmt (worst, 1)
-                                           + " cents (" + where + "; bound 55; the measurement's own floor " + fmt (quiet, 2) + ")");
+            okv (worst <= row.bound && quiet < 1.0, fmt (fs, 0) + " Hz, " + row.what + ": the largest bend through a band-pass wake or "
+                                                    "disengage, 41 Hz ... 2.4 kHz, is " + fmt (worst, 1) + " cents (" + where + "; bound "
+                                                    + fmt (row.bound, 0) + "; the measurement's own floor " + fmt (quiet, 2) + ")");
+        }
 
         // The first rung crossfades x with x through the ceiling allpass: a 2 ms white-noise click in its middle.
         Stage s;
@@ -1083,7 +1100,7 @@ void ladderBend()
         double eout = 0.0;
         for (int i = at - (int) (0.001 * fs); i < at + len + (int) (0.004 * fs); ++i) eout += (double) y[(std::size_t) i] * y[(std::size_t) i];
         const double dip = 10.0 * std::log10 (eout / ein);
-        okv (dip >= -1.0, fmt (fs, 0) + " Hz: a click in the middle of the first rung keeps " + fmt (dip) + " dB of its energy (bound -1)");
+        okv (dip >= -1.5, fmt (fs, 0) + " Hz: a click in the middle of the first rung keeps " + fmt (dip) + " dB of its energy (bound -1.5)");
     }
 }
 

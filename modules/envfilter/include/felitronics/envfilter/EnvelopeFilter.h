@@ -64,10 +64,11 @@ namespace felitronics::envfilter
 // the two families has a hole there — at mix 0.1 a tone at the corner fell 7.5 dB through a 10 ms door. So no door
 // ever crosses families. The x family has one door: the LOW-PASS DOOR (x ↔ the low pass, kDoorSeconds). The band
 // pass is reached by a LADDER of three counted stages, each phase-continuous: (1) a kRungSeconds crossfade from
-// the x-family signal to the same signal through the LR4 pair's own allpass parked at the CEILING (kLadderOctaves
-// above the corner, where it is ≈ +1 over the protected bass); (2) that allpass's corner sweeps down to the
+// the x-family signal to the same signal through the LR4 pair's own allpass parked at the CEILING (0.45 fs, where
+// it is ≈ +1 over the bass and the guitar-range harmonics); (2) that allpass's corner sweeps down to the
 // clean-lows corner over kCornerSweepSeconds (an exponential approach on log2 Hz) — a pure allpass, so the level
-// holds while the phase turns, which is heard as a small pitch bend (≤ ~48 cents, see kCornerSweepSeconds); (3) a
+// holds while the phase turns, which is heard as a small pitch bend (≤ ~50 cents at the default corner, see
+// kCornerSweepSeconds); (3) a
 // kRungSeconds crossfade from it to the band pass, which now shares its phase. Down is the same in reverse. The
 // low-pass door stays open until the band pass is fully in, and the ladder comes down only once it is open again,
 // so a mode change never passes through dry. Measured over tones at and above the corner, cutoff at it and 10×
@@ -136,7 +137,7 @@ struct EnvelopeFilterParams
     Mode      mode          = Mode::lowPass;
     float     resonance     = 4.0f;      ///< the swept filter's Q (0.5 … 12)
     float     keepLows      = 1.0f;      ///< 0 = the whole signal is filtered, 1 = everything under keepLowsHz stays clean
-    float     keepLowsHz    = 150.0f;    ///< the clean lows' corner (30 … 300 Hz) — a fifth above G2
+    float     keepLowsHz    = 150.0f;    ///< the clean lows' corner (80 … 300 Hz) — a fifth above G2
     float     mix           = 1.0f;      ///< LAW-OWNED. 0 = dry (the stage goes idle), 1 = all filter
 };
 
@@ -257,7 +258,9 @@ public:
     static constexpr float kMinRelease = 5.0f,    kMaxRelease = 2000.0f;   // ms
     static constexpr float kMinHz      = 20.0f,   kMaxHz      = 12000.0f;  // the sweep's ends
     static constexpr float kMinQ       = 0.5f,    kMaxQ       = 12.0f;
-    static constexpr float kMinKeepHz  = 30.0f,   kMaxKeepHz  = 300.0f;
+    /** The clean lows' corner. Not under 80 Hz: a corner below the low B's fundamental protects nothing a bass plays
+        (keepLows 0 is that), and the ladder's bend grows as the corner falls (see kCornerSweepSeconds). */
+    static constexpr float kMinKeepHz  = 80.0f,   kMaxKeepHz  = 300.0f;
 
     /** How far below full opening the sweep is closed: the envelope's last 30 dB under (0 dBFS − sensitivity)
         walk the cutoff across the whole range, so a note decaying by 30 dB closes it all the way. */
@@ -271,18 +274,19 @@ public:
     static constexpr double kDoorSeconds   = 0.010;   ///< the low-pass door's travel (linear, counted, lands exactly)
     /** The band pass's LADDER (see THE DOORS above). Its allpass turns a bass tone's phase by up to ~320° (−96° at
         82 Hz, −180° at the 150 Hz corner, −319° at 600 Hz), and turning it is a PITCH BEND: Δf = turn rate / 2π.
-        The first ladder (0.45 fs ceiling, a 50 ms smoothstep sweep, 10 ms rungs) bent 82/150/300 Hz tones by
-        309/339/292 cents. What sets the bend is the time the turn is spread over and how evenly: the ceiling sits
-        kLadderOctaves above the corner (so the sweep spends its time where bass phases turn, not in the treble),
-        the corner APPROACHES its target exponentially (shape kSweepShape: the rate falls with the distance left,
-        so the tones nearest the corner, which turn most, see the slowest travel), and the rungs are long enough
-        that the ceiling allpass's own small phase (≈ 2√2·f/ceiling) does not bend on the first rung. Measured
-        (EnvelopeFilterTests, 44.1/48/96 kHz): at most ~48 cents on a wake or a disengage, for 250 ms of ladder;
-        a click on the first rung loses 0.3–0.7 dB. Longer halves it again, at the cost of a slower band pass — the
-        owner's call by ear (the render tool's door demo). */
+        The first ladder (a 50 ms smoothstep sweep, 10 ms rungs) bent 82/150/300 Hz tones by 309/339/292 cents. What
+        sets the bend is the time the turn is spread over and how evenly: the corner APPROACHES its target
+        exponentially (shape kSweepShape: the rate falls with the distance left, so the tones nearest the corner,
+        which turn most, see the slowest travel), over 200 ms, between 25 ms rungs. The ceiling stays at 0.45 fs: a
+        ceiling a few octaves above the corner bought ~2 cents and put rung 1's crossfade against an allpass that is
+        −1 AT the ceiling — a notch there on every engage (−40 dB at 2.4 kHz for a tone, measured).
+        THE BEND DEPENDS ON THE CORNER: a low corner's harmonics octaves above it are crossed while the sweep is
+        still fast. Worst over 41 Hz … 2.4 kHz tones, a wake or a disengage, measured at 48 kHz (44.1/96 within
+        ~1.5 cents): corner 80 Hz 95 cents, 100 Hz 77, 150 Hz 50, 200 Hz 38, 300 Hz 25 — and 155 at 50 Hz, 257 at
+        30 Hz, which is why the corner stops at 80. A click on the first rung loses ~1 dB. A longer sweep lowers it
+        all ~1/T, at the cost of a slower band pass — the owner's call by ear (the render tool's door demo). */
     static constexpr double kCornerSweepSeconds = 0.200;
     static constexpr double kRungSeconds        = 0.025;  ///< the ladder's first and last crossfades
-    static constexpr double kLadderOctaves      = 4.0;    ///< the ladder's ceiling above the corner (capped at 0.45 fs)
     static constexpr double kSweepShape         = 4.0;    ///< the exponential approach's rate (e-folds over the sweep)
 
     /** Never above this share of the rate, whatever the range says: the prewarp's tan() runs away at Nyquist. */
@@ -642,7 +646,7 @@ private:
         const int    into = std::min (std::max (ladPos_ - rungLen_, 0), sweepLen_);
         const double c = (double) into / (double) sweepLen_;
         const double e = ease (c);
-        const double span = std::min (kLadderOctaves, std::max (kfMax_ - kf_, 0.0));   // the ceiling, above the corner
+        const double span = std::max (kfMax_ - kf_, 0.0);   // from the ceiling, 0.45 fs, down to the corner
         apSvf_.setParams (eq::FilterType::AllPass, core::det::exp2 (kf_ + (1.0 - e) * span), kApQ, 0.0);
     }
 
