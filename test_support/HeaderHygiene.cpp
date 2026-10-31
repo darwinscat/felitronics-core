@@ -106,6 +106,8 @@
 #include <felitronics/multiband/MultibandWidth.h>
 #include <felitronics/neural/Inference.h>
 #include <felitronics/neural/NeuralStage.h>
+#include <felitronics/octave/OctaveLaw.h>
+#include <felitronics/octave/Octaver.h>
 #include <felitronics/oversampling/CascadeOversampler.h>
 #include <felitronics/oversampling/Oversampler.h>
 #include <felitronics/oversampling/PolyphaseOversampler.h>
