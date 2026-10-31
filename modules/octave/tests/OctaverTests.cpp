@@ -630,6 +630,28 @@ void loneClick()
         ok (worstNote > 0.2, (humDb < -200.0 ? std::string ("no hum") : fmt ("hum %.0f dBFS", humDb)) + ": ...and the note after each one locks");
     }
 
+    // ...and one SMOOTH cycle at every bass pitch (B0 … G2), 16 phases x both polarities, plain or with 0.5 / 2 ms end
+    // ramps: the band filters ring on after the source stops, and their ringing must not finish the proof (0faf723
+    // opened on it: 0.30 … 0.37 of sub from one cycle at 30.9 / 41.2 / 55 Hz).
+    double worstLow = 0.0;
+    std::string whereLow;
+    for (double f : { kLowB, kLowE, 55.0, 73.4162, 97.9989 })
+        for (double fade : { 0.0, 0.0005, 0.002 })
+            for (int c = 0; c < 32; ++c)
+            {
+                Buf x (samples (fs, 0.4), 0.0f);
+                const std::size_t start = samples (fs, 0.1), len = (std::size_t) (fs / f);
+                for (std::size_t i = 0; i < len; ++i)
+                {
+                    const double g = fade > 0.0 ? std::min ({ 1.0, (double) i / (fade * fs), (double) (len - 1 - i) / (fade * fs) }) : 1.0;
+                    x[start + i] = (float) ((c < 16 ? 0.3 : -0.3) * g * std::sin (2.0 * kPi * f * (double) i / fs + (c % 16) * kPi / 8.0));
+                }
+                const double p = peakOf (subOf (fs, x, levels (1.0f, 0.0f)), fs, 0.0, 0.4);
+                if (p > worstLow) { worstLow = p; whereLow = fmt ("%.2f Hz, %.1f ms ramps, case %.0f", f, fade * 1000.0, c); }
+            }
+    std::printf ("    one smooth cycle at B0 … G2, 3 ramps x 32 phases/polarities: the sub's largest sample %g %s\n", worstLow, whereLow.c_str());
+    ok (worstLow == 0.0, "one cycle at any bass pitch, phase, polarity or ramp makes no sub");
+
     // A burst of TWO cycles is a note: it is heard (the rule is two rises and two falls, not a length).
     Buf b2 (samples (fs, 0.3), 0.0f);
     for (std::size_t i = 0; i < samples (fs, 0.025); ++i) b2[samples (fs, 0.1) + i] = (float) (0.3 * std::sin (2.0 * kPi * 80.0 * (double) i / fs));
@@ -686,6 +708,128 @@ void humUnderTheGate()
         ok (worstOpen <= 2.0 && worstDrop == 0.0, w + ": low B and E lock on their own edges within two cycles and never let go");
         ok (untouched, w + ": from 150 ms after a note, the hum alone comes out bit for bit");
     }
+
+    // A loud G2 stopping dead over hum at -58 dBFS: the old note's follower decays through the gate's opening level
+    // while the hum supplies crossings — the hum must not be acquired on that tail (0faf723 acquired it 153 ms after
+    // the note, sub to +250 ms at 0.0024).
+    {
+        Buf x (samples (fs, 2.0), 0.0f);
+        for (std::size_t i = 0; i < x.size(); ++i) x[i] = (float) (std::pow (10.0, -58.0 / 20.0) * std::sin (2.0 * kPi * 60.0 * (double) i / fs + 0.3));
+        const std::size_t on = samples (fs, 0.3), off = samples (fs, 1.1);
+        for (std::size_t i = on; i < off; ++i)
+            x[i] += (float) (0.5 * std::min (1.0, (double) (i - on) / 96.0) * std::sin (2.0 * kPi * 97.9989 * (double) (i - on) / fs));
+        const Buf y = subOf (fs, x, oc::paramsForAmount (1.0f));
+        std::size_t last = off;
+        for (std::size_t i = off; i < y.size(); ++i) if (y[i] != 0.0f) last = i;
+        std::printf ("    G2 stopping dead over -58 dBFS hum: the sub's last sample %.1f ms after the note\n", (double) (last - off) / fs * 1000.0);
+        ok (peakOf (y, fs, 0.5, 1.0) > 0.2 && (double) (last - off) / fs < 0.1, "a loud G2 stopping over -58 dBFS hum: no sub from 100 ms after it — the hum is not acquired");
+    }
+}
+
+/** A note much quieter than the one before it — played at once, 8 restart phases x both polarities — and a quiet note
+    after a DC pulse: the source's own peak must forget the old signal (13d1d3f held it for ever: 0.004 after a 0.5 low
+    B, or 0.01 after a +0.5 DC pulse, never acquired — the gate open, the sub exactly zero for ten seconds). The bound
+    is the measured worst, 160.3 ms after the switch for the 40 dB drops (the loud note's loss included), plus 25 %. */
+void quietAfterLoud()
+{
+    group ("a much quieter note after a loud one (and after a DC pulse) is acquired — the source's peak forgets");
+    for (double fs : { 44100.0, 48000.0, 96000.0 })
+    {
+        for (double q : { 0.004, 0.05, 0.005 })   // codex's case, 20 dB and 40 dB under
+        {
+            double lo = 1.0e9, hi = 0.0;
+            int bad = 0;
+            for (int c = 0; c < 16; ++c)
+            {
+                Buf x (samples (fs, 2.0), 0.0f);
+                const std::size_t s0 = samples (fs, 0.5);
+                for (std::size_t i = 0; i < s0; ++i) x[i] = (float) (0.5 * std::sin (2.0 * kPi * kLowB * (double) i / fs));
+                fadeIn (x, fs, 0.002);
+                for (std::size_t i = s0; i < x.size(); ++i)
+                    x[i] = (float) ((c < 8 ? q : -q) * std::sin (2.0 * kPi * kLowE * (double) (i - s0) / fs + (c % 8) * kPi / 4.0));
+                const Buf y = subOf (fs, x, levels (1.0f, 0.0f));
+                std::size_t back = samples (fs, 0.5 + 1.25 / kLowB + 0.006);   // past the loud note's own fade
+                while (back < y.size() && y[back] == 0.0f) ++back;
+                const double ms = (double) (back - s0) / fs * 1000.0;
+                lo = std::min (lo, ms);
+                hi = std::max (hi, ms);
+                if (! (peakOf (y, fs, 1.5, 2.0) > 0.5 * q && badHalfPeriods (y, fs, 1.0, 2.0, fs / kLowE, 0.05) == 0)) ++bad;
+            }
+            if (fs == 48000.0)
+                std::printf ("    a %.3f low E right after a 0.5 low B: its sub %.1f … %.1f ms after the switch (16 phases/polarities)\n", q, lo, hi);
+            ok (hi < 200.0 && bad == 0, fmt ("%.0f Hz: a %.3f low E right after a 0.5 low B ", fs, q)
+                                       + fmt ("has its sub by %.1f ms after the switch at every phase and polarity, and tracks", hi));
+        }
+        Buf d (samples (fs, 2.0), 0.0f);
+        for (std::size_t i = samples (fs, 0.1); i < samples (fs, 0.12); ++i) d[i] = 0.5f;
+        for (std::size_t i = samples (fs, 0.3); i < d.size(); ++i) d[i] = (float) (0.01 * std::sin (2.0 * kPi * kLowE * (double) (i - samples (fs, 0.3)) / fs));
+        const Buf y = subOf (fs, d, levels (1.0f, 0.0f));
+        std::size_t back = samples (fs, 0.3);
+        while (back < y.size() && y[back] == 0.0f) ++back;
+        ok ((double) (back - samples (fs, 0.3)) / fs < 0.1 && badHalfPeriods (y, fs, 0.6, 2.0, fs / kLowE, 0.05) == 0,
+            fmt ("%.0f Hz: a 0.01 low E after a +0.5 DC pulse has its sub ", fs) + fmt ("%.1f ms in, and tracks", (double) (back - samples (fs, 0.3)) / fs * 1000.0));
+    }
+}
+
+/** The supported range is fundamentals from 26 Hz to about 400 Hz: smooth, harmonic notes (four partials, a
+    band-limited saw) at 26, 27.5 (drop A), 30.9 (low B), 98 and 400 Hz acquire in BOTH polarities, 4 phases each,
+    within the measured worst plus a margin — 1.8 cycles to 31 Hz, 2.2 at 98, 2.8 at 400 (measured over 16
+    phases/polarities: 1.66 / 1.68 / 2.04 / 2.66). 25 Hz is a margin row. Below the range the 1/22 s deadline is too
+    close to the period: codex's 22.2 Hz saw acquires in one polarity and never in the other. */
+void supportedRange()
+{
+    group ("the supported range is 26 … 400 Hz: smooth notes acquire in both polarities and every phase, within the stated cycles");
+    const struct { double f, bound; } rows[] = { { 25.0, 1.8 }, { 26.0, 1.8 }, { 27.5, 1.8 }, { kLowB, 1.8 }, { 97.9989, 2.2 }, { 400.0, 2.8 } };
+    for (double fs : { 44100.0, 48000.0, 96000.0 })
+        for (const auto& r : rows)
+        {
+            const double f = r.f;
+            double worst = 0.0;
+            int bad = 0;
+            for (int c = 0; c < 8; ++c)
+            {
+                Buf x (samples (fs, 1.5));
+                for (std::size_t i = 0; i < x.size(); ++i)
+                {
+                    double v = 0.0;
+                    for (int k = 1; k <= 4; ++k) v += std::sin (2.0 * kPi * k * f * (double) i / fs + k * (c % 4) * kPi / 2.0) / k;
+                    x[i] = (float) ((c < 4 ? 1.0 : -1.0) * 0.6 / kPi * v);
+                }
+                fadeIn (x, fs, 0.002);
+                const Buf y = subOf (fs, x, levels (1.0f, 0.0f));
+                std::size_t first = 0;
+                while (first < y.size() && y[first] == 0.0f) ++first;
+                worst = std::max (worst, (double) first * f / fs);
+                if (badHalfPeriods (y, fs, 0.4, 1.5, fs / f, 0.05) != 0) ++bad;
+            }
+            ok (worst <= r.bound && bad == 0, fmt ("%.0f Hz, %.1f Hz: ", fs, f)
+                                              + fmt ("the sub starts by %.2f cycles (bound %.1f) in both polarities and tracks", worst, r.bound));
+        }
+}
+
+/** A sustained note right at the gate, whose follower ripples across the opening level (0.84 … 1.28 times it): it is
+    acquired from its fresh level over a period, not at the instant of each crossing (0faf723 never acquired it: two
+    seconds of exact zero, every rate, both polarities). */
+void nearTheGate()
+{
+    group ("a sustained low B right at the gate — its follower rippling across the opening level — is acquired, every rate and polarity");
+    for (double fs : { 44100.0, 48000.0, 96000.0 })
+        for (double sign : { 1.0, -1.0 })
+        {
+            Buf x (samples (fs, 2.0));
+            for (std::size_t i = 0; i < x.size(); ++i)
+            {
+                const double ph = 2.0 * kPi * kLowB * (double) i / fs;
+                x[i] = (float) (sign * 0.0024 * (std::sin (ph) + 0.9 * std::sin (2.0 * ph + 0.8)));
+            }
+            fadeIn (x, fs, 0.002);
+            const Buf y = subOf (fs, x, levels (1.0f, 0.0f));
+            std::size_t first = 0;
+            while (first < y.size() && y[first] == 0.0f) ++first;
+            const double at = (double) first / fs;
+            ok (at < 0.15 && badHalfPeriods (y, fs, 0.4, 2.0, fs / kLowB, 0.05) == 0,
+                fmt ("%.0f Hz, polarity %+.0f: the sub starts ", fs, sign) + fmt ("%.1f ms in and tracks for the whole note", at * 1000.0));
+        }
 }
 
 void silenceBetweenNotes()
@@ -1023,7 +1167,8 @@ void pauseIsSilence()
     ok (same == cases, fmt ("after a pause, every sample equals the same stream after silence (%.0f of %.0f gap lengths)", same, cases));
     ok (heard == cases, "precondition: every return has its sub");
 
-    // A long pause parks: ten minutes in one call costs no more than its first second and a half.
+    // A long pause parks: ten minutes in one call costs only the audio time it takes to reach the silent fixed point
+    // (1.5 … 1.6 s after a 0.5-peak note; at most about 1.8 s, the source peak's decay from the input limit).
     oc::Octaver o;
     felitronics::test::run (o.prepare (fs, 64, 2));
     o.setParams (levels (1.0f, 1.0f));
@@ -1224,6 +1369,9 @@ int main()
     mutedTail();
     loneClick();
     humUnderTheGate();
+    nearTheGate();
+    quietAfterLoud();
+    supportedRange();
     silenceBetweenNotes();
     latency();
     subHighPass();
