@@ -6,8 +6,8 @@
 //   fcore_octave_render <out-dir> [in.wav ...]
 //
 // Each input (a bass DI; channels are processed as the stage gets them, 1 or 2) is rendered through the one-slider
-// law at amount 0.25 / 0.5 / 0.75 / 1, through the −2 octave alone under the dry, and through each octave alone
-// with no dry — 24-bit WAVs named `octave-<input>-<setting>.wav`, with the input itself as `-before`. With no
+// law at amount 0.25 / 0.5 / 0.75 / 1 (the default menu: −1 up to 1.25, −2 off), through the −2 octave alone under
+// the dry, and through each octave alone with no dry — 24-bit WAVs named `octave-<input>-<setting>.wav`, with the input itself as `-before`. With no
 // input it synthesises a bass line first (modal plucked strings, fingered and slapped, low B 30.9 Hz up to G2
 // 98 Hz, a long decay, a gap over a noise floor) and renders that, named `octave-<setting>.wav`.
 
@@ -135,6 +135,17 @@ Planes run (const Planes& in, double fs, const oc::OctaverParams& p)
     return out;
 }
 
+/** The sub ALONE: the stage has no dry level, so it is read from a stereo call whose right channel is silent —
+    {2·mean, 0} tracks the mean, and the right channel comes back as the sub. Mono out. */
+Planes alone (const Planes& in, double fs, const oc::OctaverParams& p)
+{
+    Planes two (2, std::vector<double> (in[0].size(), 0.0));
+    for (const auto& c : in)
+        for (std::size_t i = 0; i < c.size(); ++i) two[0][i] += 2.0 * c[i] / (double) in.size();
+    const Planes out = run (two, fs, p);
+    return out.empty() ? out : Planes { out[1] };
+}
+
 bool write (const std::string& path, const Planes& x, double fs)
 {
     double peak = 0.0;
@@ -185,12 +196,12 @@ int main (int argc, char** argv)
             all = write (in.prefix + name, run (in.x, in.fs, oc::paramsForAmount (a)), in.fs) && all;
         }
         oc::OctaverParams p;
-        p.sub1 = 0.0f; p.sub2 = 1.0f; p.dry = 1.0f;
+        p.sub1 = 0.0f; p.sub2 = 1.0f;
         all = write (in.prefix + "sub2-under-dry.wav", run (in.x, in.fs, p), in.fs) && all;
-        p.sub1 = 1.0f; p.sub2 = 0.0f; p.dry = 0.0f;
-        all = write (in.prefix + "sub1-alone.wav", run (in.x, in.fs, p), in.fs) && all;
-        p.sub1 = 0.0f; p.sub2 = 1.0f; p.dry = 0.0f;
-        all = write (in.prefix + "sub2-alone.wav", run (in.x, in.fs, p), in.fs) && all;
+        p.sub1 = 1.0f; p.sub2 = 0.0f;
+        all = write (in.prefix + "sub1-alone.wav", alone (in.x, in.fs, p), in.fs) && all;
+        p.sub1 = 0.0f; p.sub2 = 1.0f;
+        all = write (in.prefix + "sub2-alone.wav", alone (in.x, in.fs, p), in.fs) && all;
     }
     return all ? 0 : 1;
 }
