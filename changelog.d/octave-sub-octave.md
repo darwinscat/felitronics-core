@@ -16,8 +16,9 @@ The note's life is measured in its own periods.
   peak that forgets in ~50 ms). So hum under the gate proves nothing, a note whose follower ripples across the gate
   still acquires, a much quieter note after a loud one is acquired, and no one-cycle click — any bass pitch, phase,
   polarity or ramp — makes a sub.
-- The supported range is fundamentals from 25 Hz to about 400 Hz; from 25 Hz smooth notes acquire in both polarities
-  within 2.5 cycles.
+- The supported range is fundamentals from 26 Hz to about 400 Hz. Inside it, smooth notes acquire in both
+  polarities and every phase within 1.7 cycles at 26 … 31 Hz, rising to 2.7 at 400 Hz. Below it, one polarity may not
+  acquire at all.
 - Deadlines come only from a period confirmed by two agreeing intervals. An edge a quarter period late fades the sub
   out over 4 ms, after the filters, to an exact zero; two periods without one lose the note.
 - On reopening, the voices start primed at the new note's level.
