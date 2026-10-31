@@ -35,38 +35,52 @@ namespace felitronics::octave
 // of a peak that has decayed for half a period (40 ms release). A rising edge sooner than 1/480 s after the last
 // one is ignored — no bass fundamental is that high — which is what keeps a slap's click out of the divider.
 //
-// THE NOTE'S LIFE. The note's PERIOD is the longest of the last three intervals between accepted edges (one stray
-// short interval does not halve it). A steady note's next edge comes within about 1 % of it; one a quarter period
-// LATE means the string is dying, and from that sample the sub fades out over 4 ms — AFTER the filters, so it ends
-// in an exact zero and the high pass is not handed a step to ring on — and fades back in on the next edge (a legato
-// move down sounds through with a short gap). A muted note therefore does not hold its last cycle as a DC plateau.
-// Two periods without an edge (at most 1/22 s) and the note is LOST: the thresholds drop to nothing (a quieter next
-// note is not locked out by a louder one's), and the next note must prove itself with TWO edges one plausible period
-// apart before the sub plays again — a lone click in a gap makes one edge and no sub. Dying moves the fade only,
-// never the thresholds: re-anchoring them on a late edge was tried, and on a weak fundamental it fed itself — one
-// double trigger halved the period, the next true edge looked late, the lowered thresholds took the 2nd harmonic's
-// bump, and the tracker settled into following it. Nor is it a release of the level BEFORE the filters: that hands
-// the sub's high pass a falling step, which comes out as one more pulse (measured: later under -20 dB than no
-// release at all).
+// THE NOTE'S LIFE. An edge COUNTS only with the gate open, and a note is ACQUIRED — two edges after a loss — only
+// while the band is above the gate's opening level: what plays under the gate, a DI's hum included, can neither
+// prove a note nor set its period (measured on 7188cfc: 60 Hz hum at -80 dBFS locked the sub 1.1 ms into a low B,
+// before the string's own first edge, and dropped it for 10 ms when the string took over). The comparator's floor
+// rides 20 dB under the band's own level, so hum under a sounding note never squares up at all.
 //
-// THE DIVIDER. Each accepted rising edge flips a flip-flop: −1 octave. Every second flip flips another: −2. The
+// The note's PERIOD is the longest of the last three intervals between counted edges, and it sets the deadlines
+// only once CONFIRMED — two intervals in a row within a quarter of each other; a note's first interval can be a
+// partial attack cycle (813 samples on a low B whose period is 1555), and a deadline drawn from it lost the note
+// before its next true edge. A confirmed note's next edge comes within about 1 % of its period; one a quarter period
+// LATE means the string is dying, and from that sample the sub fades out over 4 ms — AFTER the filters, so it ends
+// in an exact zero and the high pass is not handed a step to ring on — and fades back in on the next edge. A muted
+// note therefore does not hold its last cycle as a DC plateau. Two periods without an edge (at most 1/22 s; 1/22 s
+// while unconfirmed) and the note is LOST: the thresholds drop to nothing (a quieter next note is not locked out by
+// a louder one's), and the next note must prove itself with TWO counted rises AND TWO counted falls before the sub
+// plays again. One cycle of anything — the smoothest click is a single cycle with ramps — has at most two of one and
+// one of the other, so no click makes a sub (measured on 7188cfc, which asked for two rises: 0.19 from a smooth one). Dying moves the fade only, never the thresholds: re-anchoring them on a
+// late edge was tried, and on a weak fundamental it fed itself (one double trigger halved the period, the next true
+// edge looked late, the lowered thresholds took the 2nd harmonic's bump). Nor is it a release of the level BEFORE
+// the filters: that hands the sub's high pass a falling step, which comes out as one more pulse.
+//
+// THE REOPEN. While the sub is faded out its voices hold nothing (reset once, then idle) and its level is SET to the
+// cycle in progress, not glided. When the fade reopens, each voice is primed where a long half-cycle of the other
+// polarity would have left it, so its first output is a full step at the level of the note it reopens on — on an edge
+// the edge itself; for a note proven on its second fall, a step there (its first half-cycle a little short) rather
+// than half a cycle of near-silence waiting for the next edge. Measured on 7188cfc: a loud low E then a G2 20 dB
+// quieter reopened at 6.29 times the G2's own level, from the level and the filter state the low E had left.
+//
+// THE DIVIDER. Each counted rising edge flips a flip-flop: −1 octave. Every second flip flips another: −2. The
 // squares change sign mid-sample where the crossing actually lay (the sample carries the box average of the
 // step), so the sub's period does not wobble on the sample grid.
 //
-// THE VOICE. Each square is scaled by the band's peak over the last input cycle — let down only at an edge (or by
-// the dying release), so a steady note gives a steady sub with no follower ripple on it, and up at once when the
-// cycle in progress is already louder — glided over 10 ms; then rounded by its own 2-pole low pass (TONE), cleared
-// of what no amp or speaker should be asked for by a 2-pole high pass (SUB HP, 25 Hz: the −1 of the B string's
-// lowest frets is 15.4 … 20.6 Hz), and only THEN set by its level and the lock gain: a level of zero is an exact
-// zero with nothing ringing behind it. At level 1 the sub's square swings to the band's peak before the filters.
-// TONE and SUB HP glide to a new corner in log frequency over 20 ms, re-designed every 16 samples of audio time —
-// swapping a filter's coefficients under live state in one step is a click (measured: 1075 times the held filter's
-// curvature for 120 → 2000 Hz in mid-edge).
+// THE VOICE. Each square is scaled by the band's peak over the last input cycle — let down only at an edge, so a
+// steady note gives a steady sub with no follower ripple on it, and up at once when the cycle in progress is already
+// louder — glided over 10 ms; then rounded by its own 2-pole low pass (TONE), cleared of what no amp or speaker
+// should be asked for by a 2-pole high pass (SUB HP, 25 Hz: the −1 of the B string's lowest frets is
+// 15.4 … 20.6 Hz), and only THEN set by its level and the lock gain: a level of zero is an exact zero with nothing
+// ringing behind it. At level 1 the sub's square swings to the band's peak before the filters. TONE and SUB HP glide
+// to a new corner in log frequency over 20 ms, re-designed EVERY SAMPLE while they travel: swapping a filter's
+// coefficients under live state in one step is a click (1075 times the held filter's curvature for 120 → 2000 Hz in
+// mid-edge, measured on 3971592), and swapping them every 16 samples was a staircase of small ones (7.25 % per step).
 //
 // THE GATE. The sub plays only while the band is above the gate (a 1 ms / 30 ms peak follower, 6 dB of hysteresis,
 // 50 ms hold — longer than the lowest note's period, so a follower's ripple on a decaying low B cannot chatter it)
-// AND the note is locked and not dying. Between notes the sub is an exact zero. A gate down at −90 dBFS opens on a DI's own noise
-// floor and the tracker follows the hiss — the range stops at −90 for that reason, and −50 is the default.
+// AND the note is locked and not dying. Between notes the sub is an exact zero. A gate down at −90 dBFS opens on a
+// DI's own noise floor and the tracker follows the hiss — the range stops at −90 for that reason; −50 is the default.
 //
 // MONOPHONIC. A chord has no one fundamental: the comparator follows whatever its sum crosses — usually the lowest
 // note when it is the loudest in the band, otherwise the beat pattern between the notes — and the sub comes out as
@@ -108,11 +122,14 @@ namespace felitronics::octave
 
 /** The knobs, in the units the stage takes. `Octaver::setParams` applies them through the same guarded setters a
     caller may use one by one. `paramsForAmount()` (OctaveLaw.h) is the one-slider face of these: it OWNS `sub1`
-    and `sub2`, and reads the menu's own values of those two as the levels the slider reaches at its top. */
+    and `sub2` (the levels now) and writes them from the menu's `sub1Top` / `sub2Top`, which it never changes — so the
+    stage's current params can be handed back to it as the menu. */
 struct OctaverParams
 {
-    float sub1    = 1.25f;    ///< −1 octave level, 0 … 2 (1: the square swings to the band's peak)
-    float sub2    = 0.0f;     ///< −2 octave level, 0 … 2
+    float sub1Top = 1.25f;    ///< MENU: the −1 level at the slider's top (read by the law; the stage ignores it)
+    float sub2Top = 0.0f;     ///< MENU: the −2 level at the slider's top (read by the law; the stage ignores it)
+    float sub1    = 1.25f;    ///< −1 octave level now, 0 … 2 (1: the square swings to the band's peak) — the law's
+    float sub2    = 0.0f;     ///< −2 octave level now, 0 … 2                                          — the law's
     float toneHz  = 120.0f;   ///< the sub's low pass, 30 … 2000 Hz — lower is rounder
     float subHpHz = 25.0f;    ///< the sub's high pass, 10 … 80 Hz — what no amp or speaker should be asked for
     float gateDb  = -50.0f;   ///< tracking gate, dBFS of the 20 … 400 Hz band, −90 … −20 — lower tracks quieter notes
@@ -177,6 +194,7 @@ public:
     static constexpr double kMinTrackHz = 22.0;    // 1/22 s between edges: lost, whatever the period was
     static constexpr double kMaxTrackHz = 480.0;   // an edge sooner than 1/480 s after the last: not a fundamental
     static constexpr float  kInputLimit = 4.0f;    // what the tracker reads: +12 dBFS; beyond is clamped
+    static constexpr float  kFloorUnderBand = 0.1f; // the comparator's floor rides 20 dB under the band's own level
 
     // The note's life, in its own periods.
     static constexpr int kDyingQuarters = 5;       // an edge 5/4 of a period late: the note is dying, the sub fades
@@ -192,8 +210,7 @@ public:
     static constexpr float  kFloorUnderGate      = 0.01f;  // the comparator's floor: 40 dB under the gate
     static constexpr double kLevelRampSeconds    = 0.020;  // sub1 / sub2 glides
     static constexpr double kDoorSeconds         = 0.010;  // the tracker's input door on a wake
-    static constexpr double kCornerGlideSeconds  = 0.020;  // TONE / SUB HP glides, in log frequency
-    static constexpr int    kCornerStep          = 16;     // ...re-designed every 16 samples of audio time
+    static constexpr double kCornerGlideSeconds  = 0.020;  // TONE / SUB HP glides, in log frequency, re-designed per sample
 
     Octaver() noexcept { setParams (OctaverParams {}); }
 
@@ -234,9 +251,8 @@ public:
         sub1_.setLength ((int) std::lround (kLevelRampSeconds * fs_));
         sub2_.setLength ((int) std::lround (kLevelRampSeconds * fs_));
         door_.setLength ((int) std::lround (kDoorSeconds * fs_));
-        const int cornerSteps = (int) std::lround (kCornerGlideSeconds * fs_ / kCornerStep);
-        toneLog_.setLength (cornerSteps);
-        hpLog_.setLength (cornerSteps);
+        toneLog_.setLength ((int) std::lround (kCornerGlideSeconds * fs_));
+        hpLog_.setLength ((int) std::lround (kCornerGlideSeconds * fs_));
 
         cold_ = false;   // force the drop: a re-prepare holds nothing it heard before
         dropTracker();
@@ -330,8 +346,7 @@ public:
                 wake();
             }
 
-            // Segments end on the corners' 16-sample steps and on the 64-sample grid, both in audio time.
-            const int seg = std::min (grid_.segment (numSamples - done), kCornerStep - grid_.phase() % kCornerStep);
+            const int seg = grid_.segment (numSamples - done);   // segments end on the 64-sample grid of audio time
 
             if (numChannels == 0 && trackerAtRest())
             {
@@ -346,6 +361,11 @@ public:
                     break;
                 }
                 sub1_.advance (seg); sub2_.advance (seg); door_.advance (seg);
+                if (! (toneLog_.landed() && hpLog_.landed()))
+                {
+                    toneLog_.advance (seg); hpLog_.advance (seg);   // the filters hold nothing: only where they land
+                    applyCorners();                                  // matters, not the way there
+                }
             }
             else
             {
@@ -353,10 +373,7 @@ public:
             }
 
             done += seg;
-            const bool gridPoint = grid_.advance (seg);
-            if (grid_.phase() % kCornerStep == 0)
-                stepCorners();
-            if (gridPoint)
+            if (grid_.advance (seg))
                 maintain();
         }
 
@@ -396,7 +413,7 @@ private:
 
     bool isLockedNow() const noexcept
     {
-        return gateOpen_ && edgesSinceLoss_ >= 2 && sinceEdge_ <= lockLimit_ && sinceEdge_ < dyingAt_;
+        return gateOpen_ && edgesSinceLoss_ >= 2 && fallsSinceLoss_ >= 2 && sinceEdge_ <= lockLimit_ && sinceEdge_ < dyingAt_;
     }
 
     void applyGate() noexcept
@@ -417,7 +434,8 @@ private:
         hp2_.setParams   (eq::FilterType::HighPass, hp,   kButterworthQ, 0.0);
     }
 
-    /** One step of the corner glides, on the 16-sample clock of audio time. */
+    /** One sample of the corner glides: re-designed every sample while they travel, so the filter moves on a curve
+        and never on stairs. */
     void stepCorners() noexcept
     {
         if (toneLog_.landed() && hpLog_.landed())
@@ -454,12 +472,15 @@ private:
         period_ = lockLimit_ = maxPeriod_;
         intervals_[0] = intervals_[1] = intervals_[2] = 0;
         dyingAt_ = maxPeriod_ + 2;   // unreachable: the counter stops at maxPeriod_ + 1
+        fallsSinceLoss_ = 0;
+        sawLow_ = false;
         sinceEdge_ = maxPeriod_ + 1;
         edgesSinceLoss_ = 0;
         lockPos_ = 0;
         gateOpen_ = false;
         gateHold_ = 0;
         edges_ = 0;
+        voicesQuiet_ = true;
         door_.snapTo (0.0f);
         cold_ = true;
     }
@@ -473,7 +494,8 @@ private:
         return plusZero (tilt_) && plusZero (prevT_) && plusZero (peakPos_) && plusZero (peakNeg_)
             && (plusZero (cycleMax_) || cycleMax_ >= 1.0e-15f) && plusZero (amp_)
             && plusZero (ampTarget_) && plusZero (gateEnv_.stateWord())
-            && ! gateOpen_ && gateHold_ == 0 && lockPos_ == 0 && edgesSinceLoss_ == 0 && sinceEdge_ > maxPeriod_
+            && ! gateOpen_ && gateHold_ == 0 && lockPos_ == 0 && voicesQuiet_ && edgesSinceLoss_ == 0
+            && sinceEdge_ > maxPeriod_
             && hpBand_.isAtRest() && lpBand_.isAtRest() && tone1_.isAtRest() && tone2_.isAtRest()
             && hp1_.isAtRest() && hp2_.isAtRest();
     }
@@ -516,6 +538,8 @@ private:
     /** One sample of the tracker and the voices; returns the sub. */
     float tick (float x) noexcept
     {
+        stepCorners();
+
         // The bass fundamental range, through the wake's door.
         const float b = lpBand_.processSample (0, hpBand_.processSample (0, x * door_.next()));
 
@@ -559,23 +583,33 @@ private:
                 high_ = false;
                 cycleMax_ = ab;
                 intervals_[0] = intervals_[1] = intervals_[2] = 0;
+                fallsSinceLoss_ = 0;
+                sawLow_ = false;
             }
         }
+        const bool dyingBefore = sinceEdge_ >= dyingAt_;
 
-        const float hi = std::max (kHysteresis * peakPos_, floor_);
-        const float lo = std::max (kHysteresis * peakNeg_, floor_);
+        // The thresholds, and their floor: a fixed one under the gate, and one 20 dB under the band's own level — so
+        // hum or hiss under a note never squares up as edges of its own, at any level of the note.
+        const float fl = std::max (floor_, kFloorUnderBand * g);
+        const float hi = std::max (kHysteresis * peakPos_, fl);
+        const float lo = std::max (kHysteresis * peakNeg_, fl);
 
         bool  edge = false;
         float frac = 1.0f;
         if (! high_)
         {
-            if (t > hi)
+            // An edge COUNTS only with the gate open — and a note is only ACQUIRED (the two-edge proof) above the
+            // gate's opening level: what plays under the gate, hum included, can neither prove a note nor set its
+            // period. A crossing that may not count leaves the comparator LOW, so the rise that opens the gate is the
+            // note's first edge, not the one a cycle later.
+            if (t > hi && gateOpen_ && (edgesSinceLoss_ >= 2 || g >= gateOn_))
             {
                 high_ = true;
                 if (sinceEdge_ >= minPeriod_)
                 {
                     edge = true;
-                    const float span = t - prevT_;   // > 0: t crossed hi from at or below it
+                    const float span = t - prevT_;   // > 0 when t crossed hi from at or below it on this sample
                     frac = span > 0.0f ? detail::clampf (0.0f, 1.0f, (t - hi) / span) : 1.0f;
                 }
             }
@@ -583,6 +617,16 @@ private:
         else if (t < -lo)
         {
             high_ = false;
+        }
+
+        // ...and its FALLS, counted the same way (gate open, above the gate while acquiring), once per swing. A note
+        // opens the fade only after two rises AND two falls since it was lost: one cycle of anything — the smoothest
+        // click is a single cycle — has at most two of one and one of the other, so it never opens it.
+        if (t < -lo && ! sawLow_ && gateOpen_ && (fallsSinceLoss_ >= 2 || g >= gateOn_))
+        {
+            sawLow_ = true;
+            if (fallsSinceLoss_ < 2)
+                ++fallsSinceLoss_;
         }
         prevT_ = t;
 
@@ -593,7 +637,6 @@ private:
             if (edgesSinceLoss_ == 0)
             {
                 edgesSinceLoss_ = 1;   // the first edge after a loss: no period yet
-                period_ = lockLimit_ = maxPeriod_;
             }
             else
             {
@@ -601,13 +644,22 @@ private:
                 intervals_[2] = intervals_[1];
                 intervals_[1] = intervals_[0];
                 intervals_[0] = sinceEdge_;
-                period_    = std::max (intervals_[0], std::max (intervals_[1], intervals_[2]));
-                lockLimit_ = std::min (maxPeriod_, kLostPeriods * period_);
             }
-            dyingAt_   = edgesSinceLoss_ >= 2 ? period_ * kDyingQuarters / 4 + 1 : maxPeriod_ + 2;
+
+            // The LOSS deadline comes from a CONFIRMED period only — two intervals in a row that agree within a
+            // quarter. A note's first interval can be a partial attack cycle (measured: 813 samples on a low B whose
+            // period is 1555), and a loss drawn from it threw the note away before its next true edge. The DYING
+            // deadline (a fade, which the next edge reopens without a new proof) runs from the longest interval seen
+            // so far even before that: a two-lobe click — two edges, then nothing — fades after 5/4 of its own
+            // interval instead of playing for 1/22 s.
+            const int a0 = intervals_[0], a1 = intervals_[1];
+            const bool confirmed = a0 > 0 && a1 > 0 && 4 * std::abs (a0 - a1) <= std::max (a0, a1);
+            period_    = std::max (a0, std::max (a1, intervals_[2]));
+            lockLimit_ = confirmed ? std::min (maxPeriod_, kLostPeriods * period_) : maxPeriod_;
+            dyingAt_   = confirmed ? period_ * kDyingQuarters / 4 + 1 : maxPeriod_ + 2;
             sinceEdge_ = 0;
-            if (gateOpen_)
-                ++edges_;
+            sawLow_    = false;
+            ++edges_;
 
             q1_ = -q1_;
             const float box = 2.0f * frac - 1.0f;
@@ -622,22 +674,51 @@ private:
             cycleMax_  = 0.0f;
         }
 
-        // The level: up at once within a cycle, down at an edge — and released once the note is lost (behind the
-        // fade, which has already taken the sub to zero).
-        const bool lost = edgesSinceLoss_ == 0;
+        // The level: up at once within a cycle, down at an edge, released once the note is lost. While the sub is
+        // faded out it is not glided but SET — the voice that reopens speaks at the note it reopens on, never at the
+        // one before — and so it is at an edge that ends a dying stretch.
+        const bool lost  = edgesSinceLoss_ == 0;
+        const bool muted = lockPos_ == 0;
         if (lost)
             ampTarget_ = 0.0f;
         else if (cycleMax_ > ampTarget_)
             ampTarget_ = cycleMax_;
-        amp_ += (lost ? lostCoeff_ : ampCoeff_) * (ampTarget_ - amp_);
+        if (muted || (edge && dyingBefore))
+            amp_ = ampTarget_;
+        else
+            amp_ += (lost ? lostCoeff_ : ampCoeff_) * (ampTarget_ - amp_);
 
         // The voices: tone, sub HP, then the level and the lock fade (locked and not dying) — so a zero of either is
-        // an exact zero.
-        const float y1 = hp1_.processSample (0, tone1_.processSample (0, s1 * amp_));
-        const float y2 = hp2_.processSample (0, tone2_.processSample (0, s2 * amp_));
+        // an exact zero. Faded out, they hold nothing: they reopen from rest on the edge that reopens them, and no
+        // filter carries the last note's level into the next.
+        const bool open = isLockedNow();
+        float y1 = 0.0f, y2 = 0.0f;
+        if (muted && ! open)
+        {
+            if (! voicesQuiet_)
+            {
+                tone1_.reset(); tone2_.reset(); hp1_.reset(); hp2_.reset();
+                voicesQuiet_ = true;
+            }
+        }
+        else
+        {
+            if (voicesQuiet_)
+            {
+                // Reopening: each voice is put where a long half-cycle of the OTHER polarity would have left it, so
+                // its first output is a full step of the note it reopens on — on an edge that is the edge itself;
+                // off one (a note proven on its second fall, mid half-cycle) the sub enters with a step there, its
+                // first half-cycle a little short, rather than waiting half a cycle for the next edge to be heard.
+                tone1_.primeDc (0, -q1_ * amp_); hp1_.primeDc (0, -q1_ * amp_);
+                tone2_.primeDc (0, -q2_ * amp_); hp2_.primeDc (0, -q2_ * amp_);
+            }
+            voicesQuiet_ = false;
+            y1 = hp1_.processSample (0, tone1_.processSample (0, s1 * amp_));
+            y2 = hp2_.processSample (0, tone2_.processSample (0, s2 * amp_));
+        }
 
-        if (isLockedNow()) { if (lockPos_ < lockLen_) ++lockPos_; }
-        else               { if (lockPos_ > 0)        --lockPos_; }
+        if (open) { if (lockPos_ < lockLen_) ++lockPos_; }
+        else      { if (lockPos_ > 0)        --lockPos_; }
         const float lock = lockPos_ == lockLen_ ? 1.0f : (float) lockPos_ * lockStep_;
 
         return (sub1_.next() * y1 + sub2_.next() * y2) * lock;
@@ -661,8 +742,9 @@ private:
     float tilt_ = 0.0f, prevT_ = 0.0f, peakPos_ = 0.0f, peakNeg_ = 0.0f;
     float cycleMax_ = 0.0f, amp_ = 0.0f, ampTarget_ = 0.0f;
     float q1_ = -1.0f, q2_ = -1.0f;
-    bool  high_ = false, gateOpen_ = false;
+    bool  high_ = false, gateOpen_ = false, voicesQuiet_ = true, sawLow_ = false;
     int   intervals_[3] { 0, 0, 0 };   // the last three edge intervals, newest first (0: none yet)
+    int   fallsSinceLoss_ = 0;
     int   sinceEdge_ = 2, period_ = 1, lockLimit_ = 1, dyingAt_ = 3, edgesSinceLoss_ = 0, lockPos_ = 0, gateHold_ = 0;
     std::int64_t edges_ = 0;
 

@@ -343,32 +343,91 @@ void pitch()
         }
 }
 
-/** Cycles from `onset` until the sub first reaches half its own steady peak, and whether it is steady from then. */
+/** A note from silence, swept over 16 onset phases x both polarities: when the fade opens, when the sub first
+    reaches half its own steady peak, and whether the lock ever lets go in the first 300 ms after it opens. */
 void lockFromSilence()
 {
-    group ("lock: a note from silence locks within two cycles; no stray edge from then on, steady from the fourth cycle");
+    group ("lock: a note from silence, every onset phase and polarity — opens within two cycles, half level soon after, never lets go");
     for (double fs : { 44100.0, 48000.0, 96000.0 })
-        for (double f0 : { kLowE, kLowB })
+        for (const auto nb : { std::pair<double, double> { kLowB, 1.75 }, std::pair<double, double> { kLowE, 1.85 },
+                               std::pair<double, double> { 97.9989, 2.25 } })
         {
-            Buf x (samples (fs, 0.2), 0.0f);
-            append (x, sine (fs, f0, 0.5, 2.0, 0.002));
-            const Buf y = subOf (fs, x, levels (1.0f, 0.0f));
+            const double f0 = nb.first;
+            double worstOpen = 0.0, worstHalf = 0.0, worstDrop = 0.0, sumHalf = 0.0;
+            int stray = 0;
+            for (int c = 0; c < 32; ++c)
+            {
+                Buf x (samples (fs, 0.2), 0.0f);
+                Buf n = sine (fs, f0, c < 16 ? 0.5 : -0.5, 1.0, 0.0);
+                for (std::size_t i = 0; i < n.size(); ++i)
+                    n[i] = (float) ((c < 16 ? 0.5 : -0.5) * std::sin (2.0 * kPi * f0 * (double) i / fs + (c % 16) * kPi / 8.0));
+                fadeIn (n, fs, 0.002);
+                append (x, n);
 
-            const double steady = peakOf (y, fs, 1.5, 2.2);
-            const std::size_t onset = samples (fs, 0.2);
-            std::size_t at = onset;
-            while (at < y.size() && std::fabs (y[at]) < 0.5 * steady) ++at;
-            const double cycles = (double) (at - onset) * f0 / fs;
-            const int stray  = badHalfPeriods (y, fs, (double) at / fs, 2.2, fs / f0, 0.10);
-            const int wobble = badHalfPeriods (y, fs, (double) at / fs + 4.0 / f0, 2.2, fs / f0, 0.01);
-            std::printf ("    %5.1f kHz, %.2f Hz: half the steady level %.2f cycles after the onset; stray edges %d, "
-                         "half-periods off by > 1 %% from the fourth cycle %d\n", fs / 1000.0, f0, cycles, stray, wobble);
+                Buf l (x.size()), r (x.size(), 0.0f);
+                for (std::size_t i = 0; i < x.size(); ++i) l[i] = 2.0f * x[i];
+                oc::Octaver o;
+                felitronics::test::run (o.prepare (fs, 64, 2));
+                o.setParams (levels (1.0f, 0.0f));
+                std::vector<char> locked (x.size(), 0);
+                for (std::size_t at = 0; at < x.size(); at += 16)
+                {
+                    const int len = (int) std::min<std::size_t> (16, x.size() - at);
+                    float* io[2] = { l.data() + at, r.data() + at };
+                    felitronics::test::run (o.process (io, 2, len));
+                    for (int k = 0; k < len; ++k) locked[at + (std::size_t) k] = o.isLocked() ? 1 : 0;
+                }
+                const std::size_t onset = samples (fs, 0.2);
+                const double steady = peakOf (r, fs, 0.9, 1.2);
+                std::size_t open = onset, half = onset;
+                while (open < r.size() && ! locked[open]) ++open;
+                while (half < r.size() && std::fabs (r[half]) < 0.5 * steady) ++half;
+                std::size_t drop = 0;
+                for (std::size_t i = open; i < std::min (r.size(), open + samples (fs, 0.3)); ++i) drop += locked[i] ? 0 : 1;
+                worstOpen = std::max (worstOpen, (double) (open - onset) * f0 / fs);
+                worstHalf = std::max (worstHalf, (double) (half - onset) * f0 / fs);
+                sumHalf  += (double) (half - onset) * f0 / fs;
+                worstDrop = std::max (worstDrop, (double) drop / fs * 1000.0);
+                stray += badHalfPeriods (r, fs, (double) half / fs + 2.0 / f0, 1.2, fs / f0, 0.03) == 0 ? 0 : 1;
+            }
+            std::printf ("    %5.1f kHz, %5.2f Hz, 32 onsets: the fade opens by %.2f cycles; half level by %.2f (mean %.2f) = %.1f ms; "
+                         "unlocked after opening %.1f ms; onsets with a stray half-period after %d\n",
+                         fs / 1000.0, f0, worstOpen, worstHalf, sumHalf / 32.0, worstHalf / f0 * 1000.0, worstDrop, stray);
             const std::string w = fmt ("%.0f Hz, %.2f Hz", fs, f0);
-            ok (steady > 0.2, w + ": precondition — a steady sub to measure against");
-            ok (cycles <= 2.0, w + ": locks within two cycles");
-            ok (stray == 0, w + ": no stray or lost edge from the lock on");
-            ok (wobble == 0, w + ": every half-period within 1 % of the note's from the fourth cycle");
+            ok (worstOpen <= 2.0, w + ": the fade opens within two cycles at every onset phase and polarity");
+            ok (worstHalf <= nb.second, w + fmt (": half level within %.2f cycles at every onset", nb.second));
+            ok (worstDrop == 0.0, w + ": once open, the lock never lets go in the first 300 ms");
+            ok (stray == 0, w + ": no stray half-period from the second cycle after half level, at any onset");
         }
+}
+
+/** A louder note, then — legato — a new one at the same level or 12 / 20 dB under, three pitches, eight onset phases:
+    the WHOLE transient after the louder note's sub has faded must stay under the new note's own steady level. */
+void relock()
+{
+    group ("relock: after a louder note the new note's sub reopens at its own level — every pitch, phase and drop");
+    const double fs = 48000.0;
+    double worst = 0.0;
+    std::string where;
+    for (double hz : { kLowE, 55.0, 97.9989 })
+        for (double dB : { 0.0, -12.0, -20.0 })
+            for (int ph = 0; ph < 8; ++ph)
+            {
+                Buf x = sine (fs, kLowE, 0.5, 0.5, 0.002);
+                const std::size_t s0 = x.size();
+                Buf n (samples (fs, 0.7));
+                for (std::size_t i = 0; i < n.size(); ++i)
+                    n[i] = (float) (0.5 * std::pow (10.0, dB / 20.0) * std::sin (2.0 * kPi * hz * (double) i / fs + ph * kPi / 4.0));
+                fadeIn (n, fs, 0.0005);
+                append (x, n);
+                const Buf y = subOf (fs, x, levels (1.0f, 0.0f));
+                const double steady = peakOf (y, fs, 0.9, 1.2);
+                const double from = (double) s0 / fs + 1.25 / kLowE + oc::Octaver::kLockRampSeconds + 0.001;   // the old sub's fade is over
+                const double r = peakOf (y, fs, from, 0.9) / steady;
+                if (r > worst) { worst = r; where = fmt ("%.1f Hz %+.0f dB phase %.0f", hz, dB, ph); }
+            }
+    std::printf ("    the largest sub from the old note's fade on, re the new note's steady: %.2f (%s; 7188cfc: 6.29)\n", worst, where.c_str());
+    ok (worst <= 1.6, "the relock transient stays under 1.6 of the new note's own steady level, everywhere");
 }
 
 void quieterNote()
@@ -539,20 +598,93 @@ void mutedTail()
 
 void loneClick()
 {
-    group ("a lone click in a gap makes one edge and no sub (a 12.5 ms 80 Hz cycle, negative first)");
+    group ("a lone click makes no sub: one 80 Hz cycle, sharp or smooth (2 ms ramps), every phase and polarity, over silence or hum");
     const double fs = 48000.0;
-    for (double pk : { 0.3, 0.05 })
+    for (double humDb : { -300.0, -80.0, -65.0 })
     {
-        Buf x (samples (fs, 0.4), 0.0f);
-        const std::size_t c0 = samples (fs, 0.1);
-        for (std::size_t i = 0; i < samples (fs, 0.0125); ++i) x[c0 + i] = (float) (-pk * std::sin (2.0 * kPi * 80.0 * (double) i / fs));
-        Buf note = sine (fs, kLowE, 0.5, 0.5, 0.002);   // ...then a real note, which must still lock
-        append (x, note);
-        const Buf y = subOf (fs, x, levels (1.0f, 0.0f));
-        const double after = peakOf (y, fs, 0.1, 0.4), noteSub = peakOf (y, fs, 0.6, 0.9);
-        std::printf ("    %.2f pk: the sub's peak in the gap %g; the note after it %.3f\n", pk, after, noteSub);
-        ok (after == 0.0, fmt ("%.2f pk: the click makes no sub at all", pk));
-        ok (noteSub > 0.2, fmt ("%.2f pk: ...and the note after it locks", pk));
+        double worst = 0.0, worstNote = 1.0;
+        for (double pk : { 0.3, 0.05 })
+            for (int c = 0; c < 32 + 1; ++c)   // 32 smooth phases/polarities, and the sharp negative-first cycle
+            {
+                Buf x (samples (fs, 0.4), 0.0f);
+                const std::size_t c0 = samples (fs, 0.1), L = samples (fs, 0.0125), R = samples (fs, 0.002);
+                for (std::size_t i = 0; i < L; ++i)
+                {
+                    if (c == 32)
+                        x[c0 + i] = (float) (-pk * std::sin (2.0 * kPi * 80.0 * (double) i / fs));
+                    else
+                    {
+                        const double g = std::min (1.0, std::min ((double) i / (double) R, (double) (L - i) / (double) R));
+                        x[c0 + i] = (float) ((c < 16 ? pk : -pk) * g * std::sin (2.0 * kPi * 80.0 * (double) i / fs + (c % 16) * kPi / 16.0));
+                    }
+                }
+                append (x, sine (fs, kLowE, 0.5, 0.5, 0.002));   // ...then a real note, which must still lock
+                for (std::size_t i = 0; i < x.size(); ++i) x[i] += (float) (std::pow (10.0, humDb / 20.0) * std::sin (2.0 * kPi * 60.0 * (double) i / fs + 0.3));
+                const Buf y = subOf (fs, x, levels (1.0f, 0.0f));
+                worst = std::max (worst, peakOf (y, fs, 0.0, 0.4));
+                worstNote = std::min (worstNote, peakOf (y, fs, 0.6, 0.9));
+            }
+        std::printf ("    hum %s: the sub's largest sample around 66 clicks %g; the weakest note after one %.3f\n",
+                     humDb < -200.0 ? "none   " : fmt ("%.0f dBFS", humDb).c_str(), worst, worstNote);
+        ok (worst == 0.0, (humDb < -200.0 ? std::string ("no hum") : fmt ("hum %.0f dBFS", humDb)) + ": no click makes any sub");
+        ok (worstNote > 0.2, (humDb < -200.0 ? std::string ("no hum") : fmt ("hum %.0f dBFS", humDb)) + ": ...and the note after each one locks");
+    }
+
+    // A burst of TWO cycles is a note: it is heard (the rule is two rises and two falls, not a length).
+    Buf b2 (samples (fs, 0.3), 0.0f);
+    for (std::size_t i = 0; i < samples (fs, 0.025); ++i) b2[samples (fs, 0.1) + i] = (float) (0.3 * std::sin (2.0 * kPi * 80.0 * (double) i / fs));
+    ok (peakOf (subOf (fs, b2, levels (1.0f, 0.0f)), fs, 0.1, 0.3) > 0.05, "...while a two-cycle burst is a note, and is heard");
+}
+
+/** Hum under the gate (a DI's 60 Hz at -80 / -65 dBFS) supplies nothing: a low note from cold locks on its own
+    edges and never lets go, and after a note the hum alone leaves the output bit-exact. */
+void humUnderTheGate()
+{
+    group ("hum under the gate proves nothing: a low note over it locks cleanly; after the note, the hum alone is untouched");
+    const double fs = 48000.0;
+    for (double humDb : { -80.0, -65.0 })
+    {
+        const auto hum = [&] (Buf& x) { for (std::size_t i = 0; i < x.size(); ++i) x[i] += (float) (std::pow (10.0, humDb / 20.0) * std::sin (2.0 * kPi * 60.0 * (double) i / fs + 0.3)); };
+        double worstDrop = 0.0, worstOpen = 0.0;
+        for (double f0 : { kLowB, kLowE })
+            for (int ph = 0; ph < 4; ++ph)
+            {
+                Buf x (samples (fs, 1.1), 0.0f);
+                for (std::size_t i = samples (fs, 0.3); i < x.size(); ++i)
+                    x[i] = (float) (0.5 * std::sin (2.0 * kPi * f0 * (double) (i - samples (fs, 0.3)) / fs + ph * kPi / 2.0));
+                hum (x);
+                Buf l (x.size()), r (x.size(), 0.0f);
+                for (std::size_t i = 0; i < x.size(); ++i) l[i] = 2.0f * x[i];
+                oc::Octaver o;
+                felitronics::test::run (o.prepare (fs, 64, 2));
+                o.setParams (levels (1.0f, 0.0f));
+                std::vector<char> locked (x.size(), 0);
+                for (std::size_t at = 0; at < x.size(); ++at)
+                {
+                    float* io[2] = { l.data() + at, r.data() + at };
+                    felitronics::test::run (o.process (io, 2, 1));
+                    locked[at] = o.isLocked() ? 1 : 0;
+                }
+                const std::size_t on = samples (fs, 0.3);
+                std::size_t open = on, drop = 0;
+                while (open < x.size() && ! locked[open]) ++open;
+                for (std::size_t i = open; i < on + samples (fs, 0.3); ++i) drop += locked[i] ? 0 : 1;
+                worstOpen = std::max (worstOpen, (double) (open - on) * f0 / fs);
+                worstDrop = std::max (worstDrop, (double) drop / fs * 1000.0);
+            }
+        // A note, then the hum alone.
+        Buf t = sine (fs, kLowE, 0.5, 0.5, 0.002);
+        fadeOut (t, fs, 0.01);
+        append (t, Buf (samples (fs, 1.0), 0.0f));
+        hum (t);
+        const Buf full = mix (fs, t, levels (1.0f, 0.0f));
+        bool untouched = true;
+        for (std::size_t i = samples (fs, 0.65); i < t.size(); ++i) untouched = untouched && std::memcmp (&full[i], &t[i], sizeof (float)) == 0;
+        std::printf ("    hum %.0f dBFS: low B / E from cold open by %.2f cycles, unlocked after opening %.1f ms (7188cfc: locked on the hum 1.1 ms in, "
+                     "then dropped ~10 ms); after the note the hum alone is %s\n", humDb, worstOpen, worstDrop, untouched ? "bit-exact" : "TOUCHED");
+        const std::string w = fmt ("hum %.0f dBFS", humDb);
+        ok (worstOpen <= 2.0 && worstDrop == 0.0, w + ": low B and E lock on their own edges within two cycles and never let go");
+        ok (untouched, w + ": from 150 ms after a note, the hum alone comes out bit for bit");
     }
 }
 
@@ -642,12 +774,12 @@ void subHighPass()
 //------------------------------------------------------------------------------ the slider and the contract
 void sliderLaw()
 {
-    group ("the one-slider law: a master over the menu's octaves; 0 is an exact zero; the menu's voice passes through");
+    group ("the one-slider law: a master over the menu's tops; 0 is an exact zero; current params fed back are stable");
     oc::OctaverParams menu;
-    menu.sub1 = 2.0f; menu.sub2 = 1.5f; menu.toneHz = 333.0f; menu.subHpHz = 40.0f; menu.gateDb = -61.0f;
+    menu.sub1Top = 2.0f; menu.sub2Top = 1.5f; menu.toneHz = 333.0f; menu.subHpHz = 40.0f; menu.gateDb = -61.0f;
     const auto z = oc::paramsForAmount (0.0f, menu);
     ok (felitronics::core::sameBits (z.sub1, 0.0f) && felitronics::core::sameBits (z.sub2, 0.0f),
-        "amount 0 -> both sub levels +0.0 exactly, whatever the menu's tops");
+        "amount 0 -> both sub levels +0.0 exactly, whatever the tops");
     bool mono = true, voice = true;
     float prev = -1.0f;
     for (int k = 0; k <= 1000; ++k)
@@ -656,28 +788,26 @@ void sliderLaw()
         const auto p = oc::paramsForAmount (a, menu);
         mono = mono && p.sub1 > prev && p.sub2 == 1.5f * oc::sliderTaper (a) + 0.0f;
         prev = p.sub1;
-        voice = voice && p.toneHz == 333.0f && p.subHpHz == 40.0f && p.gateDb == -61.0f;
+        voice = voice && p.sub1Top == 2.0f && p.sub2Top == 1.5f && p.toneHz == 333.0f && p.subHpHz == 40.0f && p.gateDb == -61.0f;
     }
-    ok (mono, "sub1 rises strictly with the slider; sub2 is the menu's top times the same taper");
-    ok (voice, "tone, sub HP and gate pass through from the menu at every slider position");
+    ok (mono, "sub1 rises strictly with the slider; sub2 is its top times the same taper");
+    ok (voice, "the tops, tone, sub HP and gate pass through from the menu at every slider position");
     for (float a : { 0.25f, 0.5f, 0.75f, 1.0f })
-        std::printf ("    amount %.2f -> sub1 %.4f (%+.1f dB) with the default menu\n", a, oc::paramsForAmount (a).sub1, 20.0 * std::log10 (oc::paramsForAmount (a).sub1));
-    ok (oc::paramsForAmount (1.0f).sub1 == oc::OctaverParams {}.sub1 && oc::paramsForAmount (1.0f).sub2 == 0.0f,
+        std::printf ("    amount %.2f -> sub1 %.4f (%+.1f dB) with the default tops\n", a, oc::paramsForAmount (a).sub1, 20.0 * std::log10 (oc::paramsForAmount (a).sub1));
+    ok (oc::paramsForAmount (1.0f).sub1 == oc::OctaverParams {}.sub1Top && oc::paramsForAmount (1.0f).sub2 == 0.0f,
         "amount 1 with the default menu -> -1 at its top (1.25), -2 off");
     ok (oc::paramsForAmount (-1.0f, menu).sub1 == 0.0f && oc::paramsForAmount (2.0f, menu).sub1 == 2.0f, "out of range is clamped");
 
-    // A non-finite amount is ignored: the stage's levels stand; the menu's voice still passes.
-    oc::Octaver o;
-    felitronics::test::run (o.prepare (48000.0, 64, 1));
-    o.setParams (oc::paramsForAmount (0.6f, menu));
-    Buf s (64, 0.0f);
-    runBlocks (o, { s.data() }, s.size());
-    const float before = o.sub1Level();
-    const auto nanP = oc::paramsForAmount (std::numeric_limits<float>::quiet_NaN(), menu);
-    o.setParams (nanP);
-    runBlocks (o, { s.data() }, s.size());
-    ok (std::isnan (nanP.sub1) && std::isnan (nanP.sub2) && nanP.toneHz == 333.0f, "NaN amount -> the owned levels NaN, the voice from the menu");
-    ok (felitronics::core::sameBits (o.sub1Level(), before), "...and the stage's level stands where it was");
+    // The family's convention: the stage's CURRENT params are the menu. Fed back, the law gives the same levels at
+    // the same amount (3971592's tops-in-the-level-fields halved them each call: 0.75 -> 0.28), and comes back from 0.
+    const auto once  = oc::paramsForAmount (0.5f, menu);
+    const auto twice = oc::paramsForAmount (0.5f, once);
+    const auto off   = oc::paramsForAmount (0.0f, twice);
+    const auto back  = oc::paramsForAmount (0.5f, off);
+    ok (twice.sub1 == once.sub1 && twice.sub2 == once.sub2 && back.sub1 == once.sub1 && back.sub2 == once.sub2,
+        fmt ("current params fed back: %.4f -> %.4f -> 0 -> %.4f (stable, and back from zero)", once.sub1, twice.sub1, back.sub1));
+    const auto nanP = oc::paramsForAmount (std::numeric_limits<float>::quiet_NaN(), once);
+    ok (std::memcmp (&nanP, &once, sizeof (once)) == 0, "a NaN amount returns the menu (the current params) untouched");
 }
 
 void amountZero()
@@ -778,9 +908,41 @@ void glide()
 
 void retune()
 {
-    group ("TONE and SUB HP retune without a click: 120 -> 2000 Hz, 2000 -> 120, 25 -> 80 Hz across the waveform, 44.1 / 48 / 96 kHz");
+    group ("TONE and SUB HP retune without a click: a per-sample glide over the whole range, and no added curvature, 44.1 / 48 / 96 kHz");
     for (double fs : { 44100.0, 48000.0, 96000.0 })
     {
+        // The WHOLE glide, both ways, over the whole range: the corner moves every sample, by no more than 0.5 %,
+        // and lands exactly. (7188cfc re-designed every 16 samples: 7.25 % at a time.)
+        double worst = 1.0;
+        bool landed = true;
+        for (int dir = 0; dir < 2; ++dir)
+        {
+            oc::Octaver o;
+            felitronics::test::run (o.prepare (fs, 64, 1));
+            oc::OctaverParams p = levels (1.0f, 0.0f);
+            p.toneHz  = dir == 0 ? oc::Octaver::kMinToneHz : oc::Octaver::kMaxToneHz;
+            p.subHpHz = dir == 0 ? oc::Octaver::kMinSubHpHz : oc::Octaver::kMaxSubHpHz;
+            o.setParams (p);
+            float z = 0.0f;
+            float* io[1] = { &z };
+            felitronics::test::run (o.process (io, 1, 1));
+            o.setToneHz (dir == 0 ? oc::Octaver::kMaxToneHz : oc::Octaver::kMinToneHz);
+            o.setSubHpHz (dir == 0 ? oc::Octaver::kMaxSubHpHz : oc::Octaver::kMinSubHpHz);
+            double t0 = o.toneHzNow(), h0 = o.subHpHzNow();
+            for (int i = 0; i < (int) (0.03 * fs); ++i)
+            {
+                z = 0.0f;
+                felitronics::test::run (o.process (io, 1, 1));
+                const double t1 = o.toneHzNow(), h1 = o.subHpHzNow();
+                worst = std::max ({ worst, t1 / t0, t0 / t1, h1 / h0, h0 / h1 });
+                t0 = t1; h0 = h1;
+            }
+            landed = landed && std::fabs (t0 / (dir == 0 ? oc::Octaver::kMaxToneHz : oc::Octaver::kMinToneHz) - 1.0) < 1.0e-5
+                            && std::fabs (h0 / (dir == 0 ? oc::Octaver::kMaxSubHpHz : oc::Octaver::kMinSubHpHz) - 1.0) < 1.0e-5;
+        }
+        std::printf ("    %5.1f kHz: TONE 30 <-> 2000 Hz and SUB HP 10 <-> 80 Hz glides — the largest step between two samples x%.4f\n", fs / 1000.0, worst);
+        ok (worst <= 1.005 && landed, fmt ("%.0f Hz: the corners move every sample by at most 0.5 %% over the whole range and land", fs));
+
         const Buf x = sine (fs, kLowE, 0.5, 1.4);
         struct Move { float fromTone, toTone, fromHp, toHp; const char* name; };
         for (const Move mv : { Move { 120.0f, 2000.0f, 25.0f, 25.0f, "tone up" }, Move { 2000.0f, 120.0f, 25.0f, 25.0f, "tone down" },
@@ -842,15 +1004,15 @@ void pauseIsSilence()
         float* iz[2] = { z1.data(), z2.data() };
         felitronics::test::run (a.process (nullptr, 0, gapLen));   // a pause...
         felitronics::test::run (b.process (iz, 2, gapLen));        // ...and the same length of silence
-        // A quiet note between the gate's thresholds (-53 dBFS; it opens at -50, closes at -56): it plays only if
-        // the gate is still open from before the gap.
-        Buf q1 = sine (fs, kLowE, std::pow (10.0, -53.0 / 20.0), 1.0, 0.0), q2 = q1, q3 = q1, q4 = q1;
+        // A quiet note on its return (-44 dBFS: over the gate's opening level, so it is acquired again whatever the
+        // gate held through the gap — the BITS must still be the same).
+        Buf q1 = sine (fs, kLowE, std::pow (10.0, -44.0 / 20.0), 1.0, 0.0), q2 = q1, q3 = q1, q4 = q1;
         runBlocks (a, { q1.data(), q2.data() }, q1.size());
         runBlocks (b, { q3.data(), q4.data() }, q3.size());
         ++cases;
         if (std::memcmp (q1.data(), q3.data(), q1.size() * sizeof (float)) == 0
             && std::memcmp (q2.data(), q4.data(), q2.size() * sizeof (float)) == 0) ++same;
-        const Buf qa = sine (fs, kLowE, std::pow (10.0, -53.0 / 20.0), 1.0, 0.0);
+        const Buf qa = sine (fs, kLowE, std::pow (10.0, -44.0 / 20.0), 1.0, 0.0);
         double d = 0.0;
         for (std::size_t i = samples (fs, 0.2); i < q3.size(); ++i) d = std::max (d, (double) std::fabs (q3[i] - qa[i]));
         if (d > 1.0e-3) ++heard;
@@ -859,7 +1021,7 @@ void pauseIsSilence()
                          gapLen, d, std::memcmp (q1.data(), q3.data(), q1.size() * sizeof (float)) == 0 ? "bit-identical" : "DIFFERENT");
     }
     ok (same == cases, fmt ("after a pause, every sample equals the same stream after silence (%.0f of %.0f gap lengths)", same, cases));
-    ok (heard >= 4, "precondition: through the short gaps the gate held and the quiet note has its sub");
+    ok (heard == cases, "precondition: every return has its sub");
 
     // A long pause parks: ten minutes in one call costs no more than its first second and a half.
     oc::Octaver o;
@@ -1055,11 +1217,13 @@ int main()
     sliderLaw();
     pitch();
     lockFromSilence();
+    relock();
     quieterNote();
     decay();
     harmonics();
     mutedTail();
     loneClick();
+    humUnderTheGate();
     silenceBetweenNotes();
     latency();
     subHighPass();

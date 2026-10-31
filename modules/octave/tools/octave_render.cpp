@@ -9,7 +9,8 @@
 // law at amount 0.25 / 0.5 / 0.75 / 1 (the default menu: −1 up to 1.25, −2 off), through the −2 octave alone under
 // the dry, and through each octave alone with no dry — 24-bit WAVs named `octave-<input>-<setting>.wav`, with the input itself as `-before`. With no
 // input it synthesises a bass line first (modal plucked strings, fingered and slapped, low B 30.9 Hz up to G2
-// 98 Hz, a long decay, a gap over a noise floor) and renders that, named `octave-<setting>.wav`.
+// 98 Hz, a long decay, a gap over a noise floor) and renders that, named `octave-<setting>.wav` — and, for the SUB HP
+// question, four open-B plucks at the slider's top under SUB HP 25 Hz and 10 Hz (`octave-openB-*.wav`).
 
 #include <felitronics/io/Wav.h>
 #include <felitronics/octave/OctaveLaw.h>
@@ -115,6 +116,19 @@ std::vector<double> synthLine (double fs)
     return out;
 }
 
+/** Four open-B plucks (30.9 Hz), fingered, a second and a half each: what SUB HP does to the B string's −1. */
+std::vector<double> openBLine (double fs)
+{
+    std::vector<double> out ((std::size_t) std::lround (6.5 * fs), 0.0);
+    std::uint32_t seed = 0x0B0B0B0Bu;
+    for (int k = 0; k < 4; ++k)
+        addNote (out, fs, { 0.2 + 1.5 * k, 1.35, 30.868, false, 1.0 }, seed);
+    double peak = 0.0;
+    for (double v : out) peak = std::max (peak, std::fabs (v));
+    for (double& v : out) v = v / peak * std::pow (10.0, -10.0 / 20.0);
+    return out;
+}
+
 Planes run (const Planes& in, double fs, const oc::OctaverParams& p)
 {
     const int nch = (int) std::min<std::size_t> (in.size(), 2), block = 256;
@@ -182,7 +196,8 @@ int main (int argc, char** argv)
         if (w.ch.size() > 2) w.ch.resize (2);
         inputs.push_back ({ dir + "/octave-" + stem (argv[k]) + "-", w.ch, w.sr });
     }
-    if (inputs.empty())
+    const bool synthesised = inputs.empty();
+    if (synthesised)
         inputs.push_back ({ dir + "/octave-", Planes { synthLine (48000.0) }, 48000.0 });
 
     bool all = true;
@@ -202,6 +217,20 @@ int main (int argc, char** argv)
         all = write (in.prefix + "sub1-alone.wav", alone (in.x, in.fs, p), in.fs) && all;
         p.sub1 = 0.0f; p.sub2 = 1.0f;
         all = write (in.prefix + "sub2-alone.wav", alone (in.x, in.fs, p), in.fs) && all;
+    }
+    if (synthesised)
+    {
+        // The B string's −1 under SUB HP 25 Hz (the default) and 10 Hz (the menu's lowest), at the slider's top.
+        const Planes b { openBLine (48000.0) };
+        all = write (dir + "/octave-openB-before.wav", b, 48000.0) && all;
+        for (float hp : { 25.0f, 10.0f })
+        {
+            oc::OctaverParams menu;
+            menu.subHpHz = hp;
+            char name[64];
+            std::snprintf (name, sizeof name, "/octave-openB-amount-1-subhp-%.0f.wav", (double) hp);
+            all = write (dir + name, run (b, 48000.0, oc::paramsForAmount (1.0f, menu)), 48000.0) && all;
+        }
     }
     return all ? 0 : 1;
 }

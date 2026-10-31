@@ -18,10 +18,17 @@ the same sub on every channel (`latencySamples() == 0`). There is no dry level �
 - **Tracker.** The playing channels summed (÷ nch), band-limited to the bass fundamental range (2-pole high pass
   20 Hz, 2-pole low pass 400 Hz), tilted by a one-pole at 50 Hz, squared up by a comparator whose thresholds are
   0.88 of each polarity's own peak (40 ms release). An edge sooner than 1/480 s after the last is ignored.
-- **The note's life.** The period is the longest of the last three edge intervals. An edge a quarter period late:
-  the note is dying, and the sub fades out over 4 ms after the filters (back in on the next edge). Two periods without
-  one (at most 1/22 s): the note is lost, the thresholds drop, and the next note must show TWO edges a plausible
-  period apart before the sub plays — a lone click in a gap makes no sub.
+- **Acquiring a note.** An edge counts only with the gate open, and a note is acquired only while the band is over
+  the gate's opening level; the comparator's floor rides 20 dB under the band's own level. Hum or hiss under the gate
+  therefore proves nothing. A lost note comes back only after TWO rises and TWO falls since the loss: one cycle of
+  anything, the smoothest click included, has at most two of one and one of the other.
+- **The note's life.** The period is the longest of the last three edge intervals, and it sets deadlines only once
+  two intervals in a row agree within a quarter (a note's first interval can be a partial attack cycle). An edge a
+  quarter period late: the note is dying, and the sub fades out over 4 ms after the filters (back in on the next
+  edge). Two periods without one (at most 1/22 s): the note is lost and the thresholds drop.
+- **Reopening.** While faded out, the voices hold nothing and the level is set, not glided. When the fade reopens,
+  each voice is primed as if a long half-cycle of the other polarity had just ended, so its first output is a full
+  step at the level of the note it reopens on — never the last note's level, never half a step.
 - **Divider.** Each accepted rising edge flips −1; every second flip flips −2. The step lands mid-sample where the
   crossing lay.
 - **Voice.** Each square × the band's peak over the last cycle (up at once, down at an edge, 10 ms glide), through
@@ -44,19 +51,33 @@ o.isLocked();                                    // relaxed atomic, any thread �
 
 The setters (`setSub1`, `setSub2`, `setToneHz`, `setSubHpHz`, `setGateDb`) are public too. The two levels glide over
 20 ms on a counted ramp that lands exactly; TONE and SUB HP glide to a new corner in log frequency over 20 ms,
-re-designed every 16 samples of audio time (an instant swap under live state is a click: 1075 times the held filter's
-curvature for 120 → 2000 Hz in mid-edge). At both levels 0 the stage drops its tracker at the next 64-sample grid
-point and from then on does not touch the buffer (`isIdle()`, bit-exact dry, nothing computed); a wake is a restart
-through a 10 ms input door. A pause (`nch == 0`) runs the whole instrument as that much silence, and parks on the
-silent fixed point (a ten-minute pause in one call: about 1 ms).
+re-designed every sample while they travel (at most 0.48 % per sample at 44.1 kHz; an instant swap under live state
+is a click, and a swap every 16 samples was a staircase of 7.25 % steps). At both levels 0 the stage drops its tracker
+at the next 64-sample grid point and from then on does not touch the buffer (`isIdle()`, bit-exact dry, nothing
+computed); a wake is a restart through a 10 ms input door. A pause (`nch == 0`) runs the whole instrument as that much
+silence, and parks on the silent fixed point (a ten-minute pause in one call: about 1 ms).
+
+### How soon it speaks (from silence, 2 ms attack; 16 onset phases × both polarities; 44.1, 48 and 96 kHz agree)
+
+| note | the fade opens, worst | half level, mean | half level, worst |
+|---|---|---|---|
+| B0 30.9 Hz | 1.51 cycles (49 ms) | 1.35 cycles (44 ms) | 1.59 cycles (51 ms) |
+| E1 41.2 Hz | 1.61 cycles (39 ms) | 1.47 cycles (36 ms) | 1.71 cycles (42 ms) |
+| G2 98.0 Hz | 1.89 cycles (19 ms) | 1.91 cycles (20 ms) | 2.14 cycles (22 ms) |
+
+About one and a half cycles: the price of never answering a click, which is one cycle long and so cannot be told
+from a note before the note's second fall. A note played over a louder one, legato, is steady after about four of
+its cycles (the louder note must be lost first; 12 or 20 dB quieter alike); after a gap, about two and a quarter.
 
 ## The one slider (`OctaveLaw.h`)
 
-`paramsForAmount (amount, menu)`: a MASTER over the octaves the menu voiced. It owns `sub1` and `sub2`: each is the
-menu's value of that field — the level at the slider's top — times `c(a) = a/2 + a²/2`. Tone, sub HP and gate pass
-through. Amount 0 is an exact zero for both whatever the menu says (idle); a non-finite amount comes back as NaN in
-the two owned fields, which the stage's setters ignore, so the levels stand. With the default menu (−1 at 1.25,
-−2 off): 0.25 → −14.2 dB, 0.5 → −6.6 dB, 0.75 → −1.7 dB, 1 → +1.9 dB re the band's peak.
+`paramsForAmount (amount, menu)`: a MASTER over the octaves the menu voiced. It owns `sub1` and `sub2` (the levels now)
+and writes them as the menu's `sub1Top` / `sub2Top` (the levels at the slider's top) times `c(a) = a/2 + a²/2`. It never
+writes the tops, so the stage's current params can be handed back as the menu any number of times — the same amount
+gives the same levels, and amount 0 comes back. Tone, sub HP and gate pass through. Amount 0 is an exact zero for both
+whatever the tops (idle); a non-finite amount returns the menu untouched. With the default tops (−1 at 1.25, −2 off):
+0.25 → −14.2 dB, 0.5 → −6.6 dB, 0.75 → −1.7 dB, 1 → +1.9 dB re the band's peak. The amp's menu shows the tops and must
+not expose `sub1` / `sub2`.
 
 The −2 octave is off in the default menu: on a bass it lands at 7.7 Hz (low B) to 24.5 Hz (G2), where only its
 square's upper partials are heard while its fundamental spends headroom and speaker excursion.
@@ -69,7 +90,8 @@ peaks). SUB HP (default 25 Hz, 2-pole Butterworth) keeps what no amp model or sp
 the −1 octave is cut by 9.0 dB on the open B (15.4 Hz), 5.0 dB on the open E (20.6 Hz), 2.3 dB on the open A
 (27.5 Hz), 0.9 dB on D (36.7 Hz), 0.3 dB on G (49.0 Hz); the −2 by 20.4 dB on B (7.7 Hz) and 15.5 dB on E (10.3 Hz).
 The measured cut matches the formula within 0.5 dB (`OctaverTests`). At the default the high pass also turns a held
-square into a pulse that decays in about 15 ms. OCTAVE runs before an envelope filter: its sub raises that
+square into a pulse that decays in about 15 ms. Whether 25 Hz leaves the B string's −1 hollow is the owner's ear to
+judge: `octave-openB-amount-1-subhp-25.wav` and `-10.wav` are the same four open-B plucks at the slider's top. OCTAVE runs before an envelope filter: its sub raises that
 filter's detector level, so the filter opens further with OCTAVE up.
 
 ## How the tracker was chosen
