@@ -270,6 +270,19 @@ zero: no subnormal in any state at any block, and the silence holds; the heads s
 and `modules/reverb/tests/AmpReverbTests.cpp` (three minutes after a HALL at DECAY ×2: no subnormal in the room,
 the predelay or the chorus line, and once exact zero is reached it holds).
 
+### Added with the module: `chorus::BassChorus` — the eq flush on the grid, the line flushed per write
+
+**Recursive state.** The voice's high pass — two `eq::Svf` sections carried as lanes of one Svf — and the five
+parameter glides (depth, centre delay and mix as two one-poles in cascade, rate and crossover as one; mix and depth
+glide to zero). The line is NOT recursive: it holds the high pass's output and is only read back, never fed back.
+**Verdict: flushed.** The Svf keeps the eq module's 1e-15 flush on `core::StateGrid` (audio time, 64 samples) and
+heals poison at the end of every call; what is written into the line goes through `core::flushDenormal`, so a
+stored value is zero or ≥ 1e-15. The glides land (item 6): each stage is put on its target once its residual is
+under a landing far below audibility (mix 1e-15, the heads 1e-9 of a sample, rate 1e-12 Hz, crossover 1e-6 Hz) or
+an update no longer moves it — so the mix reaches an exact zero, which is what lets the stage idle at amount 0.
+Tested in `modules/chorus/tests/BassChorusTests.cpp` (a minute of silence after a full chorus at 44.1, 48 and
+96 kHz: no subnormal in the lines or any glide at any block, and the last second is exact zeros).
+
 ## How these are tested
 
 State tests, in the style of `modules/dynamics/tests/DynamicsTests.cpp:61` — after a long silence the

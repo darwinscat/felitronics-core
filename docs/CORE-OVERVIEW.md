@@ -29,6 +29,7 @@ The guitar-amp modules — `nam` (the NeuralAmpModelerCore backend), `rigplayer`
 
 | Module | What | Key types |
 |---|---|---|
+| `chorus` | bass chorus: the dry untouched plus a voice made from the LR4 high band (the lows stay dry, mono, in phase), a sine-swung Hermite-read head, two voices in opposite phase on a stereo bus; the one-slider law | `BassChorus`, `law::paramsFor` |
 | `delay` | tape-style echo: a gliding (repitching) head, a dark saturated loop, a stereo offset; the knob law (sync ladder, sync policy, DARK) | `TapeDelay`, `DelayLaw.h` (`divisionMs`, `timeMsFor`, `darkHzForPercent`) |
 | `reverb` | Freeverb (the published algorithm, matched to the behaviour the amps were voiced on) and the six-character amp room | `Freeverb`, `AmpReverb` |
 
