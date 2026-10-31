@@ -105,8 +105,8 @@ namespace felitronics::core::det
 // TWO AMP STAGES DO IT DELIBERATELY, and say so here so the rule above is not read as broken by accident:
 // delay::TapeDelay runs a det-built tanh per sample in its loop (~5 ns against the system's ~2), and
 // envfilter::EnvelopeFilter runs det log2, exp2 and tan per sample for its sweep — measured on deb (gcc 14,
-// i9-13900H), 1.01 % of real time for the whole stage at 48 kHz stereo against 0.53 % with the system's
-// three. Both buy the same transcendental bits on every row for a stage the amps and the browser demo share.
+// i9-13900H), 1.04 % of real time for the whole stage at 48 kHz stereo against 0.58 % with the system's
+// three (the sweep moving, every glide at rest — not a worst case). Both buy the same transcendental bits on every row for a stage the amps and the browser demo share.
 //
 // DOMAIN. Argument reduction here is Cody-Waite with a two-part pi/2, which is exact only while
 // |k * pio2Hi| is exact — that holds comfortably to |x| < 2^24. Outside that this returns NaN rather
