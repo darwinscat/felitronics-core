@@ -23,6 +23,7 @@
 #include <felitronics/blend/BlendParams.h>
 #include <felitronics/blend/IrBlend.h>
 #include <felitronics/blend/Overlay.h>
+#include <felitronics/chorus/BassChorus.h>
 #include <felitronics/codecgrid/BackResampler.h>
 #include <felitronics/codecgrid/CodecGridDetector.h>
 #include <felitronics/codecgrid/GridCurve.h>
