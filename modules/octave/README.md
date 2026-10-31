@@ -18,10 +18,13 @@ the same sub on every channel (`latencySamples() == 0`). There is no dry level �
 - **Tracker.** The playing channels summed (÷ nch), band-limited to the bass fundamental range (2-pole high pass
   20 Hz, 2-pole low pass 400 Hz), tilted by a one-pole at 50 Hz, squared up by a comparator whose thresholds are
   0.88 of each polarity's own peak (40 ms release). An edge sooner than 1/480 s after the last is ignored.
-- **Acquiring a note.** An edge counts only with the gate open, and a note is acquired only while the band is over
-  the gate's opening level; the comparator's floor rides 20 dB under the band's own level. Hum or hiss under the gate
-  therefore proves nothing. A lost note comes back only after TWO rises and TWO falls since the loss: one cycle of
-  anything, the smoothest click included, has at most two of one and one of the other.
+- **Acquiring a note.** An edge counts only with the gate open. A lost note comes back only after TWO rises and TWO
+  falls since the loss, each one fresh twice over: the band's peak over the last half to whole longest period stands
+  at the gate's opening level (so a note whose follower ripples across that level still acquires, and a loud note's
+  decaying follower cannot hand the acquisition to the hum under it), and the raw input itself has just swung that
+  way, past a quarter of its own peak (so the band filters' ringing after a source has stopped cannot finish the
+  proof). One cycle of anything, at any bass pitch, phase or ramp, has at most two swings one way and one the other,
+  and makes no sub. The comparator's floor rides 20 dB under the band's own level.
 - **The note's life.** The period is the longest of the last three edge intervals, and it sets deadlines only once
   two intervals in a row agree within a quarter (a note's first interval can be a partial attack cycle). An edge a
   quarter period late: the note is dying, and the sub fades out over 4 ms after the filters (back in on the next
@@ -68,6 +71,15 @@ silence, and parks on the silent fixed point (a ten-minute pause in one call: ab
 About one and a half cycles: the price of never answering a click, which is one cycle long and so cannot be told
 from a note before the note's second fall. A note played over a louder one, legato, is steady after about four of
 its cycles (the louder note must be lost first; 12 or 20 dB quieter alike); after a gap, about two and a quarter.
+
+### Known, measured, left as they are
+
+- A note whose intervals never agree within a quarter (a wild, unsteady pitch) never confirms its period; its loss
+  deadline falls back to 1/22 s.
+- The per-sample corner redesign costs about 1 % of real time while TONE or SUB HP glides (0.14–0.19 % steady; i9-13900H).
+- The reopening step is a full step at the new level: at the menu's extremes it stands out more (2.0× the steady peak
+  on G2 at TONE 30 / SUB HP 10; a relock reaches 1.88× at SUB HP 80 — 1.45× at the default menu).
+- A re-strike of the same note inside its dying window relocks about 50 ms later (two rises and two falls again).
 
 ## The one slider (`OctaveLaw.h`)
 
