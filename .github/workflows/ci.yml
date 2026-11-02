@@ -91,9 +91,10 @@ jobs:
           ninja --version 2>/dev/null && echo "(ninja, above)" || echo "(no ninja — the default generator it is)"
           # The compiler's DEFAULT target is the distribution's choice, not this tree's: Ubuntu 26.04's amd64v3
           # build configures GCC for x86-64-v3, which has an FMA for law 10's `-ffp-contract=on` to fuse with
-          # (IrResampler.h's PhaseMemo comment has what that broke). Printed so a log says which one ran.
+          # (IrResampler.h's PhaseMemo comment has what that broke). Printed so a log says which one ran. arm64
+          # spells it __ARM_FEATURE_FMA, and always has one (GCC <= 13 still does not fuse: `on` is `off` there).
           if [ "$(uname -s)" = Linux ]; then
-            echo | c++ -dM -E -x c++ - | grep -E '__FMA__|__AVX2__' || echo "(no FMA in c++'s default target)"
+            echo | c++ -dM -E -x c++ - | grep -E '__FMA__|__AVX2__|__ARM_FEATURE_FMA' || echo "(no FMA in c++'s default target)"
           fi
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFELITRONICS_BUILD_TESTS=ON -DFELITRONICS_WITH_PFFFT=${{ matrix.pffft }}
