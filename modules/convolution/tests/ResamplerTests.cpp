@@ -12,6 +12,7 @@
 
 #include <felitronics_test.h>
 #include <felitronics/convolution/IrResampler.h>
+#include <felitronics/core/DetMath.h>
 #include <felitronics/core/Math.h>
 
 #include <algorithm>
@@ -184,7 +185,12 @@ double referenceTap (const std::vector<float>& x, double inSr, double outSr, int
 // the two can be compared to the last bit. This is a DIFFERENTIAL check, not a specification: what an output
 // SHOULD be is `referenceTap`'s business (and the hand-worked 105/104 case's), and this one answers a
 // different question — whether reusing a window that was computed for an earlier output changes anything.
-// The answer has to be "not one bit", because a changed tap is a changed cabinet.
+// The answer has to be "not one bit", because a changed tap is a changed cabinet. Its products go through
+// the header's `det::mulAdd` / `det::mul` pins as well: a second COPY of `acc += in[k] * w` is the
+// compiler's to contract or not, independently of the first. GCC 14 and later fused the header's (a
+// `const float*`) and not this one, whose `in[k]` is a call to `std::vector::operator[]` that GCC's front
+// end evaluates into a temporary first, so the product and the sum were no longer one expression (seen in
+// GCC's GIMPLE; the PhaseMemo comment in IrResampler.h has the case it broke).
 std::vector<float> resampleUnmemoized (const std::vector<float>& in, double inSr, double outSr,
                                        convolution::IrResampleConfig cfg = {})
 {
@@ -219,10 +225,10 @@ std::vector<float> resampleUnmemoized (const std::vector<float>& in, double inSr
                                                          : std::sin (2.0 * core::kPi * fc * xx) / (core::kPi * xx);
             const double r    = xx / (double) R;
             const double win  = (r <= -1.0 || r >= 1.0) ? 0.0
-                              : convolution::detail::besselI0 (beta * std::sqrt (1.0 - r * r)) / i0beta;
-            const double w    = sinc * win;
+                              : convolution::detail::besselI0 (beta * std::sqrt (1.0 - core::det::mul (r, r))) / i0beta;
+            const double w    = core::det::mul (sinc, win);
             wsum += w;
-            if (k >= 0 && k < inLen) acc += (double) in[(std::size_t) k] * w;
+            if (k >= 0 && k < inLen) acc = core::det::mulAdd ((double) in[(std::size_t) k], w, acc);
         }
         out[(std::size_t) n] = (float) (! core::exactlyEqual (wsum, 0.0) ? acc / wsum : 0.0);
     }
@@ -545,6 +551,10 @@ int main()
             { 48000.0,  44100.0, 2000, wide,       "halfTaps 300" },
             { 48000.0,  44100.0, 2000, b50,        "beta 50 (the series still converges to 53.04)" },
             { 48000.0,  44100.0, 2000, narrowBand, "cutoffScale 1e-6" },
+            // The most sensitive case here: normalised, its four weights are 1/8, 3/8, 3/8, 1/8 to an ulp, so an
+            // exact answer can sit on a float32 midpoint (output 2 does) and ONE double ulp anywhere in the sum
+            // decides a float. It is the case that saw an x86-64-v3 GCC fuse one copy of the accumulation and
+            // not the other.
             { 96000.0,  48000.0,  600, rect,       "a rectangular window, full band" },
             // The two cache branches the cases above never reach. An aperiodic ratio long enough to store
             // 4096 phases without one hit trips the GIVE-UP; a 4096-radius kernel makes each row 8193
@@ -568,7 +578,13 @@ int main()
             // paths refuse would pass this loop while testing nothing — which is exactly what happened to
             // the two halfTaps-4096 cases when a mutant moved the ceiling to 4095.
             if (memoed.empty()) { ++differ; std::printf ("    %s: produced nothing\n", cs.what); }
-            else if (at != -2) { ++differ; std::printf ("    %s: differs at output %d\n", cs.what, at); }
+            else if (at >= 0)
+            {
+                ++differ;
+                std::printf ("    %s: differs at output %d (%a memoized, %a not)\n", cs.what, at,
+                             (double) memoed[(std::size_t) at], (double) plain[(std::size_t) at]);
+            }
+            else if (at != -2) { ++differ; std::printf ("    %s: %zu outputs against %zu\n", cs.what, memoed.size(), plain.size()); }
         }
         std::printf ("    %d rate/config cases, %lld output floats compared as bits\n", checked, floats);
         test::ok (checked == (int) (sizeof cases / sizeof cases[0]) && floats > 0 && differ == 0,

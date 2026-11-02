@@ -255,7 +255,11 @@ the CPU at runtime, invisible to any build. Full write-up:
    normal can land subnormal), the rounding mode, and NaN sign/payload.
    **AND A PIN THAT IS NOT AN OVERRIDE.** Where a number is gated against a reference that never contracts
    (JavaScript), the right answer is the unfused one, and a `volatile` store of each product before it is added
-   holds under every contraction mode, gcc's `fast` included, with no pragma. The worked case — the stereo band's
+   holds under every contraction mode, gcc's `fast` included, with no pragma. `convolution::resampleIr` pins its
+   accumulation so (`core::det::mulAdd`): its phase memo claims bits against its own long road and the suite's
+   frozen copy of it, and the GCC of Ubuntu 26.04's amd64v3 build (Canonical's cloud images, GitHub's
+   `ubuntu-latest`) — x86-64-v3 by default, so an x86 row with an FMA — fused the header's copy and not the
+   suite's. The worked case — the stereo band's
    `analysis::StereoSums`, the width it read fused on arm64 and every cell the pin was measured in — moved with
    the offline analyzers to felitronics-mastering-core (`docs/LAW10-STEREOSUMS.md` there).
 
