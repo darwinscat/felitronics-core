@@ -23,6 +23,9 @@ else()
     # arm64 Linux row reached CI, on untouched main: a nonlinear stage's "silence in ⇒ output identically 0" read
     # 1.26e-08, and the multi-res fast pane missed its budget by 0.005841 dB. Neither the Mac (clang) nor
     # any x86 row could see it: baseline x86-64 has no FMA instruction to contract with at all.
+    # (No longer true of every x86 row: Ubuntu 26.04's amd64v3 build, which Canonical's cloud images carry,
+    # configures GCC for x86-64-v3, which has one, and GitHub's ubuntu-latest moved to it in October 2026 —
+    # the PhaseMemo comment in IrResampler.h has what it found.)
     #
     # `on`, not `off`. It fixes both (verified on gcc 13.3 and 14.2, aarch64) and costs the shipping tier
     # NOTHING, because it is already clang's default. `off` also fixes them but disables FMA everywhere,

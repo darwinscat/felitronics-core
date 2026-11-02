@@ -92,8 +92,20 @@ inline BandDesign designBand (const BandParams& in, double fs) noexcept
     }
     else if (type == FilterType::Tilt)
     {
-        d.sec[0] = matched::lowShelfDb  (freq, fs, -gainDb);   // lows down
-        d.sec[1] = matched::highShelfDb (freq, fs,  gainDb);   // highs up -> spectral tilt about f0
+        // slope 6 asks for the gentle tilt: two first-order shelves, the 6 dB between the ends spread
+        // over decades instead of the octaves around f0. Every other slope (12 is the default) keeps the
+        // 2-pole shelves, bit for bit. Pivot and ends are the same either way: f0 unity, lows -gainDb,
+        // highs +gainDb.
+        if (slope == 6)
+        {
+            d.sec[0] = matched::lowShelf1Db  (freq, fs, -gainDb);
+            d.sec[1] = matched::highShelf1Db (freq, fs,  gainDb);
+        }
+        else
+        {
+            d.sec[0] = matched::lowShelfDb  (freq, fs, -gainDb);   // lows down
+            d.sec[1] = matched::highShelfDb (freq, fs,  gainDb);   // highs up -> spectral tilt about f0
+        }
         d.n = 2;
     }
     else

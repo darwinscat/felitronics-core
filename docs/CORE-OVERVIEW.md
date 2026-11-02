@@ -25,11 +25,18 @@ same audit had been started three times.
 The guitar-amp modules — `nam` (the NeuralAmpModelerCore backend), `rigplayer` (the `.orbitrig` pack player) and
 `poweramp` (the tube power-amp trunk) — live in [felitronics-guitar-core](https://github.com/darwinscat/felitronics-guitar-core).
 
+## Amp stages (the plugins' echo and room)
+
+| Module | What | Key types |
+|---|---|---|
+| `delay` | tape-style echo: a gliding (repitching) head, a dark saturated loop, a stereo offset; the knob law (sync ladder, sync policy, DARK) | `TapeDelay`, `DelayLaw.h` (`divisionMs`, `timeMsFor`, `darkHzForPercent`) |
+| `reverb` | Freeverb (the published algorithm, matched to the behaviour the amps were voiced on) and the six-character amp room | `Freeverb`, `AmpReverb` |
+
 ## Mastering stages
 
 | Module | What | Key types |
 |---|---|---|
-| `saturation` | oversampled soft-saturation | `WaveShaper` (Tanh/Atan/Cubic/Asym), `Saturator` |
+| `saturation` | oversampled soft-saturation | `WaveShaper` (Tanh/Atan/Cubic/Asym/Tube/Transistor/Transformer/Tape), `Saturator` |
 | `stereo` | mid/side image tools | `MidSide`, `MonoBass` (bass mono-maker / elliptical), `StereoWidth` (mono-fold-safe) |
 | `dynamiceq` | level-driven EQ band (cut/boost when loud/quiet) | `DynamicEqBand`, `LaneDynamics` (drives an `eq::EqBand` point's per-lane delta seam — what makes the mastering chain's EQ points dynamic) |
 | `deesser` | sibilance control, 2 topologies | `DeEsser` (surgical dynamic-EQ · classic split-band) |
@@ -44,6 +51,7 @@ The guitar-amp modules — `nam` (the NeuralAmpModelerCore backend), `rigplayer`
 | `analysis` | RT metering, the analyser taps and the spectrum panes (JUCE-free display pipelines); **offline display curves** (`::offline`) | `LoudnessMeter` (LUFS M/S/I + **LRA**), `TruePeakMeter` (dBTP, BS.1770-4 — the spec's short filter, for live display), `ReferenceTruePeakMeter` (dBTP, the 4×/128-tap reference a delivered file is certified and a delivered ceiling aimed with), `CorrelationMeter`, `KWeightingFilter`, `SpectrumTap`, `RollingSpectrumTap` (hop ≠ window, reports the hop that happened), `PlotMap`, `SpectrumPaneT<Fft>` (single FFT, the classic look), `MultiResSpectrumPaneT<…, Fft>` (constant-Q from several FFT lengths — `docs/ANALYZER-MULTIRES.md`), `MultiResSpectrumPaneFastT<…, Fft>` (the same pane, ~1.8–2.3× cheaper on pffft, fill bit-identical — `docs/PERF-ANALYZER-MULTIRES.md`), `offline::logMagnitudeCurve` (1/N-oct, log-f), `offline::interferenceDb` |
 | `measurement` | **offline** IR capture: ESS/Farina sweep + deconv, IR post, capture gate (+ standalone sweepless peak/flat-top clip scan), multi-mic align, fine time/polarity align by cross-correlation (message-thread, double) | `Sweep`, `Deconvolve`, `IrPost`, `CaptureGate`, `PeakClip`, `MicSetAlign`, `XcorrAlign`, `ModelGuess` |
 | `blend` | **offline** multi-mic IR blend engine: per-mic gain/phase/shift/HPF/LPF + master, solo/mute — the canonical home of the blend defaults | `StripParams`/`MasterParams`, `Filter`, `blendIrs`, `processedMic`, `Overlay` (`makeOverlay` — the one-call mix-view facade) |
+| `codecgrid` | **offline** measurement: the frame grid a lossy codec leaves in decoded PCM — a stretch is analysed again with the codec's own transform at every frame offset, and at the encoder's offset the quantiser's zeros come back. MP3 (the Layer III hybrid filterbank), AAC (both windows), CELT; at the programme's rate and at the other of 44.1 / 48 kHz. Reports a grid, its phase and in how many stretches — not "this is an MP3", and never "lossless" | `CodecGridDetector` (`storageFor` · `prepare` · `process` · `finishStep`), `GridScan`, `Mp3Hybrid`, `Mdct` + `MixedRadixFft` (a complex FFT for any 2^a 3^b 5^c), `BackResampler`, `GridRule` |
 | `io` | **offline** file I/O: minimal self-contained WAV read/write (moved from OrbitCapture's `oc/wav.hpp`; zero-dep, loud rejects, memory + file readers; 16/24-bit PCM on `dither`'s 2^(bits-1) grid both ways, so write∘read is the identity on every code; word-aligned RIFF both ways — an odd `data` chunk is written with its pad byte, a pad is skipped on read) | `WavData`, `readWav`, `readWavMemory`, `writeWav`, `writeWavMonoF32` |
 
 **Build & test:** `cmake -S . -B build -DFELITRONICS_BUILD_TESTS=ON && cmake --build build -j && ctest --test-dir build`.

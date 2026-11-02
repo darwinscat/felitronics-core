@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(felitronics_core VERSION 0.56.0 LANGUAGES CXX)
+project(felitronics_core VERSION 0.61.2 LANGUAGES CXX)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)   # so clangd / IDEs parse the headers at the right C++ standard
 
@@ -20,6 +20,8 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/FelitronicsPolicy.cmake)
 #   analysis      felitronics::analysis   felitronics::analysis core+oversampling (SpectrumTap; FFT via the seam; the reference true peak)
 #   dynamics      felitronics::dynamics   felitronics::dynamics  core         (EnvelopeFollower · GainComputer · Compressor · NoiseGate · AutoLeveler · TransientShaper · ChannelLinker)
 #   eq            felitronics::eq         felitronics::eq        core+analysis (matched biquads + Cytomic SVF + EqEngine)
+#   delay         felitronics::delay      felitronics::delay     core         (TapeDelay — the amps' echo)
+#   reverb        felitronics::reverb     felitronics::reverb    core+eq      (Freeverb + AmpReverb — the amps' tail)
 #
 # Consume (pinned by tag, exactly like JUCE) — JUCE-free, so this fetch never pulls JUCE:
 #   include(FetchContent)
@@ -70,12 +72,16 @@ add_subdirectory(modules/stereo)
 add_subdirectory(modules/multiband)
 add_subdirectory(modules/dynamiceq)
 add_subdirectory(modules/deesser)
+add_subdirectory(modules/dehum)   # mains hum canceller (50/60 Hz + harmonics) — core only
+add_subdirectory(modules/delay)   # the amp plugins' tape-style echo — core only
+add_subdirectory(modules/reverb)   # Freeverb + the amp plugins' six-character tail — core + eq
 add_subdirectory(modules/dither)
 add_subdirectory(modules/lineareq)
 add_subdirectory(modules/measurement)   # OFFLINE IR-measurement math (sweep/Farina deconv/gate) — double, message-thread
 add_subdirectory(modules/blend)   # OFFLINE mic-blend engine (mixer params + kernels + Σ(gain·strip) blend) — double coeffs, float buffers
 add_subdirectory(modules/io)   # OFFLINE file I/O (WAV read/write, moved from OrbitCapture's oc/wav.hpp) — zero-dep, message-thread
 add_subdirectory(modules/text)   # JUCE-free UTF-8 → ASCII romanization for filename slugs (German/ß + Cyrillic), from OrbitCapture NAM's Matrix.h — zero-dep, message-thread
+add_subdirectory(modules/codecgrid)   # OFFLINE measurement: the frame grid a lossy codec leaves in decoded PCM (MP3, AAC, Opus) — float transforms, message-thread
 add_subdirectory(modules/laws)   # NOT a module: the cross-module law suites (law 11, law 11c), tests only — see its CMakeLists
 
 # felitronics::test_support — the house test harness (felitronics_test.h, the ONE allocation counter, the
@@ -106,7 +112,8 @@ if(FELITRONICS_BUILD_TESTS AND (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU"))
         felitronics::convolution felitronics::oversampling felitronics::limiter felitronics::neural
         felitronics::saturation felitronics::stereo felitronics::multiband felitronics::dynamiceq
         felitronics::deesser felitronics::dither felitronics::lineareq felitronics::measurement felitronics::blend
-        felitronics::io felitronics::text)
+        felitronics::io felitronics::text felitronics::codecgrid felitronics::dehum felitronics::delay
+        felitronics::reverb)
     target_compile_features(felitronics_header_hygiene PRIVATE cxx_std_20)
     target_compile_options(felitronics_header_hygiene PRIVATE ${FELITRONICS_HYGIENE_WARNINGS})
     # When selected, felitronics::convolution propagates the uniform FELITRONICS_WITH_PFFFT definition
@@ -132,7 +139,23 @@ if(FELITRONICS_BUILD_TESTS AND (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU"))
         felitronics::convolution felitronics::oversampling felitronics::limiter felitronics::neural
         felitronics::saturation felitronics::stereo felitronics::multiband felitronics::dynamiceq
         felitronics::deesser felitronics::dither felitronics::lineareq felitronics::measurement felitronics::blend
-        felitronics::io felitronics::text)
+        felitronics::io felitronics::text felitronics::codecgrid felitronics::dehum felitronics::delay
+        felitronics::reverb)
     target_compile_features(felitronics_no_exceptions_probe PRIVATE cxx_std_20)
     target_compile_options(felitronics_no_exceptions_probe PRIVATE -fno-exceptions -fno-rtti)
+endif()
+
+# ----------------------------------------------------------------------------
+# wasm + SSE-compat PROBE — compile-only, emscripten only. The hygiene TU again (every public header, the
+# same strict warnings), now under -msimd128 -msse4.1: the flags a consumer passes to put Eigen on its SSE
+# path, which emscripten lowers onto SIMD128. They also define __SSE2__ in a target that is not x86, so a
+# header that keys an x86-only intrinsic on __SSE2__ (FlushToZero.h's _mm_setcsr did, until it tested for
+# wasm first) breaks every such consumer. modules/core's felitronics_core_wasm_sse_tests runs the behaviour;
+# this catches the next header to make the same mistake. Building it IS the assertion.
+if(FELITRONICS_BUILD_TESTS AND EMSCRIPTEN)
+    add_library(felitronics_wasm_sse_probe OBJECT test_support/HeaderHygiene.cpp)
+    get_target_property(_felitronics_hygiene_libs felitronics_header_hygiene LINK_LIBRARIES)   # one module list, not a third copy
+    target_link_libraries(felitronics_wasm_sse_probe PRIVATE ${_felitronics_hygiene_libs})
+    target_compile_features(felitronics_wasm_sse_probe PRIVATE cxx_std_20)
+    target_compile_options(felitronics_wasm_sse_probe PRIVATE ${FELITRONICS_HYGIENE_WARNINGS} -msimd128 -msse4.1)
 endif()

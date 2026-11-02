@@ -89,6 +89,13 @@ jobs:
           echo "runner: $(uname -s) $(uname -m)"
           cmake --version | head -1
           ninja --version 2>/dev/null && echo "(ninja, above)" || echo "(no ninja — the default generator it is)"
+          # The compiler's DEFAULT target is the distribution's choice, not this tree's: Ubuntu 26.04's amd64v3
+          # build configures GCC for x86-64-v3, which has an FMA for law 10's `-ffp-contract=on` to fuse with
+          # (IrResampler.h's PhaseMemo comment has what that broke). Printed so a log says which one ran. arm64
+          # spells it __ARM_FEATURE_FMA, and always has one (GCC <= 13 still does not fuse: `on` is `off` there).
+          if [ "$(uname -s)" = Linux ]; then
+            echo | c++ -dM -E -x c++ - | grep -E '__FMA__|__AVX2__|__ARM_FEATURE_FMA' || echo "(no FMA in c++'s default target)"
+          fi
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFELITRONICS_BUILD_TESTS=ON -DFELITRONICS_WITH_PFFFT=${{ matrix.pffft }}
       - name: Build
@@ -155,9 +162,18 @@ jobs:
     # on a 4-core hosted VM, and deb has 20 threads. The fork gate is the same one: a pull request whose
     # head is not in this repository keeps the hosted runner.
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","deb"]') || 'ubuntu-latest' }}
-    timeout-minutes: 60
+    timeout-minutes: 90                       # a quarter of deb (see Threads) runs about twice as long
     steps:
       - uses: actions/checkout@v7
+      - name: Threads
+        # deb IS A SHARED MACHINE with two of these runners on it, this job and wasm-audio-tier often at once:
+        # past half its 20 threads its other services stop answering and its clock drops from 5 GHz to 1. So a
+        # self-hosted job takes a QUARTER and the two together stay at half; a hosted runner keeps every core.
+        run: |
+          n=$(nproc)
+          if [ "$RUNNER_ENVIRONMENT" = self-hosted ]; then n=$(( n / 4 )); [ "$n" -ge 1 ] || n=1; fi
+          echo "JOBS=$n" >> "$GITHUB_ENV"
+          echo "-j $n of $(nproc) threads"
       - name: Configure (ASan + UBSan, hard-fail on any UB)
         run: >
           cmake -S . -B build-san
@@ -170,7 +186,7 @@ jobs:
         # pffft ON here too, so the vendored C runs under ASan+UBSan. CMAKE_C_COMPILER=clang is REQUIRED: the
         # sanitizer runtime is clang's (CXX=clang++), and a gcc-compiled pffft.c would link the wrong ASan.
       - name: Build
-        run: cmake --build build-san -j "$(nproc)"
+        run: cmake --build build-san -j "$JOBS"
       - name: Test
         env:
           # LSan (Linux-only; macOS has no LeakSanitizer) → this job is where leaks fail the build. It caught
@@ -178,16 +194,16 @@ jobs:
           # teardown — now fixed (~NeuralStage frees it; a ctors==dtors test guards it on every platform).
           ASAN_OPTIONS: halt_on_error=1:detect_leaks=1:strict_string_checks=1:detect_stack_use_after_return=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
-        # No wall-clock gate here, and therefore every core. spectrum_pane_perf compares timings; under ASan it
+        # No wall-clock gate here, so nothing needs the machine alone. spectrum_pane_perf compares timings; under ASan it
         # measures the instrumentation, and on deb — a machine other sessions build on — it measures THEM: it
         # failed exactly that way while four other builds were running. The gate keeps running where it means
-        # something, in the build-test matrix. Without it, the 132 tests may run together, and the five that
-        # take 290, 229, 119, 104 and 92 s under ASan stop queueing behind each other.
+        # something, in the build-test matrix. Without it, the 132 tests may run $JOBS at a time, and the five
+        # that take 290, 229, 119, 104 and 92 s under ASan stop queueing behind each other.
           SCOPE_MODE: ${{ needs.scope.outputs.mode }}
           SCOPE_REGEX: ${{ needs.scope.outputs.regex }}
         run: |
           SEL=(); if [ "$SCOPE_MODE" = selected ]; then SEL=(-R "$SCOPE_REGEX" --no-tests=error); fi
-          ctest --test-dir build-san -j "$(nproc)" --output-on-failure -E spectrum_pane_perf "${SEL[@]}"
+          ctest --test-dir build-san -j "$JOBS" --output-on-failure -E spectrum_pane_perf "${SEL[@]}"
 
   # Dedicated gcc-14 job. The matrix above has no "compiler" dimension — each OS row takes whatever its
   # image ships — so the newest GCC is simply not built anywhere: ubuntu-latest defaults to g++-13. That is
@@ -206,7 +222,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install g++-14
-        run: sudo apt-get update && sudo apt-get install -y g++-14
+        run: |
+          sudo apt-get update && sudo apt-get install -y g++-14
+          echo | g++-14 -dM -E -x c++ - | grep -E '__FMA__|__AVX2__' || echo "(no FMA in g++-14's default target)"
       - name: Configure
         env: { CC: gcc-14, CXX: g++-14 }
         run: cmake -S . -B build-gcc14 -DCMAKE_BUILD_TYPE=Release -DFELITRONICS_BUILD_TESTS=ON -DFELITRONICS_WITH_PFFFT=ON
@@ -248,6 +266,9 @@ jobs:
   #                                      wrap still cannot see: a thread in code never emitted (an unused
   #                                      inline, an uninstantiated template), and std::mutex, whose lock sits
   #                                      inside libc++-noexcept.a — hence the header lint below.
+  #   an x86-only intrinsic keyed on  -> COMPILE error: felitronics_wasm_sse_probe builds every public header
+  #   __SSE2__                           under -msimd128 -msse4.1 (Eigen's SSE path), where emscripten defines
+  #                                      __SSE2__ but has no _mm_setcsr.
   #   denormal / law-8 violations     -> NOT caught, at all. That is a property of the CPU at runtime, not of
   #                                      the build (see the KWeightingFilter finding).
   #   long double ON AN EMITTED PATH  -> caught from the ARTIFACT: on wasm32 the type is software binary128,
@@ -263,9 +284,17 @@ jobs:
     # on a 4-core hosted VM, and deb has 20 threads. The fork gate is the same one: a pull request whose
     # head is not in this repository keeps the hosted runner.
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","deb"]') || 'ubuntu-latest' }}
-    timeout-minutes: 60
+    timeout-minutes: 90                       # a quarter of deb (see Threads) runs about twice as long
     steps:
       - uses: actions/checkout@v7
+      - name: Threads
+        # A quarter of deb, as the ASan row takes: two runners share it, and past half its threads the
+        # machine's other services stop answering and its clock drops from 5 GHz to 1. Hosted: every core.
+        run: |
+          n=$(nproc)
+          if [ "$RUNNER_ENVIRONMENT" = self-hosted ]; then n=$(( n / 4 )); [ "$n" -ge 1 ] || n=1; fi
+          echo "JOBS=$n" >> "$GITHUB_ENV"
+          echo "-j $n of $(nproc) threads"
       - name: Install emsdk 6.0.9
         # Installed from upstream directly rather than through a third-party action, so the only thing this
         # job trusts is emscripten itself. 6.0.9 is the toolchain the tier was measured on (docs/WASM-AUDIO-TIER.md);
@@ -296,11 +325,11 @@ jobs:
         # objects started compiling within 5 s, 90 of them within the first second; on deb, during the same
         # step of the main run after it, the runner's user held 16.9 GB resident at load average 80 on 20
         # threads.
-        run: cmake --preset wasm-audio && cmake --build --preset wasm-audio -j "$(nproc)"
+        run: cmake --preset wasm-audio && cmake --build --preset wasm-audio -j "$JOBS"
       - name: Run the suite in node
         # ctest drives each test .js through node: the Emscripten toolchain sets CMAKE_CROSSCOMPILING_EMULATOR.
         # Same reasoning as the ASan row: the wall-clock gate measures node and the shared machine, not the
-        # code, and it already runs natively in build-test. Without it the suite can use every core.
+        # code, and it already runs natively in build-test. Without it the suite can run $JOBS at a time.
         # No --no-tests=error: this tier does not build fftpffft, so a pull request touching only it selects
         # nothing that exists here, and that is not a failure. The empty-FILTER guard lives where the same
         # selection must match: the build-test rows with pffft ON.
@@ -309,7 +338,7 @@ jobs:
           SCOPE_REGEX: ${{ needs.scope.outputs.regex }}
         run: |
           SEL=(); if [ "$SCOPE_MODE" = selected ]; then SEL=(-R "$SCOPE_REGEX"); fi
-          ctest --preset wasm-audio -j "$(nproc)" -E spectrum_pane_perf "${SEL[@]}"
+          ctest --preset wasm-audio -j "$JOBS" -E spectrum_pane_perf "${SEL[@]}"
       - name: No threads — audited on EVERY emitted .wasm, not one sample
         run: node tools/wasm/check-no-threads.mjs --all build-wasm-audio
       - name: No threading header in a public module header
@@ -515,11 +544,11 @@ jobs:
         run: |
           cmake --preset wasm-audio -B build-wasm-checked -DFELITRONICS_WASM_ASSERTIONS=2 \
                 -DCMAKE_EXE_LINKER_FLAGS="-sSAFE_HEAP=1 -sSTACK_OVERFLOW_CHECK=2"
-          cmake --build build-wasm-checked -j "$(nproc)"
-          # All cores: the one test that must not share the machine — the wall-clock gate — is excluded right
-          # here by -E, so nothing in this run measures time. Under SAFE_HEAP every load and store is checked,
-          # which makes this the slowest test run in the workflow; capping it at 4 left deb three-quarters idle.
-          ctest --test-dir build-wasm-checked -j "$(nproc)" --output-on-failure -E 'spectrum_pane_perf'
+          cmake --build build-wasm-checked -j "$JOBS"
+          # $JOBS at a time: the one test that must not share the machine — the wall-clock gate — is excluded
+          # right here by -E, so nothing in this run measures time. Under SAFE_HEAP every load and store is
+          # checked, which makes this the slowest test run in the workflow.
+          ctest --test-dir build-wasm-checked -j "$JOBS" --output-on-failure -E 'spectrum_pane_perf'
 
   # eqviz — renders the per-filter PNG quality maps (digital vs independent analog references) and
   # uploads them as a PR artifact, so a reviewer SEES filter quality instead of trusting their ears.

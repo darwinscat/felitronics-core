@@ -714,6 +714,38 @@ namespace matched
     }
 
     //==========================================================================
+    // First-order shelves (6 dB/oct), magnitude-matched — the gentle relatives of the 2-pole shelves
+    // below. Analog low shelf H(s) = (s + w0·√G) / (s + w0/√G): G at DC, unity up high, exactly √G
+    // (half the dB) at f0. The one-pole/one-zero section matches that magnitude at DC, at f0 and at
+    // Nyquist. With r = (1 - a1) / (1 + a1), the f0 condition reduces to r² · tan²(w0/2) =
+    // (G·xN² + 1) / (xN² - 1), xN = (fs/2) / f0 — closed form, no 0/0 at G = 1 (the section is then
+    // the identity), and r > 0 keeps the pole inside the unit circle. A high shelf is G times the low
+    // shelf of 1/G, which carries all three matched points over exactly.
+    inline BiquadCoeffs lowShelf1 (double f0, double fs, double gainLin) noexcept
+    {
+        BiquadCoeffs c;
+        f0 = std::min (f0, 0.495 * fs);
+
+        const double xn2 = (0.5 * fs / f0) * (0.5 * fs / f0);
+        const double hN  = std::sqrt (gainLin * (xn2 + gainLin) / (gainLin * xn2 + 1.0));  // analog |H| at Nyquist
+        const double r   = std::sqrt ((gainLin * xn2 + 1.0) / (xn2 - 1.0)) / std::tan (kPi * f0 / fs);
+
+        const double inv = 1.0 / (1.0 + r);
+        c.b0 = (gainLin + hN * r) * inv;
+        c.b1 = (gainLin - hN * r) * inv;
+        c.b2 = 0.0; c.a1 = (1.0 - r) * inv; c.a2 = 0.0;
+        return c;
+    }
+    inline BiquadCoeffs highShelf1 (double f0, double fs, double gainLin) noexcept
+    {
+        BiquadCoeffs c = lowShelf1 (f0, fs, 1.0 / gainLin);
+        c.b0 *= gainLin; c.b1 *= gainLin;
+        return c;
+    }
+    inline BiquadCoeffs lowShelf1Db  (double f0, double fs, double gainDb) noexcept { return lowShelf1  (f0, fs, std::pow (10.0, gainDb / 20.0)); }
+    inline BiquadCoeffs highShelf1Db (double f0, double fs, double gainDb) noexcept { return highShelf1 (f0, fs, std::pow (10.0, gainDb / 20.0)); }
+
+    //==========================================================================
     // High shelf — matched 2-pole Butterworth. gainLin = the high-frequency plateau
     // (linear; |H| -> gainLin as f -> Nyquist+, 1.0 at DC). 2poleShelvingFits appendix A.1.
     inline BiquadCoeffs highShelf (double f0, double fs, double gainLin) noexcept

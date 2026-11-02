@@ -39,4 +39,29 @@ if(FELITRONICS_BUILD_TESTS)
     target_include_directories(felitronics_saturation_falsify_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
     target_compile_features(felitronics_saturation_falsify_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_saturation_falsify_tests COMMAND felitronics_saturation_falsify_tests)
+
+    # The Tube and Transistor curves. The exhaustive float sweep of Transistor's curve is its own ctest entry, so a
+    # slow instrumented build can leave it out.
+    add_executable(felitronics_saturation_types_tests tests/SaturatorTypesTests.cpp)
+    target_link_libraries(felitronics_saturation_types_tests PRIVATE felitronics::saturation)
+    target_include_directories(felitronics_saturation_types_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_saturation_types_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_saturation_types_tests COMMAND felitronics_saturation_types_tests)
+    add_test(NAME felitronics_saturation_types_exhaustive_tests COMMAND felitronics_saturation_types_tests exhaustive)
+
+    # The Transformer: the one shape with a model state — its double-precision reference NULL, THD, peak law, and
+    # the state's lifecycle (links the allocation counter for the prepare() byte budget).
+    add_executable(felitronics_saturation_transformer_tests tests/SaturatorTransformerTests.cpp)
+    target_link_libraries(felitronics_saturation_transformer_tests PRIVATE felitronics::saturation)
+    target_include_directories(felitronics_saturation_transformer_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_saturation_transformer_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_saturation_transformer_tests COMMAND felitronics_saturation_transformer_tests)
+
+    # Tape: Tanh's core between a pre-emphasis and its exact inverse — its double-precision reference NULL, the top
+    # saturating first, peaks against Tanh's, the bypass rate, and the two-float state's lifecycle.
+    add_executable(felitronics_saturation_tape_tests tests/SaturatorTapeTests.cpp)
+    target_link_libraries(felitronics_saturation_tape_tests PRIVATE felitronics::saturation)
+    target_include_directories(felitronics_saturation_tape_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_saturation_tape_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_saturation_tape_tests COMMAND felitronics_saturation_tape_tests)
 endif()

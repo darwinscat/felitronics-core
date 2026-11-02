@@ -5,6 +5,266 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
+## v0.61.2 — 2026-10-21
+
+### delay · reverb — `feed` fades over 5 ms instead of switching, so a stand-by flip no longer ticks in the repeats or clicks into the room
+
+`TapeDelay::process (…, feed)` and `AmpReverb::process (…, feed)` switched what enters the line or the room at
+the call boundary. A flip on a loud note was a full-scale step at the record head, which the delay then played
+back as a tick at every repeat, and which the reverb carried through its tail as a click. The input now goes
+through a linear ramp of `kFeedRampSeconds` (5 ms, counted in samples at the prepared rate: 240 at 48 kHz) from
+1 to 0 or from 0 to 1. A flip in mid-ramp reverses from where the ramp stands. The recirculation and the room's
+own tail are not ramped.
+
+Measured on a 0 dBFS 375 Hz tone flipped on a crest at a block boundary: the delay's largest sample-to-sample
+step where the first and second repeats replay the flip falls from 14.8x, 13.3x and 15.6x the steady echo's own
+step (off, on, and off-then-on within 128 samples) to 0.98x, 1.05x and 1.00x. In a PLATE, the room's largest
+sample above 4 kHz in the 250 ms after the flip falls from -24.7, -24.7 and -23.5 dB re its steady answer to
+-70.1, -70.2 and -63.5 dB.
+
+With `feed` held, the output is bit-identical to before: at the ends of the ramp the input is the plain sample
+or the plain zero, with no multiply. This was checked on 15.8 M output samples (the golden scenarios, 84 random
+renders from 1 kHz to 192 kHz with held `feed`, and 24 stand-by renders), and no golden moved. After
+`prepare()` or `reset()` the ramp starts settled on the next call's `feed`, so a fresh insert does not fade in
+its first note. A pause (`nch == 0`) moves the ramp as the same length of silence would (law 11c). The ramp
+lands on exactly 0 or 1 because it is counted, not glided.
+
+## v0.61.1 — 2026-10-19
+
+### core — `FlushToZero.h` compiles in a wasm build with `-msse4.1`
+
+A wasm consumer that wants Eigen's SSE path (NAM) builds with `-msimd128 -msse4.1`; emscripten then defines
+`__SSE2__` and lowers SSE onto SIMD128. `FlushToZero.h` keyed its x86 path on `__SSE2__` and called `_mm_setcsr`,
+which emscripten does not provide because WebAssembly has no MXCSR, so no file that included it compiled under those
+flags. The header now tests for wasm first and takes the path a target without an FP-control register always took:
+`ScopedFlushToZero` is a no-op, and law 8's software flush keeps denormals out, as it already did in every wasm
+build. Native x86-64, arm64 and the existing wasm build preprocess to the same source as before, byte for byte; MSVC
+defines neither wasm macro, so its branch is the old condition verbatim. The wasm-audio tier now builds every public
+header under `-msimd128 -msse4.1` (`felitronics_wasm_sse_probe`) and runs `felitronics_core_wasm_sse_tests`: under
+those flags subnormals survive inside `ScopedFlushToZero`, and `flushDenormal` / `flushPoison` still zero them.
+
+## v0.61.0 — 2026-10-19
+
+### delay · reverb — two new modules: the amp plugins' echo and room, moved out of the product
+
+`felitronics::delay` and `felitronics::reverb` — header-only, JUCE-free; `delay` depends on `core`, `reverb` on
+`core` and `eq`. They are OrbitAmp's delay and reverb, moved here so every amp plugin and the browser demo run one
+implementation; the signal paths are the app's, expression for expression, with every transcendental in
+`core::det`, so every row computes the same bits up to FMA contraction (law 10).
+
+- **`delay::TapeDelay`** — a tape head, not a sampler: TIME is a target the head glides to (~150 ms) and the glide
+  bends the repeats' pitch; every pass through the loop goes through a one-pole low pass (DARK) and a fixed `tanh`
+  saturator; OFFSET holds one channel's wet back by up to ±31 ms. The dry is never touched.
+- **`delay/DelayLaw.h`** — the amps' knob law: the 13-step sync ladder (`kDivisionNames`, `kDivisionBeats`,
+  `divisionMs`, the tempo floored at 40 BPM so no division outruns the 6.1 s line), the sync policy
+  (`timeMsFor`), the DARK knob's log-even map from 16 kHz to 800 Hz (`darkHzForPercent`) and the knob ranges.
+- **`reverb::AmpReverb`** — the six characters (Ambience, Room, Hall, Plate, Spring, Modulated with its slow
+  chorus), DECAY ×0.5 … ×2 through the room size, PREDELAY 0 … 100 ms and a wet-only HPF; the tail is ADDED to an
+  untouched dry. Built on **`reverb::Freeverb`** — Jezar's Freeverb (2000, public domain), written here from the
+  published algorithm; the behaviour of the framework Freeverb the amps were voiced on was established by running
+  it, not by reading it into this code.
+- **Contract**: `prepare (rate, maxBlock, maxChannels)` allocates (1 or 2 channels, 1 … 768 kHz) and a refused
+  one DISARMS; `[[nodiscard]] bool process (io, nch, n, feed)`; `reset()` is a stream restart (clocks re-anchored,
+  glides landed); knobs are bounded before any arithmetic; both stages in the law-11 census and the law-11c pause
+  suite. Law 8: flushed per sample at the house 1e-15 (+0.008 % RT); the delay's heads glide in double and land.
+- **Law 11, a new census property for every stage**: P8, a refused re-prepare disarms. Every existing stage
+  already did.
+- **Distance to the app** (an out-of-tree harness renders the app's own classes beside these): the delay within
+  3.0e-7 at fixed knobs (ulp-level: `det` against the system libm); the room within 1.2e-10 for the unmodulated characters and 5.4e-5 for MODULATED
+  (both stages primed past the app's own first-10-ms leak); `Freeverb` against the framework's within 2.8e-14. Regression goldens
+  of the core's own renders (25 KB) guard the sound in CI.
+- **Intel builds of the plugins move by up to 1.04e-6 (-120 dBFS) from today's app**: the framework's Freeverb
+  quantises its state on x86-64 and not on arm64; these modules quantise nowhere — the arm64 sound everywhere.
+- **Other departures from the app, on purpose**: a fresh room starts at its parameters (the app leaked up to
+  0.8 × mix of the dry into the first 10 ms after its first prepare); the delay's heads land on their targets (the
+  app's float motor parked up to 2.3 ms short at 6 s); `reset()` is a true restart; absurd knob values can no
+  longer reach a NaN read position; the tail estimates are right from construction; a call longer than `maxBlock`
+  is processed whole.
+
+## v0.60.0 — 2026-10-17
+
+### dehum — a new module: `HumRemover` removes mains hum (50/60 Hz and its harmonics) from an input
+
+`felitronics::dehum::HumRemover<MaxHarmonics = 64>` — header-only, depends on `core` only, zero latency,
+no heap. A phase-coherent synchronous canceller: one complex weight per harmonic per channel, adapted by
+LMS against references from one uint32 mains phase. With a fixed step it is exactly a notch comb, and the
+step is set from a width in hertz, so every harmonic gets the same absolute width: 0.5 Hz while playing
+(a partial 0.5 Hz from a harmonic loses 0.97 dB, 3 Hz away 0.03 dB), 3 Hz while the input is quiet.
+
+- **Modes** Off / 50 / 60 / Auto. Auto decides from Goertzel bins {50, 100} vs {60, 120} on 0.5 s windows
+  (summed over channels as powers): a family must win by 6 dB in three consecutive quiet windows; ambiguous
+  → it stays dry; decided only in quiet, so it is sticky while playing. Hum-only input decides in ≈ 1.0 s,
+  missing-fundamental, odd-only, even-only and opposite-phase stereo hum included. Moving off a decided family
+  needs that family to have lost 10 dB; a real swap re-decides in ≈ 1.3 s.
+- **Frequency**: a coarse estimate from the bins' phase advance, the median of up to four in a row, acquired only
+  from a clean set (two or more within 0.05 Hz), so a knock or a palm on the strings does not throw it off. Then an
+  FLL from the weights' own rotation (K·τ = ½, slewed ≤ 0.05 Hz/s, bounded by `lockRangeHz`, default ±1 Hz). It runs
+  only in quiet, while the coarse estimate agrees and the canceller explains the input — broadband, or, where hiss
+  makes that impossible (a guitar DI), in the weights' own narrowband terms. Detuned mains (49.6 … 60.4 Hz) lock
+  within 0.01 Hz in ≈ 1.2 s; a held note beside a harmonic does not move it; a single-coil DI locks ≈ 1–2.5 s after
+  Auto decides. While playing the frequency holds, and the first quiet gap re-locks a drift (0.8–1.05 s for 0.06 Hz).
+- **Quiet / active**: quiet needs (a) the window to be hum — broadband within 12 dB of the hum bins, or the
+  fundamental a clean line at the mains bin (a humbucker's hum is only ≈ 4 dB over its hiss), which serves the
+  tracker and lends the learn width only near the broadband rule; (b) the residual within 12 dB of its own floor
+  (a 4 s minimum rising ≤ 2 dB/s — a note is not quiet however stationary; a louder hum is told apart and
+  re-qualifies in ≈ 0.5 s); and (c) no per-sample trigger in the last 50 ms (the residual catches a pluck's first
+  samples). `active()` is the 64-sample power 12 dB over the floor for 20 ms.
+- **The ghost a note leaves is returned**: a note beside a harmonic leaves its beat in that harmonic's weight, which
+  would ring out at the playing width (1.56 s to −60 dB) — behind high gain an after-ring after every chug. An event
+  opens on a trigger with a snapshot of the weights before the attack; when the input is back near its floor, a note
+  of up to 3 s returns the weights to the snapshot over 40 ms. Every return is checked over the next 16 periods
+  against the residual the weights it replaced would have made on the same samples, and taken back if those did
+  better. No return when the hum dropped under the note (hands on the strings) or the frequency moved. Measured:
+  the 330 Hz ghost under −60 dB re the tone 0.07 s after the stop; palm-muted chugs over a single coil leave
+  ≤ −62 dB re the chug 50–90 ms after each end (it was −37).
+- **LEARN**: `beginLearn()` / `learnStatus()` / `endLearn(commit)` → `LearnReport` { mains, hz, humDb,
+  harmonicDb[], floorAfterDb (peak |out| over the settled window), settledAtMs, verdict, kept }. Disturbed
+  (a trigger, or a floor window that rises) freezes adaptation from that sample; a floor window under
+  0.25 s is TooShort; `kept` says whether the stage now runs the learned model; anything but a committed,
+  Learned learn restores the snapshot — weights, frequency, decision and its own phase frame — bit for bit
+  through a 20 ms ramp. `endLearn` with no learn running says NotLearning.
+- **Telemetry**: `detected()`, `mainsHz()`, `oscillatorHz()`, `locked()` (judged on a whole hop, kept while the
+  FLL is held), `humDb()`, `harmonicDb(k)`, `quiet()`, `active()`.
+- **Laws**: bit-identical under re-slicing (8a), the weights flushed and healed on the grid (8), a pause is
+  silence for every shared clock (11c), a stopped channel keeps its model (11a), `prepare()` disarms and
+  refuses (11b), and a restart is a fresh instance bit for bit; the weight update cannot contract under any
+  `-ffp-contract` mode (10); digital black in is bit-exact black out, and the correction fades out over the
+  64 zeros and back in after them, so region ends and starts do not step. Harmonics stop where the top of
+  the lock range would cross maxHz or 0.9·Nyquist. setParams / beginLearn / endLearn belong on the process
+  thread or strictly between process calls.
+- **Bench**: `tools/dehumbench.cpp` — ≈ 4.0 µs per 64-frame block, 0.30 % of a core at 48 kHz stereo,
+  24 harmonics (Apple M5 Pro). Footprint 39 KiB at 24 harmonics, 104 KiB at 64, plus ≈ 9 KiB.
+- **Limits, stated in the header**: a slow attack (≈ 10 ms) within ≈ 100 ms of the previous note may trip no
+  trigger, and that note keeps the old ghost; a note held longer than 3 s gets no return, so a partial of it
+  inside a harmonic's notch rings out at the playing width — the A string is the plain case (5·110 = 11·50,
+  6·110 = 11·60).
+- **Cannot**: remove hum made after its input (e.g. inside a physical amplifier downstream).
+
+## v0.59.0 — 2026-10-02
+
+### eq — a gentle tilt on first-order shelves
+
+`matched::lowShelf1` / `highShelf1` (and their `…Db` forms) are first-order shelves, 6 dB/oct, beside `lowpass1` /
+`highpass1`: the analog shelf with exactly half the gain in dB at f0, matched in magnitude at DC, at f0 and at
+Nyquist, the pole in closed form. A `FilterType::Tilt` band with `slope == 6` now builds its tilt from these two
+instead of the 2-pole shelves: the same pivot (unity at f0), the same ends (lows −gain, highs +gain), but the change
+spreads over decades instead of the octaves around f0. At +3 dB about 1 kHz (48 kHz): 125 Hz −2.91 · 250 −2.64 ·
+500 −1.79 · 1k 0 · 2k +1.79 · 4k +2.65 · 8k +2.91, where the 2-pole tilt reads −3.00 · −2.98 · −2.64 · 0 · +2.64 ·
++2.98 · +3.00.
+
+Every other slope, the default 12 included, keeps the 2-pole tilt bit for bit. A Tilt band that already carries
+slope 6 — say from a type switch in a product that keeps the slope across types — turns gentle with this release.
+
+## v0.58.0 — 2026-10-02
+
+### codecgrid — a new module: the frame grid a lossy codec leaves in decoded PCM
+
+`felitronics::codecgrid` is an offline measurement. A decoder's output, analysed again with the codec's own transform
+from the same sample, gives the quantiser's zeros back; one sample off, it does not. `CodecGridDetector` takes eight
+stretches of a programme and reads each with seven hypotheses — the MPEG-1 Layer III hybrid filterbank, the AAC MDCT
+with its sine and its Kaiser-Bessel-derived window, each at the programme's rate and at the other of 44.1 / 48 kHz
+(the stretch is taken back with a zero-phase resampler), and CELT's MDCT at 48 kHz — at every frame offset. It reports
+which grid stands out, how far, in how many stretches and on which phase: `Confirmed`, `InPlaces`, `SeveralGrids`,
+`NoGrid` or `NotExamined`, with the family, the codec's rate, the hop, the phase counted from sample 0 of the
+programme, every stretch's readings, the curve of the best reading and the zero share of its 32 bands with a map of
+it per frame.
+
+It reports a grid, not a codec: material that went through the same transform with coefficients zeroed by something
+else reads the same. `NoGrid` means no grid of the transforms tried, on whole-sample offsets, in the stretches
+examined — never "lossless". Long blocks only; HE-AAC, whose core runs at half the rate, has no hypothesis of its own.
+
+A grid is `Confirmed` on either of two grounds. The rule (`GridRule`: score, depth in decibels, breadth over the 32
+cells of four signals by eight band groups, uniqueness against the best offset more than two samples away) finds it in
+two stretches on exactly the same phase; or the best offset of one hypothesis lands within a sample of one phase in at
+least four of the eight stretches and the rule finds the grid on that phase in at least one of them. One stretch found
+and nothing to confirm it is `InPlaces`.
+
+A score counts the frames of a stretch as independent readings, and the frames of a programme that repeats on a whole
+number of frames are not: sample-locked drums at 125 bpm put the same sixteenth note every six frames of 20 ms, the
+noise of the curve is then that of six frames instead of a hundred, its largest offset scores like a grid, and it sits
+on the same phase in every stretch. `GridScan::frameRepeat` compares the frames of a stretch with each other and
+`repeatFactor` says what a score is worth among the frames that differ; a reading the rule accepts only at face value
+is `repeated` and confirms nothing. The suite's rhythm — one noise burst every six frames, never coded — is found by
+the rule at face value with scores of 17.6, 9.9 and 12.8 and is worth 4.5 at most. The rule's numbers, the stretch length of 2 s, the eight stretches at tenths of the programme and the phase tolerance are
+parameters whose defaults were set by a measurement on real encoders that is not part of this repository; the suites
+here prove the mechanism on programmes made to carry a grid — a transform, the smallest 30 % of every frame's
+coefficients set to zero, the inverse — with no codec and no audio file.
+
+The pieces are public: `Mp3Hybrid` (the polyphase analysis and the 36-point MDCT folded to an 18 x 18 DCT-IV, with the
+alias butterflies), `Mdct` over a `ComplexFftBackend`, `MixedRadixFft` (the scalar reference for any size 2^a 3^b 5^c —
+CELT's frame needs 480 points), the windows, `LevelAccumulator` and `readCurve`, `BackResampler`, `GridScan`. The
+transforms run in single precision from tables designed in double through `core::det`. Against the standard's formulas
+written out directly the MP3 analysis nulls 129 dB under the peak and the hybrid lines 134 dB; the MDCT nulls 134 dB
+under the peak against its 2M x M sum for the three frames in use; `tests/crossnull` nulls the curves, the readings and
+the resampler against numpy and scipy.
+
+The form is the offline measurers': `storageFor()` publishes what `prepare()` takes and it is taken byte for byte
+(10 029 524 bytes at 44.1 kHz and 10 591 124 at 48 kHz with the default stretches); `prepare()` is the only
+allocation; `process()` keeps a copy of the stretches, takes any split of the programme and gives the same report for
+every split; a request it cannot honour in full is refused whole; `finishStep()` does a bounded piece of the analysis
+per call and `finish()` drives the same steps. Parameters it could accept and not honour — a phase tolerance wide enough to call any two offsets one phase, more
+agreeing stretches than there are, a NaN anywhere — are refused. A rate other than 44.1 or 48 kHz, a programme shorter than one stretch
+and a silent one are accepted and reported `NotExamined` with the reason. Non-finite samples are read as zero and
+counted.
+
+## v0.57.0 — 2026-09-30
+
+### saturation — Tube and Transistor shapes
+
+`WaveShaper::Shape` gains `Tube` and `Transistor`, appended as 4 and 5 so no existing value moves. Neither has a knob of
+its own: drive, mix, output and autoComp work as for every shape, and `Params::bias` stays Asym's. **Tube** is
+tanh(u+0.3) - tanh(0.3), evaluated as q·t/(1+c·t) so it keeps float precision at low drive (within 1e-6 of a double
+evaluation at every drive; the plain difference is off by 5.1e-4 at driveDb 0). It adds mostly the 2nd harmonic — H2
+leads H3 by 9.3 dB at driveDb 6 and -3 dBFS — its negative peak is the larger one, and the Saturator's DC blocker runs
+for it as for Asym. With autoComp 1 its small-signal slope below 1 (0.936 at the least, near driveDb 3) lifts a
+full-scale sine's peak by up to +0.58 dB before the blocker settles and +0.17 dB after. **Transistor** is
+u/(1+u⁴)^(1/4): odd, with no cubic term, so it is cleaner than Tanh at low drive (H3 -35.3 dBc against Tanh's -28.7 at
+driveDb 6 and -3 dBFS) and harder past its knee; |u| is clamped to 64 so a huge input at a huge drive keeps its sign.
+Tanh, Atan, Cubic and Asym are unchanged bit for bit, settled and gliding.
+
+### saturation — Transformer shape
+
+`WaveShaper::Shape` gains `Transformer`, appended as 6 so no existing value moves. It is the one shape with memory: per
+channel and per oversampled sample the Saturator runs a flux proxy L (a leaky integrator at 40 Hz, unity DC gain) and
+outputs sat(L) + sat'(L)·(x − L) with sat(u) = tanh(k·u)/k — the exact derivative of the saturated flux, with no
+differentiator filter. The low end saturates and the top passes: at driveDb 6 on a full-scale sine (48 kHz, os 4) THD
+is 8.95 % at 20 Hz, 1.40 % at 160 Hz, 0.096 % at 640 Hz and 0.0016 % at 5 kHz, where Tanh has 6.6 %; the same 80 Hz
+THD at 44.1, 48 and 96 kHz to 0.002 dB. It has no knob of its own (drive, mix, output and autoComp; `Params::bias` is
+not read), no hysteresis, no DC blocker and no added latency. The curve is SLOPE-normalised (norm = 1/k, so
+`slopeAtZero()` is exactly 1.0f and drive-compensation is exactly 1.0f): a -60 dBFS multitone comes out within 1.2e-10
+of Tanh at driveDb 0, and the model's output peak never exceeds its input's (at os > 1 the oversampler's own round trip can still
+overshoot, as it does for every shape: +0.467 dB on a 20 Hz square at driveDb 6, against Tanh's +0.727). At os 1 the stage nulls against a
+double-precision evaluation of the model to 9.3e-7. The model state is one float per channel
+(`Saturator::kModelFloats`), in `Storage` and `Storage::bytes()` — which grow by exactly that — zeroed by prepare() and
+reset(), flushed per sample, and gated like the DC blocker, so a channel that leaves and returns, or a switch to another
+shape and back, starts it from zero. Tanh, Atan, Cubic, Asym, Tube and Transistor are unchanged bit for bit, settled
+and gliding.
+
+### saturation — Tape shape
+
+`WaveShaper::Shape` gains `Tape`, appended as 7 so no existing value moves. The Saturator runs it as a model: per channel
+and per oversampled sample, a pre-emphasis E(s) = (1 + s/ω1)/(1 + s/ω2), Tanh's core tanh(k·e)/tanh(k), then the exact
+inverse D = 1/E, with f1 = 1/(2π·50 µs) = 3183.1 Hz (the NAB 15 ips corner) and f2 = f1·10^(6/20) = 6351.1 Hz, a +6 dB
+high shelf. The top reaches the core louder and saturates first: at driveDb 6 (48 kHz, os 4, autoComp 0) the
+fundamental of a 10 kHz sine is 0.5 dB compressed at -11.104 dBFS and that of a 1 kHz sine at -6.429 — 4.675 dB apart,
+where the analog |E(10k)|/|E(1k)| is 4.645 dB — while Tanh compresses both at -6.126. The 10 kHz point stays within
+0.0285 dB across 44.1, 48 and 96 kHz. Since D·E = 1, a -60 dBFS multitone comes out within 6.4e-10 of Tanh at the same
+drive, a full-scale one within 4.17e-7 at driveDb 0, and drive-compensation is Tanh's. Each section is a first-order
+bilinear transform with its own corner prewarped (both exact at every rate), in transposed direct form II. On
+full-scale 1/5/10 kHz sines, a 1 kHz square and band-limited clicks at driveDb 0/6/12 (os 4, autoComp 1), Tape's peak
+is Tanh's or lower to the printed 0.001 dB. At os 1 the stage nulls against a double-precision evaluation of E, the
+core and D to 2.43e-7. Where f2 >= 0.45·fsOs (os 1 below 14113.6 Hz, os 2 below half that) the pair is bypassed and Tape renders Tanh's bits.
+Tape has no knob of its own (`Params::bias` is not read), no head bump, no HF roll-off, no hysteresis, no DC blocker
+and no added latency; a standalone `WaveShaper` set to Tape is Tanh's curve, operand for operand.
+
+`Saturator::kModelFloats` rises from 1 to 2 (the Transformer keeps slot 0, Tape uses slots 0 and 1), so `Storage` and
+`Storage::bytes()` grow by one float per channel. The state is zeroed by prepare() and reset(), flushed per sample and
+gated like the Transformer's. A direct switch between the Transformer and Tape starts the new model from zeroed state:
+at os 1 the switched stage renders what a fresh stage of the new shape renders from the switch on. A drive glide lands
+on the settled stage's bits 20 samples after the landing at os 1 and 9 at os 4, once the de-emphasis state has
+forgotten the glide. Tanh, Atan, Cubic, Asym, Tube, Transistor and Transformer are unchanged bit for bit, settled and
+gliding.
+
 ## v0.56.0 — 2026-09-29
 
 ### limiter — the K13 peak clipper's reduction, sample by sample

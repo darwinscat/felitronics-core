@@ -1,0 +1,6 @@
+*.f32
+out/
+venv/
+dump
+__pycache__/
+readings.txt

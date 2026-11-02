@@ -85,7 +85,9 @@ incompatible dependency is a compile/link error; an allocation in `process()` is
 `ENOTSUP`, so `std::thread` compiles, links and merely aborts at runtime (measured, emsdk 6.0.9). What
 the wrap still cannot see: a thread in code never emitted (an unused inline, an uninstantiated template),
 and `std::mutex`, whose lock lives inside `libc++-noexcept.a` and whose stub silently succeeds — a lint
-over module headers covers the latter. **Law 8 is not covered at all**: a denormal stall is a property of
+over module headers covers the latter. An x86-only intrinsic keyed on `__SSE2__` is a **compile** error:
+every public header is also built under `-msimd128 -msse4.1` (the flags that put Eigen on its SSE path),
+where emscripten defines `__SSE2__` but has no `_mm_setcsr`. **Law 8 is not covered at all**: a denormal stall is a property of
 the CPU at runtime, invisible to any build. Full write-up:
 [`WASM-AUDIO-TIER.md`](WASM-AUDIO-TIER.md).
 - `desktop` — heap in `prepare`, SIMD, JUCE only in adapters.
@@ -253,7 +255,11 @@ the CPU at runtime, invisible to any build. Full write-up:
    normal can land subnormal), the rounding mode, and NaN sign/payload.
    **AND A PIN THAT IS NOT AN OVERRIDE.** Where a number is gated against a reference that never contracts
    (JavaScript), the right answer is the unfused one, and a `volatile` store of each product before it is added
-   holds under every contraction mode, gcc's `fast` included, with no pragma. The worked case — the stereo band's
+   holds under every contraction mode, gcc's `fast` included, with no pragma. `convolution::resampleIr` pins its
+   accumulation so (`core::det::mulAdd`): its phase memo claims bits against its own long road and the suite's
+   frozen copy of it, and the GCC of Ubuntu 26.04's amd64v3 build (Canonical's cloud images, GitHub's
+   `ubuntu-latest`) — x86-64-v3 by default, so an x86 row with an FMA — fused the header's copy and not the
+   suite's. The worked case — the stereo band's
    `analysis::StereoSums`, the width it read fused on arm64 and every cell the pin was measured in — moved with
    the offline analyzers to felitronics-mastering-core (`docs/LAW10-STEREOSUMS.md` there).
 
@@ -631,6 +637,7 @@ its own JUCE-free self-tests.
 | `oversampling`  | polyphase up/down-sampling                                           | compiled if SIMD; for true-peak + nonlinear |
 | `limiter`       | true-peak limiter                                                    | compiled; uses `oversampling` |
 | `neural`        | a thin **inference-object seam** (process-only) + the swap-safe model holder; model *loading* lives in the adapter | header-only, backend-free; a backend (the NAM one is in felitronics-guitar-core) is chosen at build time. NOT a runtime model-swap of one backend for another |
+| `dehum`         | `HumRemover`: mains hum (50/60 Hz + harmonics) removed from an input by a phase-coherent synchronous canceller — exactly a notch comb of constant absolute width (0.5 Hz playing, 3 Hz in quiet), Auto 50/60 from Goertzel bins in quiet, an FLL that holds while playing, LEARN with a floor report | header-only, `core` only; weights in double (law 3 carve-out, stated), zero latency, no heap; ≈ 0.26 % of a core at 48 kHz stereo, 24 harmonics (`tools/dehumbench.cpp`). Cannot remove hum made after its input |
 
 **The FFT seam** (`core/Fft`) — the architecture's keystone, **designed FIRST** (see §6). NOT a bare
 `virtual fft(float*)`: a **plan object created in `prepare`** with explicit scratch ownership,
@@ -788,6 +795,10 @@ here is the *goal* state — only the adapter touches JUCE.
 Their DSP beyond this core — the NAM backend, the `.orbitrig` pack player, the tube power-amp trunk —
 lives in felitronics-guitar-core. The pre-migration inventory of OrbitCab's DSP that this section used to
 carry left core with those modules.
+The amps' echo and room are core's: the five amp plugins (OrbitAmp, CatpitAmp, RedPawAmp, FrostPawAmp,
+AmberPawAmp) and the site's in-browser demo consume `delay::TapeDelay` with its knob law (`DelayLaw.h`) and
+`reverb::AmpReverb` (which owns its `reverb::Freeverb`), moved out of OrbitAmp's own stages — see the two
+modules' READMEs for the provenance and the measured distance to the app.
 
 ### Future products
 - Standalone **compressor** (Felitronics) — `dynamics` broadband + optional sidechain `eq`.
