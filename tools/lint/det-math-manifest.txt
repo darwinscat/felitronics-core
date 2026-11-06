@@ -83,7 +83,7 @@ modules/measurement/include/felitronics/measurement/CaptureGate.h  [log10*1]  re
 modules/measurement/include/felitronics/measurement/IrPost.h  [pow*1]  retain-offline  post-processing gain for a measured IR
 modules/measurement/include/felitronics/measurement/LevelProbe.h  [exp*1 pow*1]  retain-offline  the probe's stimulus level and its smoothing; feeds the capture level a human sets
 modules/measurement/include/felitronics/measurement/PeakClip.h  [log10*1]  retain-offline  a clip report in dB for the capture UI
-modules/measurement/include/felitronics/measurement/ReferenceUnity.h  [log10*1 pow*2]  retain-offline  the -60 dB normalisation floor that decides whether a measured IR is normalised at all. Its header says plainly that this float arithmetic defines shipped audible unity gain, so it is read and left, not waved through
+modules/measurement/include/felitronics/measurement/ReferenceUnity.h  [log10*2 pow*4]  retain-offline  the -60 dB normalisation floor that decides whether a measured IR is normalised at all, and the gain, for the guitar's reference and the bass's (bassReferenceUnityGain, moved from OrbitAmp unchanged). Its header says plainly that this float arithmetic defines shipped audible unity gain, so it is read and left, not waved through
 modules/measurement/include/felitronics/measurement/Sweep.h  [cos*2 exp*2 log*2 sin*1]  retain-offline  the exponential sweep and its inverse filter — sin() PER SAMPLE of the generated stimulus, which is the one place a deterministic sin would cost real time for a signal that is measured, not compared
 
 
