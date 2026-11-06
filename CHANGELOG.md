@@ -5,6 +5,124 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
+## v0.62.0 — 2026-11-06
+
+### chorus — new module: `BassChorus`, the bass amp's chorus, whose lows stay dry and centred
+
+`felitronics::chorus::BassChorus` is the dry plus a voice: a copy of the input's Linkwitz–Riley high band (LR4's
+high half, at an adjustable crossover, 100 … 1000 Hz) read by a head that swings on a sine around a centre delay.
+The dry is never split — it leaves the stage sample for sample as it came in, at every setting — and the low end is
+kept out of the voice by LR4's 24 dB/oct: attenuated, not excluded. On a stereo bus the two sides carry two voices
+in quadrature, so a mono sum still swings; a mono call is one voice. The read is a 4-point cubic Hermite in double.
+
+The one-slider law is `ChorusLaw.h`: `paramsForAmount (amount, menu)` drives depth (0 … 3 ms) and mix (0 … 1)
+together and passes rate, crossover and centre delay through from the menu; a non-finite amount is ignored.
+`pitchDeviationCents (params)` is the read-out a face may print. Amount 0 is the dry bit for bit and computes
+nothing: the stage idles on the sample its counted mix ramp lands on zero, and a wake is a restart.
+
+Measured (`modules/chorus/tests/BassChorusTests.cpp`, 44.1 / 48 / 96 kHz): the voice plus LR4's low half of the
+same input sums flat to 4e-6 dB from 20 Hz to 20 kHz, and the voice reads -6.02 dB at the crossover and -24.6 dB
+an octave below; the Side, (L − R)/2, of a tone under the crossover stays under the voice's own LR4 level there
+at every rate, centre and crossover extreme, sidebands included — the open strings' fundamentals read -76 dB (low
+B) to -28 dB (G2) at the default 200 Hz crossover; the full 3 ms depth holds on the lowest centre (5 ms); the
+voice stops on the sample the mix lands on zero; the pitch deviation measured on a 1 kHz sine is the set one within 0.3 %, the two voices a quarter
+period apart; a stream that idles, wakes, moves every knob, and glides the centre into and out of the depth's
+limit keeps its largest third difference under the bound of a smooth signal; a lane that returns after a narrow
+stretch or a gap fades in, its largest step the steady voice's own; `tailSeconds()` (71 ms) leaves the voice
+under -100 dB at the lowest crossover. The voiced band rises about +3 dB at amount 1 (up to +6 on coherent
+peaks): budget that before a limiter. Plus the law-11 properties, re-slicing, restart, pause, stopped channel,
+poison, a minute of silence with no subnormal in the lines or the glides, and no allocation.
+
+### envfilter — a new module: `EnvelopeFilter`, the bass amp's envelope filter (auto-wah), and its one-slider law
+
+`felitronics::envfilter` — header-only, JUCE-free, no heap; depends on `core`, `dynamics` and `eq`. A peak
+`dynamics::EnvelopeFollower` on the loudest channel — or on an external key, `process (io, nch, n, key, nk)`, the
+dynamics house shape — places the cutoff of a resonant Cytomic TPT state-variable filter on a log-frequency sweep
+(150 Hz … 3 kHz by default): fully open when envelope + sensitivity reaches 0 dBFS, closed 30 dB below; UP rests
+low and a hit opens it, DOWN rests high and a hit pushes it down. The playing reaches the cutoff through a 4 ms
+smoother, the hand's edits (direction, range, sensitivity) glide 20 ms first, and the filter is redesigned every
+sample. Low pass or band pass, both scaled by 1/√max(1, Q) (Q 0.5 … 12): the low pass's
+passband sits at −6.0 dB at Q 4 and −10.8 dB at Q 12. `keepLows` takes the band under `keepLowsHz` (150 Hz; 80 … 300) out
+of the filter and adds it back clean, with a split per mode that cannot cancel it: an exact complement in low pass
+(dry = the input), an in-phase LR4 pair in band pass (dry = its allpass). The doors never crossfade the two phase
+families: the low pass has a 10 ms door from the input, the band pass a 250 ms ladder (a 25 ms crossfade to the
+LR4 allpass parked at 0.45 fs, a 200 ms exponential sweep of it down to the corner — heard as a pitch bend of at
+most ~50 cents at the default corner, 95 at the lowest (80 Hz) — and a 25 ms crossfade to the band pass); the door machine is a pure function,
+swept exhaustively by the tests (no state sticks), so a wake, a
+disengage and a mode change keep a tone at or above the corner within 0.92 dB of its settled level. Everything
+glides and lands; `mix` 0 closes the doors (counted), after which the stage is idle: the buffer is returned
+untouched and nothing is computed; a wake is a restart. Mono or stereo (linked), 8 … 768 kHz, zero latency, law 8/8a on `core::StateGrid`,
+law 11 (an external key is consumed through a gap). About 1.04 % of real time at 48 kHz stereo with the sweep moving and the glides at rest (deb, i9-13900H) — not a
+worst case: both modes always run, and a corner edit or the ladder redesigns the splits or the allpass per sample.
+
+`EnvelopeFilterLaw.h` — `paramsForAmount (amount, menu)`: mix rises 0 → 1 over the slider's lower half,
+sensitivity −6 → +18 dB over the whole travel; `mix` and `sensitivityDb` are law-owned, everything else is the
+menu's; a non-finite amount returns `menu` unchanged.
+
+`core` — DetMath.h's cost note names the two stages that put `core::det` on a per-sample path deliberately
+(`delay::TapeDelay`, `envfilter::EnvelopeFilter`), with the measured price.
+
+Measured (`felitronics_envfilter_tests`, 44.1 / 48 / 96 kHz): 12 dB more input moves the cutoff 1.729 oct, the
+law's number, and a probe tone's gain under each burst matches the published cutoff's analytic response within
+0.01 dB; the kernel at Q 12 with its cutoff flipped between 20 Hz and 0.45 fs every sample stays finite (largest
+tap 22.6 on ±1 noise); a swept output holds −150 dB of energy above 6 kHz (a cutoff held for 32 samples: −105);
+over 360 cases of cutoff × Q × corner × mix × tone the band under the corner never drops below its floor (0 dB in
+low pass, the LR4 low share in band pass) — the band pass parked at 104 Hz over a 100 Hz corner that took a 98 Hz
+note down 13.6 dB now gives it +2.4 dB; a corner retuned under a sustained note, a direction flip and a range
+edit move without a step (≤ 1.04× the steady step; the flip takes 51 ms to cover 90 % of its travel).
+
+### octave — new module: `Octaver`, the bass amp's sub-octave, and its one-slider law
+
+`felitronics::octave::Octaver` is an analog-style octaver of the OC-2 family, not a pitch shifter.
+- **Tracker.** The playing channels are summed, band-limited to the bass fundamental range (20 … 400 Hz) and tilted
+  toward the lowest partial. A comparator squares that up, with thresholds at 0.88 of each polarity's own decaying
+  peak and a floor 20 dB under the band's own level.
+- **Divider.** Flip-flops divide its rising edges by 2 and by 4.
+- **Voices.** Each divided square is scaled by the band's peak over the last cycle and goes through its own low pass
+  (TONE) and high pass (SUB HP, 25 Hz). One sub is added to every channel; the dry is never touched
+  (`latencySamples() == 0`, no dry level).
+
+The note's life is measured in its own periods.
+- Edges count only with the gate open.
+- A lost note comes back after two rises and two falls, each fresh twice over: the band's peak over the last period
+  stands at the gate's opening level, and the raw input itself has just swung past a quarter of its recent peak (a
+  peak that forgets in ~50 ms). So hum under the gate proves nothing, a note whose follower ripples across the gate
+  still acquires, a much quieter note after a loud one is acquired, and no one-cycle click — any bass pitch, phase,
+  polarity or ramp — makes a sub.
+- The supported range is fundamentals from 26 Hz to about 400 Hz. Inside it, smooth notes acquire in both
+  polarities and every phase within 1.7 cycles at 26 … 31 Hz, rising to 2.7 at 400 Hz. Below it, one polarity may not
+  acquire at all.
+- Deadlines come only from a period confirmed by two agreeing intervals. An edge a quarter period late fades the sub
+  out over 4 ms, after the filters, to an exact zero; two periods without one lose the note.
+- On reopening, the voices start primed at the new note's level.
+- A gate (6 dB hysteresis, 50 ms hold) keeps the sub an exact zero between notes.
+
+Knobs: `sub1`, `sub2` (the levels now), `sub1Top`, `sub2Top` (the slider's top, for the law), `toneHz`, `subHpHz`,
+`gateDb`. Levels glide over 20 ms on a counted ramp; TONE and SUB HP glide in log frequency, re-designed every sample.
+
+`OctaveLaw.h`'s `paramsForAmount (amount, menu)` is the face's one slider, a master over the menu's tops with taper
+`a/2 + a²/2`: 0 → exact zero, 0.5 → −6.6 dB, 1 → +1.9 dB re the band's peak with the default menu. −2 is off by
+default. It never writes the tops, so the current params can be fed back as the menu, and a non-finite amount returns
+the menu untouched. With both levels at 0 the stage goes idle (`isIdle()`): the dry bit for bit, nothing computed. A
+wake restarts it through a 10 ms input door. A pause (`nch == 0`) runs it exactly as that much silence and parks on
+the silent fixed point.
+
+Measured (`OctaverTests`, gcc 14 / MSVC / wasm):
+- **Pitch:** the sub is f/2 and f/4 at 41.2 and 30.9 Hz on 44.1, 48 and 96 kHz (asserted within 1e-4; it reads
+  0.500000 and 0.250000 to six places).
+- **Onset, from silence, worst over 16 phases × both polarities:** the fade opens within 1.51 cycles on low B,
+  1.61 on low E and 1.89 on G2. Half level comes within 1.59 / 1.71 / 2.14 cycles (51 / 42 / 22 ms).
+- **Relock:** after a louder note, the reopened sub stays within 1.45× the new note's own steady level.
+- **Decay:** lock holds through a 40 dB, 3-second decay to −46 dBFS.
+- **Harmonic-rich notes:** no stray edge on sawtooths, modal plucks and Karplus–Strong from low B to G2.
+- **Weak fundamental:** tracks while the fundamental is no more than 11 dB (low B) … 21 dB (G2) under the 2nd
+  harmonic in its worst phase.
+- **Muted note:** the sub is an exact zero 5/4 of a period + 4 ms after the note's last edge.
+- **Hum:** with 60 Hz hum at −80 / −65 dBFS, low B and E lock on their own edges and the hum alone passes bit-exact;
+  a loud G2 stopping dead over −58 dBFS hum leaves no sub 100 ms on.
+- **Near the gate:** a sustained low B whose follower ripples 0.84 … 1.28× the opening level is acquired within 90 ms.
+- **Retune:** TONE and SUB HP move at most 0.5 % per sample over their whole range.
+
 ## v0.61.3 — 2026-11-02
 
 ### convolution — `resampleIr` pins its arithmetic against FMA: a GCC x86-64-v3 build resamples to the bits of a baseline one
