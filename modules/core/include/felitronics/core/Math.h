@@ -5,9 +5,12 @@
 
 #include <felitronics/core/DetMath.h>   // felitronics::core::det — the deterministic dB spelling below
 
+#include <algorithm>
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <limits>
+#include <type_traits>
 
 namespace felitronics::core
 {
@@ -103,6 +106,33 @@ constexpr bool exactlyEqual (T a, T b) noexcept
 #elif defined(__GNUC__)
     #pragma GCC diagnostic pop
 #endif
+}
+
+// JUCE'S `approximatelyEqual` AT ITS DEFAULT TOLERANCE, JUCE-free — for code that moved here out of a JUCE plug-in and
+// must decide exactly as it did there (juce_MathsFunctions.h, JUCE 8): a pair that is not both finite compares exactly;
+// otherwise the difference passes at or under the smallest normal value, or at or under one epsilon of the larger
+// magnitude. Not a general tolerance — a spelling kept so a move changes no bit.
+template <typename T>
+inline bool approximatelyEqual (T a, T b) noexcept
+{
+    static_assert (std::is_floating_point_v<T>, "approximatelyEqual: a floating-point type");
+    if (! (std::isfinite (a) && std::isfinite (b)))
+        return exactlyEqual (a, b);
+    const T diff = std::abs (a - b);
+    return diff <= std::numeric_limits<T>::min()
+        || diff <= std::numeric_limits<T>::epsilon() * std::max (std::abs (a), std::abs (b));
+}
+
+// JUCE'S `roundToInt`, JUCE-free: the value plus 1.5 * 2^52 in double, read as the low 32 bits of the sum — so a tie
+// goes to the EVEN integer (2.5 -> 2, 3.5 -> 4, -2.5 -> -2), in the FPU's default rounding mode, not away from zero as
+// std::lround does. Meaningful for |value| < 2^31, as JUCE's. Kept for code moved here from a JUCE plug-in, whose
+// lengths and indices it decides.
+template <typename F>
+inline int roundToInt (F value) noexcept
+{
+    static_assert (std::is_floating_point_v<F>, "roundToInt: a floating-point type");
+    const double sum = (double) value + 6755399441055744.0;
+    return (int) (std::int32_t) (std::uint32_t) (std::bit_cast<std::uint64_t> (sum) & 0xFFFFFFFFu);
 }
 
 // DID AN AUTONOMOUS STEP LEAVE THE STATE UNCHANGED, BIT FOR BIT? The silence advancement of law 11c is a
