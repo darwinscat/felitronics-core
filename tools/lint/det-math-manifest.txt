@@ -47,6 +47,7 @@ modules/core/include/felitronics/core/Smoother.h  [exp*1 pow*1]  retain-rt  para
 modules/core/include/felitronics/core/StreamResampler.h  [sin*1]  retain-rt  one tap of the windowed-sinc kernel, called to BUILD the kernel table in reset(), not per sample; the table then filters shipped audio
 
 # --- dynamics: coefficients and curves on the audio thread ---
+modules/basscomp/include/felitronics/basscomp/BassComp.h  [exp*6 pow*1]  retain-rt  the bass amp's COMP (moved from OrbitAmp unchanged): the make-up's gain, exp per sample on the audio thread, and the paces' coefficients (exp) once per prepare() and per 1 ms cadence; pow turns the presence floor from dB once per prepare(). Shipped bass audio
 modules/dynamics/include/felitronics/dynamics/AutoLeveler.h  [exp*1 log10*1 pow*3]  retain-rt  target/threshold conversions and a per-block float log10 on the levelling path
 modules/dynamics/include/felitronics/dynamics/CharacterComp.h  [cos*2 exp*5 log10*2 sin*1]  retain-rt  the bass amp's OPTO, FET and SQUASH (moved from OrbitAmp unchanged): the per-sample detector level (log10, both detectors) and gain (exp) are the shipped squeeze; the coefficient exps and the half-band's sin/cos are design, once per prepare()/set(). OrbitAmp's sound, so a deterministic route would be the owner's call
 modules/dynamics/include/felitronics/dynamics/BandBallistics.h  [pow*1 sin*1]  retain-rt  per-band attack/release and crossover design for the multiband dynamics

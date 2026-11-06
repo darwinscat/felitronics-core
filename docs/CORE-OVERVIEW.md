@@ -29,6 +29,7 @@ The guitar-amp modules — `nam` (the NeuralAmpModelerCore backend), `rigplayer`
 
 | Module | What | Key types |
 |---|---|---|
+| `basscomp` | the bass amp's COMP: core's compressor and the bass's own characters (OPTO, FET, SQUASH — `dynamics::CharacterComp`) behind one BLEND (parallel compression, 0 bit-exact dry), a fixed 30 Hz key high pass, an automatic level-neutral make-up (what the squeeze took from this playing), every control gliding on a 1 ms cadence counted from the prepare; the standby is `core::BypassFade`; a picture read-out of each block | `BassComp` |
 | `chorus` | bass chorus: the dry untouched plus a voice from the LR4 high band (lows stay dry and centred); two quadrature voices on a stereo bus; the one-slider law | `BassChorus`, `ChorusLaw.h` (`paramsForAmount`, `pitchDeviationCents`) |
 | `delay` | tape-style echo: a gliding (repitching) head, a dark saturated loop, a stereo offset; the knob law (sync ladder, sync policy, DARK) | `TapeDelay`, `DelayLaw.h` (`divisionMs`, `timeMsFor`, `darkHzForPercent`) |
 | `reverb` | Freeverb (the published algorithm, matched to the behaviour the amps were voiced on) and the six-character amp room | `Freeverb`, `AmpReverb` |

@@ -18,6 +18,7 @@
 #include <felitronics/analysis/SpectrumTap.h>
 #include <felitronics/analysis/offline/SpectrumCurve.h>
 #include <felitronics/analysis/TruePeakMeter.h>
+#include <felitronics/basscomp/BassComp.h>
 #include <felitronics/blend/Blend.h>
 #include <felitronics/blend/BlendKernels.h>
 #include <felitronics/blend/BlendParams.h>

@@ -80,6 +80,7 @@ add_subdirectory(modules/reverb)   # Freeverb + the amp plugins' six-character t
 add_subdirectory(modules/envfilter)   # the bass envelope filter (auto-wah) — core + dynamics + eq
 add_subdirectory(modules/chorus)   # the bass chorus — core + eq
 add_subdirectory(modules/octave)   # the bass amp's sub-octave (an OC-2-style tracker and divider) — core + eq + dynamics
+add_subdirectory(modules/basscomp)   # the bass amp's COMP (core's compressor and the bass's characters behind one blend) — core + eq + dynamics
 add_subdirectory(modules/dither)
 add_subdirectory(modules/lineareq)
 add_subdirectory(modules/measurement)   # OFFLINE IR-measurement math (sweep/Farina deconv/gate) — double, message-thread
@@ -118,7 +119,7 @@ if(FELITRONICS_BUILD_TESTS AND (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU"))
         felitronics::saturation felitronics::stereo felitronics::multiband felitronics::dynamiceq
         felitronics::deesser felitronics::dither felitronics::lineareq felitronics::measurement felitronics::blend
         felitronics::io felitronics::text felitronics::codecgrid felitronics::dehum felitronics::delay
-        felitronics::reverb felitronics::envfilter felitronics::chorus felitronics::octave)
+        felitronics::reverb felitronics::envfilter felitronics::chorus felitronics::octave felitronics::basscomp)
     target_compile_features(felitronics_header_hygiene PRIVATE cxx_std_20)
     target_compile_options(felitronics_header_hygiene PRIVATE ${FELITRONICS_HYGIENE_WARNINGS})
     # When selected, felitronics::convolution propagates the uniform FELITRONICS_WITH_PFFFT definition
@@ -145,7 +146,7 @@ if(FELITRONICS_BUILD_TESTS AND (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU"))
         felitronics::saturation felitronics::stereo felitronics::multiband felitronics::dynamiceq
         felitronics::deesser felitronics::dither felitronics::lineareq felitronics::measurement felitronics::blend
         felitronics::io felitronics::text felitronics::codecgrid felitronics::dehum felitronics::delay
-        felitronics::reverb felitronics::envfilter felitronics::chorus felitronics::octave)
+        felitronics::reverb felitronics::envfilter felitronics::chorus felitronics::octave felitronics::basscomp)
     target_compile_features(felitronics_no_exceptions_probe PRIVATE cxx_std_20)
     target_compile_options(felitronics_no_exceptions_probe PRIVATE -fno-exceptions -fno-rtti)
 endif()
