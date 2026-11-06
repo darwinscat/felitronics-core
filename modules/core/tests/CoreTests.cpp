@@ -242,5 +242,31 @@ int main()
         test::ok (t.settled (0.0), "settled(0) — the early-out can actually fire");
     }
 
+    // --- JUCE's own spellings, JUCE-free (approximatelyEqual, roundToInt): the code that moved here out of a JUCE
+    //     plug-in decides as it did there. The expected values are JUCE 8's, worked by hand from its definitions. ---
+    test::group ("Math: approximatelyEqual at JUCE's default tolerance");
+    {
+        test::ok (core::approximatelyEqual (1.0f, 1.0f), "equal values");
+        test::ok (core::approximatelyEqual (1.0f, std::nextafter (1.0f, 2.0f)), "one ulp above 1 is within epsilon of the larger");
+        test::ok (! core::approximatelyEqual (1.0f, std::nextafter (std::nextafter (1.0f, 2.0f), 2.0f)), "two ulps above 1 are not");
+        test::ok (core::approximatelyEqual (0.0f, std::numeric_limits<float>::min()), "a difference of the smallest normal passes");
+        test::ok (core::approximatelyEqual (0.0f, std::numeric_limits<float>::denorm_min()), "a subnormal difference passes");
+        test::ok (! core::approximatelyEqual (0.0f, 2.0f * std::numeric_limits<float>::min()), "twice the smallest normal does not");
+        const float inf = std::numeric_limits<float>::infinity(), nan = std::numeric_limits<float>::quiet_NaN();
+        test::ok (core::approximatelyEqual (inf, inf), "infinities compare exactly: equal");
+        test::ok (! core::approximatelyEqual (inf, 1.0e30f), "an infinity is no finite value");
+        test::ok (! core::approximatelyEqual (nan, nan), "a NaN equals nothing, itself included");
+        test::ok (core::approximatelyEqual (1.0, 1.0 + 2.0e-16) && ! core::approximatelyEqual (1.0, 1.0 + 5.0e-16), "double: epsilon of the larger");
+    }
+
+    test::group ("Math: roundToInt — JUCE's, ties to even");
+    {
+        test::ok (core::roundToInt (2.5) == 2 && core::roundToInt (3.5) == 4 && core::roundToInt (-2.5) == -2, "ties go to the even integer");
+        test::ok (core::roundToInt (2.4999) == 2 && core::roundToInt (2.5001) == 3 && core::roundToInt (-0.6) == -1, "off a tie, the nearer");
+        test::ok (core::roundToInt (0.5f) == 0 && core::roundToInt (1.5f) == 2, "a float goes through double, as JUCE's");
+        test::ok (core::roundToInt (2400.0) == 2400 && core::roundToInt (192.0 + 0.5) == 192, "the lengths and indices it decides");
+        test::ok (core::roundToInt (2147483000.0) == 2147483000 && core::roundToInt (-2147483000.0) == -2147483000, "the 32-bit range's ends");
+    }
+
     return test::report();
 }

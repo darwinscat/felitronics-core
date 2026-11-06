@@ -37,6 +37,19 @@ if(FELITRONICS_BUILD_TESTS)
     target_compile_features(felitronics_eq_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_eq_tests COMMAND felitronics_eq_tests)
 
+    # The bass amp's own cuts and their biquad — moved from OrbitAmp, their arithmetic unchanged.
+    add_executable(felitronics_eq_basscuts_tests tests/BassCutsTests.cpp)
+    target_link_libraries(felitronics_eq_basscuts_tests PRIVATE felitronics::eq)
+    target_include_directories(felitronics_eq_basscuts_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_eq_basscuts_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_eq_basscuts_tests COMMAND felitronics_eq_basscuts_tests)
+
+    # One EQ link of a chain, the console grammar — moved from OrbitAmp with its gate.
+    add_executable(felitronics_eq_eqlink_tests tests/EqLinkTests.cpp)
+    target_link_libraries(felitronics_eq_eqlink_tests PRIVATE felitronics::eq)
+    target_compile_features(felitronics_eq_eqlink_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_eq_eqlink_tests COMMAND felitronics_eq_eqlink_tests)
+
     # The per-lane dynamic gain-delta seam — asserts WHERE the delta lands, not that a bell moves.
     add_executable(felitronics_eq_banddelta_tests tests/EqBandDeltaTests.cpp)
     target_link_libraries(felitronics_eq_banddelta_tests PRIVATE felitronics::eq)

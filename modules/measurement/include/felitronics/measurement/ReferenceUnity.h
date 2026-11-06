@@ -118,4 +118,48 @@ inline float referenceUnityGain (const float* taps, int numSamples, double sampl
     return referenceUnityGain (channels, 1, numSamples, sampleRate);
 }
 
+// THE BASS'S UNITY (moved from OrbitAmp's cabinet, src/core/CabinetIr.h, its arithmetic unchanged): the gain that
+// passes the BASS's reference at unity RMS — white noise through second-order Butterworth cuts at 40 and 120 Hz, the
+// band a bass line's fundamentals fill. The guitar's reference above weighs the top a bass cabinet rolls off, and left
+// every bass cabinet 4 to 8 dB hot on a real bass line; against this one the bass's own boxes and the commercial
+// shots measured all land within a dB of unity on it. The family's arithmetic otherwise: the first second, the same
+// clamp, a near-silent shot left alone. Mono — one channel's taps at `sampleRate`, the rate the IR is measured at.
+inline float bassReferenceUnityGain (const float* taps, int numSamples, double sampleRate)
+{
+    constexpr double low = 40.0, high = 120.0;
+
+    if (taps == nullptr || numSamples <= 0 || sampleRate <= 0.0)
+        return 1.0f;
+
+    const int cap = std::min (numSamples, (int) std::lround (kIrAnalysisSeconds * sampleRate));
+    int n = 256;
+    while (n < cap * 2 && n < (1 << 21))
+        n <<= 1;
+
+    core::fft::DefaultRealFft fft;
+    if (! fft.prepare (n))
+        return 1.0f;
+
+    std::vector<float> padded ((std::size_t) n, 0.0f), spec ((std::size_t) core::fft::DefaultRealFft::spectrumFloats (n));
+    std::copy_n (taps, cap, padded.begin());
+    fft.forward (padded.data(), spec.data());
+
+    double num = 0.0, den = 0.0;
+    for (int k = 1; k < n / 2; ++k)
+    {
+        const double f = (double) k * sampleRate / n, a = f / high, b = low / f;
+        const double w = 1.0 / ((1.0 + a * a * a * a) * (1.0 + b * b * b * b));
+        num += w * ((double) spec[(std::size_t) (2 * k)] * spec[(std::size_t) (2 * k)]
+                    + (double) spec[(std::size_t) (2 * k + 1)] * spec[(std::size_t) (2 * k + 1)]);
+        den += w;
+    }
+
+    const double gSq = den > 0.0 ? num / den : 0.0;
+    if (gSq < std::pow (10.0, kIrRefFloorDb / 10.0))
+        return 1.0f;
+
+    const float gDb = (float) (-10.0 * std::log10 (gSq));
+    return std::pow (10.0f, std::clamp (gDb, kIrNormMinDb, kIrNormMaxDb) / 20.0f);
+}
+
 } // namespace felitronics::measurement

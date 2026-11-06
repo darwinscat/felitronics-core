@@ -37,6 +37,7 @@ modules/analysis/include/felitronics/analysis/offline/SpectrumCurve.h  [log10*2 
 modules/blend/include/felitronics/blend/BlendKernels.h  [abs*2 cos*3 sin*2]  retain-offline  Hilbert phase rotation and crossfade kernels for IR blending; the output is an IR file, compared by tolerance in the blend suites
 modules/blend/include/felitronics/blend/IrBlend.h  [pow*2]  retain-offline  dB<->linear for blend weights the user sets; the result is a written IR
 modules/blend/include/felitronics/blend/Overlay.h  [pow*2]  retain-offline  overlay curve weighting for the display of a blend
+modules/cabinet/include/felitronics/cabinet/CabinetIr.h  [cos*1]  retain-rt  the trimmed tail's half-cosine fade, baked into the taps once per rebuild (a load or a move of the post), never per sample; the cabinet's IR is the amps' shipped audio (moved from OrbitAmp unchanged)
 modules/convolution/include/felitronics/convolution/CabConvolver.h  [log10*2 pow*2]  retain-rt  the RT cabinet convolver's IR normalisation floor and gain; this is OrbitCab's signal path
 modules/convolution/include/felitronics/convolution/IrResampler.h  [sin*1]  owner-decision  the resampler kernel's sinc - one call per window MISS since P70's phase memo, not one per tap. Audited by P80 and deliberately left on the system call: these are shipped bits (OrbitCab's IR at load), pinned against a frozen unmemoized kernel in ResamplerTests, so converting it is the owner's decision and an additive one
 
@@ -47,7 +48,9 @@ modules/core/include/felitronics/core/Smoother.h  [exp*1 pow*1]  retain-rt  para
 modules/core/include/felitronics/core/StreamResampler.h  [sin*1]  retain-rt  one tap of the windowed-sinc kernel, called to BUILD the kernel table in reset(), not per sample; the table then filters shipped audio
 
 # --- dynamics: coefficients and curves on the audio thread ---
+modules/basscomp/include/felitronics/basscomp/BassComp.h  [exp*6 pow*1]  retain-rt  the bass amp's COMP (moved from OrbitAmp unchanged): the make-up's gain, exp per sample on the audio thread, and the paces' coefficients (exp) once per prepare() and per 1 ms cadence; pow turns the presence floor from dB once per prepare(). Shipped bass audio
 modules/dynamics/include/felitronics/dynamics/AutoLeveler.h  [exp*1 log10*1 pow*3]  retain-rt  target/threshold conversions and a per-block float log10 on the levelling path
+modules/dynamics/include/felitronics/dynamics/CharacterComp.h  [cos*2 exp*5 log10*2 sin*1]  retain-rt  the bass amp's OPTO, FET and SQUASH (moved from OrbitAmp unchanged): the per-sample detector level (log10, both detectors) and gain (exp) are the shipped squeeze; the coefficient exps and the half-band's sin/cos are design, once per prepare()/set(). OrbitAmp's sound, so a deterministic route would be the owner's call
 modules/dynamics/include/felitronics/dynamics/BandBallistics.h  [pow*1 sin*1]  retain-rt  per-band attack/release and crossover design for the multiband dynamics
 modules/dynamics/include/felitronics/dynamics/EnvelopeFollower.h  [exp*1]  retain-rt  the follower's attack/release coefficient — exp(-1/(tau*fs)), recomputed on setTimes()
 modules/dynamics/include/felitronics/dynamics/GainReductionFollower.h  [exp*1]  retain-rt  the same coefficient for the gain-reduction follower
@@ -59,6 +62,7 @@ modules/dynamics/include/felitronics/dynamics/TransientShaper.h  [dbToGain()*1 e
 modules/dehum/include/felitronics/dehum/HumRemover.h  [atan2*2 hypot*1 log10*3]  retain-rt  the two atan2 are the coarse mains estimate (a bin's phase advance, once per 0.25 s hop), which sets the frequency the canceller runs at, so they reach shipped audio: the header states that rows agree within tolerance there, not bit for bit. The hypot and the three log10 are telemetry (humDb, harmonicDb, the LEARN report's floor), read by a UI and never by the audio path
 
 # --- eq: the biggest group, and all of it is coefficient design for shipped filters ---
+modules/eq/include/felitronics/eq/BassCuts.h  [cos*1 exp*2 log*4 sin*1]  retain-rt  the bass amp's cuts (moved from OrbitAmp unchanged): CutBiquad's RBJ design (cos, sin) once per redesign, the glide's log-even step on a 32-sample cadence (log, exp) and its coefficient (exp) once per prepare(). Shipped bass audio
 modules/eq/include/felitronics/eq/EqBand.h  [abs*1 polar*1 sin*1]  retain-rt  Butterworth Q design and the z^-1 phasor for a band's response. std::polar is cos+sin in disguise, which is why the lint governs it
 modules/eq/include/felitronics/eq/EqEngine.h  [abs*3 log10*2]  retain-rt  the composite magnitude response in dB, for the curve the user sees and for the engine's own fitting
 modules/eq/include/felitronics/eq/MatchedBiquad.h  [abs*25 cos*10 cosh*1 exp*7 log10*1 polar*1 pow*11 sin*12 sqrt*21 tan*4]  retain-rt  TabbyEQ's filter design, all of it: matched-pole placement, shelf solving, notch cascades, bandpass cascades, first-order shelves. These transcendentals ARE the coefficients, and the coefficients ARE the product's sound. The 25 std::abs are a MIX — most are scalar magnitude on a coefficient, and only the ones taking a std::complex are hypot; the 21 std::sqrt include complex square roots in the pole solver (:400, :641), which scalar IEEE exactness does not cover
@@ -80,7 +84,7 @@ modules/measurement/include/felitronics/measurement/CaptureGate.h  [log10*1]  re
 modules/measurement/include/felitronics/measurement/IrPost.h  [pow*1]  retain-offline  post-processing gain for a measured IR
 modules/measurement/include/felitronics/measurement/LevelProbe.h  [exp*1 pow*1]  retain-offline  the probe's stimulus level and its smoothing; feeds the capture level a human sets
 modules/measurement/include/felitronics/measurement/PeakClip.h  [log10*1]  retain-offline  a clip report in dB for the capture UI
-modules/measurement/include/felitronics/measurement/ReferenceUnity.h  [log10*1 pow*2]  retain-offline  the -60 dB normalisation floor that decides whether a measured IR is normalised at all. Its header says plainly that this float arithmetic defines shipped audible unity gain, so it is read and left, not waved through
+modules/measurement/include/felitronics/measurement/ReferenceUnity.h  [log10*2 pow*4]  retain-offline  the -60 dB normalisation floor that decides whether a measured IR is normalised at all, and the gain, for the guitar's reference and the bass's (bassReferenceUnityGain, moved from OrbitAmp unchanged). Its header says plainly that this float arithmetic defines shipped audible unity gain, so it is read and left, not waved through
 modules/measurement/include/felitronics/measurement/Sweep.h  [cos*2 exp*2 log*2 sin*1]  retain-offline  the exponential sweep and its inverse filter — sin() PER SAMPLE of the generated stimulus, which is the one place a deterministic sin would cost real time for a signal that is measured, not compared
 
 

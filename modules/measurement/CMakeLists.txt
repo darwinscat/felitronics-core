@@ -18,6 +18,13 @@ if(FELITRONICS_BUILD_TESTS)
     target_compile_features(felitronics_measurement_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_measurement_tests COMMAND felitronics_measurement_tests)
 
+    # The bass's unity (moved from OrbitAmp's cabinet): the gain that passes the bass's reference at unity RMS.
+    add_executable(felitronics_measurement_bassunity_tests tests/BassUnityTests.cpp)
+    target_link_libraries(felitronics_measurement_bassunity_tests PRIVATE felitronics::measurement)
+    target_include_directories(felitronics_measurement_bassunity_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_measurement_bassunity_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_measurement_bassunity_tests COMMAND felitronics_measurement_bassunity_tests)
+
     add_executable(felitronics_measurement_adversarial_tests tests/AdversarialTests.cpp)
     target_link_libraries(felitronics_measurement_adversarial_tests PRIVATE felitronics::measurement)
     target_include_directories(felitronics_measurement_adversarial_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)

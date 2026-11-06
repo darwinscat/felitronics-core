@@ -5,6 +5,131 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
+## v0.63.0 — 2026-11-06
+
+### basscomp — a new module: `BassComp`, the bass amp's COMP
+
+`felitronics::basscomp::BassComp` moved here from OrbitAmp (`src/core/BassComp.h`), JUCE-free and its arithmetic
+unchanged — header-only, depends on `core`, `eq` and `dynamics`; a module of its own because it is composition
+(`dynamics` stays independent of `eq`). EACH CONTROL ONE JOB: the threshold (-48 … 0 dB) and the ratio (1.5 … 10:1)
+are their own; the knob is BLEND, parallel compression — 0 is no compressor at all (once glided there nothing is
+computed and the block passes bit for bit), 1 all of the signal compressed, sample-aligned (no lookahead). Make-up is
+automatic and level-neutral: what the squeeze has taken from this playing, averaged over 400 ms while a note sounds
+and held through pauses. Five characters: core's compressor on the RMS (SMOOTH) or the peaks (PUNCHY), and
+`dynamics::CharacterComp`'s OPTO, FET and SQUASH, a switch between the two compressors crossing over in 15 ms. The
+detector hears the bass through a 30 Hz, 12 dB/oct high pass (`eq::CutBiquad`). Every move glides (20 ms for each
+control's whole travel), and the controls reach the compressor on a 1 ms cadence counted from the prepare: the same
+playing gives the same samples whatever the host's blocks. The standby is `core::BypassFade`'s span, handed in per
+block: standing by with BLEND up it is fed, not heard.
+
+What the plug-in used to write into its picture from inside `process` is now a read-out: with `pictured` set, a
+heard block leaves a `Picture` (the signal handed in, the squeezed signal before the make-up, the same blended as
+the sound is, the squeeze per sample, the detector, whether the trace breaks before it) until the next call;
+`picture()` is null where there is none. Nothing of it reaches the sound.
+
+Measured (`modules/basscomp/tests/BassCompTests.cpp`): BLEND 0 is the note bit for bit; a steady note at the
+reference -18 dBFS RMS keeps its level within 1.2 dB in all five characters at BLEND ½ and 1, and at -40 dB, 8:1; a
+-40 dB note under a -12 dB threshold stays within 1e-5 of itself; host blocks of 512, 64 and 333 play the same
+samples (SMOOTH, OPTO, FET); standing by and settled, the dry bit for bit; a prepare's `snapAmount` is heard from its
+first block and a recall up from 0 is fed, not heard, through its warm; the picture is there only while pictured and
+heard and says when its trace breaks; the indicator reads the squeeze heard; no allocation in 40 blocks with a
+character switch among them.
+
+### cabinet — a new module: `CabinetIr`, an amp's cabinet stage
+
+`felitronics::cabinet::CabinetIr` moved here from OrbitAmp (`src/core/CabinetIr.h`) — its DSP half, JUCE-free and
+its arithmetic unchanged; header-only, depends on `core`, `eq`, `measurement` and `convolution`. One IR shot comes in
+as taps at its own rate (`load (taps, n, rate)`, false for a shot `takes` refuses: no length, a rate outside 8 kHz …
+768 kHz, or longer than 5 s) — decoding a file stays the caller's. What a player does to it — the tail trimmed on a
+half-cosine, the 6 … 48 dB/oct cuts in matched biquads, the sign — is baked into the taps (`setPost`), the level taken
+after it at the shot's own rate against the guitar's reference or the bass's (`setReference`,
+`measurement::bassReferenceUnityGain`), and the taps resampled to the session's rate once per rate before
+`convolution::CabConvolver` (zero latency, the 50 ms click-free swap) is handed them; silence under -80 dBFS at
+either end is cut first. On the audio thread `process` keeps a non-finite sample out of the convolution and silences
+a poisoned output for the impulse's length; `idle` drains the whole schedule once the cabinet stands out of the path,
+so it comes back with no ghost, and runs a cabinet handed over meanwhile in on silence. `prepare`, `load`,
+`setPost`, `setReference` and `flushPending` are the producer's side, one thread at a time — the class takes no lock
+(the wasm-audio tier is single-threaded): a host whose producer side runs on two threads holds its own around them, as
+OrbitAmp's cabinet does; `process` and `idle` take none.
+
+Measured (`modules/cabinet/tests/CabinetIrTests.cpp`): after the crossfade the output is the direct convolution
+times the reference's gain, guitar and bass, at sample zero (within 2e-4); a quarter of the tail kept reports a
+quarter of the length, and the sign flipped is the same cabinet negated; a 48 kHz shot in a 44.1 or 96 kHz session
+keeps its level within 0.1 dB; after a NaN every sample is a number and the cabinet still sounds; drained, silence
+in is silence out; a refused shot leaves the cabinet it had; no allocation in `process` (stereo and mono) or `idle`.
+
+### core — `BypassFade`, the crossfade of a link that replaces the signal; `approximatelyEqual` and `roundToInt` with JUCE's semantics
+
+`felitronics::core::BypassFade` moved here from OrbitAmp (`src/core/BypassFade.h`), JUCE-free and its arithmetic
+unchanged: a link that replaces the signal (a captured amp, a cabinet, a compressor's blend) is crossfaded against
+the signal it was handed over 15 ms of audio, whatever the host's blocks — `advance (n, target)` returns the block's
+`Span` (from, to, moving, the ramp counted within the block), `blend` walks dry → wet for the ramp and holds after
+it, `runs` keeps a link alive through its fade-out, `snapTo` stands a prepare at an end. Settled, it reports no
+motion and costs nothing. An empty block in a fade keeps it a fade.
+
+Two spellings came with it, in `Math.h`, so code moved out of a JUCE plug-in decides as it did there:
+`approximatelyEqual (a, b)` is JUCE 8's at its default tolerance (a non-finite pair compares exactly; otherwise the
+difference passes at or under the smallest normal value or one epsilon of the larger magnitude), and
+`roundToInt (v)` is JUCE's 1.5 · 2^52 trick, ties to even — not `std::lround`, which rounds them away from zero.
+
+Measured (`modules/core/tests/BypassFadeTests.cpp`, `CoreTests.cpp`): a switch settles in 15 ms of audio (±1
+sample) at 44.1, 48 and 96 kHz in blocks of 1 … 4096; one 4096-sample block carries the whole 720-sample fade at
+48 kHz and holds at the wet after it; the empty block, the turn mid-way and the landing; the two helpers on their
+edges (one and two ulps, the smallest normal, a subnormal, infinities and NaN; ties at ±2.5, 3.5, 0.5f, 1.5f).
+
+### dynamics — `CharacterComp`, the bass amp's own compressor characters (OPTO, FET, SQUASH)
+
+`felitronics::dynamics::CharacterComp` moved here from OrbitAmp (`src/core/CompCharacters.h`), JUCE-free and its
+arithmetic unchanged. One mono compressor whose character (`Voice`) sets the curve — feed-forward, or fed back, its
+knee R times wider in the input's terms — the detector (the RMS over 10 ms, or the peaks), a release in one stage or
+two (a memory that sinks in while a squeeze is held and lets go slowly), and the gain element's colour growing with
+the squeeze: GRAIN (odd harmonics worked at twice the rate, added as a residual with no fundamental of its own) and
+DARK (the top let down toward a one-pole low pass). `staticDeltaDb` draws the curve; `seed` takes a squeeze over
+from another detector without a step. The detector's key is the caller's: no filter inside.
+
+Measured (`modules/dynamics/tests/CharacterCompTests.cpp`): a steady note settles where `staticDeltaDb` says, fed
+forward and fed back (within 0.5 dB); fed back, 2 dB under the threshold, the curve is the quadratic's root
+(-0.4503 dB at 4:1, an 8 dB knee) where feed-forward takes -0.1875; a level under the knee is untouched; 300 ms after
+it is let go a long squeeze still holds more than twice a short hit's; GRAIN keeps the note's level within 0.15 dB;
+DARK takes an 8 kHz tone more than 3 dB lower; one call and calls of 37 samples give the same samples and the same
+squeeze; `seed` and `reset`.
+
+### eq — `BassCuts` and `CutBiquad`, the bass amp's own cuts; `EqLink`, one EQ link of an amp's chain
+
+Both moved here from OrbitAmp, JUCE-free and their arithmetic unchanged, so the amps' plug-ins and their web port
+play the same filters.
+
+`felitronics::eq::CutBiquad` is a 2nd-order Butterworth high or low pass (RBJ, transposed direct form II in double).
+`felitronics::eq::BassCuts` is the bass amp's HPF and LPF, 12 dB/oct each, up to two channels: settled and off it is
+a wire, bit for bit; on, the biquads plainly; a switch is a 15 ms crossfade (and a cut faded out forgets its memory);
+a frequency move glides log-evenly, ~30 ms to a percent, its coefficients redrawn on a 32-sample cadence counted from
+the snap, and lands exactly; a NaN that came in is not kept in the recursion.
+
+`felitronics::eq::EqLink` is the console grammar in matched biquads: HPF and LPF with a real slope (6, 12, 18, 24 or
+48 dB/oct), two shelves with free corners, two tone bells and a narrow third that switches in. A band at exactly 0 dB
+is not run, so a flat link is bit-transparent; `magnitudeDb`, `filterMagnitudeDb` and `toneMagnitudeDb` read the
+coefficients `process` runs. Its `Settings` compare member for member, spelt out with `core::exactlyEqual`.
+
+Measured (`modules/eq/tests/BassCutsTests.cpp`, `EqLinkTests.cpp`, the latter moved with the class): -3.01 dB at the
+corner, -12.3 dB an octave under a high pass, unity in the pass band; off a wire and on the biquads, sample for
+sample; blocks of 96 and 32 the same samples, and blocks of 1 within an ulp (1.0e-7) — the rest of a cadence step
+after a fade lands writes `d + (y - d) · 1`, which can round an ulp from `y`: the plug-in's arithmetic, held to what
+it is; the 15 ms switch and the glide's exact landing; finite after a NaN. EqLink's gate as it was: the shelves'
+plateaus, the bells' centres, the slope ladder two octaves under an HPF, and the curve equal to the sound.
+
+### measurement — `bassReferenceUnityGain`, the bass's unity for a cabinet IR
+
+`felitronics::measurement::bassReferenceUnityGain (taps, n, rate)` moved here from OrbitAmp's cabinet
+(`src/core/CabinetIr.h`, `bassUnityGain`), its arithmetic unchanged: the gain that passes the bass's reference — white
+noise through second-order Butterworth cuts at 40 and 120 Hz, the band a bass line's fundamentals fill — at unity
+RMS. `referenceUnityGain`'s reference weighs the top a bass cabinet rolls off and left every bass cabinet 4 to 8 dB
+hot on a real bass line; against this one the bass's boxes land within a dB of unity. The family's arithmetic
+otherwise: the first second, the ±30 dB clamp, a near-silent IR (under -60 dB) left alone. Mono.
+
+Measured (`modules/measurement/tests/BassUnityTests.cpp`): an impulse at unity and half of one at twice the gain; an
+800 Hz one-pole low pass within a tenth of a dB of unity on the bass's reference while the guitar's lifts it more;
+the clamp at +30 dB, the floor, and degenerate input.
+
 ## v0.62.0 — 2026-11-06
 
 ### chorus — new module: `BassChorus`, the bass amp's chorus, whose lows stay dry and centred

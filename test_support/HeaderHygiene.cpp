@@ -18,11 +18,13 @@
 #include <felitronics/analysis/SpectrumTap.h>
 #include <felitronics/analysis/offline/SpectrumCurve.h>
 #include <felitronics/analysis/TruePeakMeter.h>
+#include <felitronics/basscomp/BassComp.h>
 #include <felitronics/blend/Blend.h>
 #include <felitronics/blend/BlendKernels.h>
 #include <felitronics/blend/BlendParams.h>
 #include <felitronics/blend/IrBlend.h>
 #include <felitronics/blend/Overlay.h>
+#include <felitronics/cabinet/CabinetIr.h>
 #include <felitronics/chorus/BassChorus.h>
 #include <felitronics/chorus/ChorusLaw.h>
 #include <felitronics/codecgrid/BackResampler.h>
@@ -40,6 +42,7 @@
 #include <felitronics/convolution/MatrixConvolverNupc.h>
 #include <felitronics/convolution/NonUniformConvolver.h>
 #include <felitronics/convolution/PartitionedConvolver.h>
+#include <felitronics/core/BypassFade.h>
 #include <felitronics/core/Config.h>
 #include <felitronics/core/DelayLine.h>
 #include <felitronics/core/DeliveryResampler.h>
@@ -63,6 +66,7 @@
 #include <felitronics/dynamics/AutoLeveler.h>
 #include <felitronics/dynamics/BandBallistics.h>
 #include <felitronics/dynamics/ChannelLinker.h>
+#include <felitronics/dynamics/CharacterComp.h>
 #include <felitronics/dynamics/Compressor.h>
 #include <felitronics/dynamics/EnvelopeFollower.h>
 #include <felitronics/dynamics/GainComputer.h>
@@ -77,9 +81,11 @@
 #include <felitronics/dynamics/TransientShaper.h>
 #include <felitronics/envfilter/EnvelopeFilter.h>
 #include <felitronics/envfilter/EnvelopeFilterLaw.h>
+#include <felitronics/eq/BassCuts.h>
 #include <felitronics/eq/Crossover2.h>
 #include <felitronics/eq/EqBand.h>
 #include <felitronics/eq/EqEngine.h>
+#include <felitronics/eq/EqLink.h>
 #include <felitronics/eq/EqTypes.h>
 #include <felitronics/eq/MatchedBiquad.h>
 #include <felitronics/eq/MultibandSplitter.h>
