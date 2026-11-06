@@ -48,6 +48,7 @@ modules/core/include/felitronics/core/StreamResampler.h  [sin*1]  retain-rt  one
 
 # --- dynamics: coefficients and curves on the audio thread ---
 modules/dynamics/include/felitronics/dynamics/AutoLeveler.h  [exp*1 log10*1 pow*3]  retain-rt  target/threshold conversions and a per-block float log10 on the levelling path
+modules/dynamics/include/felitronics/dynamics/CharacterComp.h  [cos*2 exp*5 log10*2 sin*1]  retain-rt  the bass amp's OPTO, FET and SQUASH (moved from OrbitAmp unchanged): the per-sample detector level (log10, both detectors) and gain (exp) are the shipped squeeze; the coefficient exps and the half-band's sin/cos are design, once per prepare()/set(). OrbitAmp's sound, so a deterministic route would be the owner's call
 modules/dynamics/include/felitronics/dynamics/BandBallistics.h  [pow*1 sin*1]  retain-rt  per-band attack/release and crossover design for the multiband dynamics
 modules/dynamics/include/felitronics/dynamics/EnvelopeFollower.h  [exp*1]  retain-rt  the follower's attack/release coefficient — exp(-1/(tau*fs)), recomputed on setTimes()
 modules/dynamics/include/felitronics/dynamics/GainReductionFollower.h  [exp*1]  retain-rt  the same coefficient for the gain-reduction follower

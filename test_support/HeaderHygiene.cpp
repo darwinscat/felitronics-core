@@ -64,6 +64,7 @@
 #include <felitronics/dynamics/AutoLeveler.h>
 #include <felitronics/dynamics/BandBallistics.h>
 #include <felitronics/dynamics/ChannelLinker.h>
+#include <felitronics/dynamics/CharacterComp.h>
 #include <felitronics/dynamics/Compressor.h>
 #include <felitronics/dynamics/EnvelopeFollower.h>
 #include <felitronics/dynamics/GainComputer.h>

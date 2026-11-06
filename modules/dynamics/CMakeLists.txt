@@ -62,6 +62,13 @@ if(FELITRONICS_BUILD_TESTS)
     target_compile_features(felitronics_dynamics_detector_gate_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_dynamics_detector_gate_tests COMMAND felitronics_dynamics_detector_gate_tests)
 
+    # The bass amp's own compressor characters (OPTO, FET, SQUASH) — moved from OrbitAmp, their arithmetic unchanged.
+    add_executable(felitronics_dynamics_charactercomp_tests tests/CharacterCompTests.cpp)
+    target_link_libraries(felitronics_dynamics_charactercomp_tests PRIVATE felitronics::dynamics)
+    target_include_directories(felitronics_dynamics_charactercomp_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_dynamics_charactercomp_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_dynamics_charactercomp_tests COMMAND felitronics_dynamics_charactercomp_tests)
+
     add_executable(felitronics_dynamics_transient_tests tests/TransientShaperTests.cpp)
     target_link_libraries(felitronics_dynamics_transient_tests PRIVATE felitronics::dynamics)
     target_include_directories(felitronics_dynamics_transient_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
