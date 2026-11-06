@@ -82,6 +82,7 @@
 #include <felitronics/eq/Crossover2.h>
 #include <felitronics/eq/EqBand.h>
 #include <felitronics/eq/EqEngine.h>
+#include <felitronics/eq/EqLink.h>
 #include <felitronics/eq/EqTypes.h>
 #include <felitronics/eq/MatchedBiquad.h>
 #include <felitronics/eq/MultibandSplitter.h>
