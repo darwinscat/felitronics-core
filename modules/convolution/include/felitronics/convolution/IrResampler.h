@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <felitronics/core/DetMath.h>   // core::det::mulAdd / mul — the contraction pins (see PhaseMemo)
 #include <felitronics/core/Math.h>
 
 #include <algorithm>
@@ -53,6 +54,25 @@ namespace detail
     // exact double, or the real behind xx stops being frac - j — past 2^53 the integer k would round.
     // The position guard in `resampleIr` keeps c + R inside int, three decades below that, so it holds;
     // but it holds by that guard and not by luck, which is one reason the guard may not be relaxed.
+    //
+    // And a third, which no exactness of xx can supply: equal terms summed in the same order make the same
+    // double only if every evaluation ROUNDS them the same way. `acc += in[k] * w` is the contractible form
+    // — under the policy's `-ffp-contract=on` (DSP-ARCHITECTURE.md §2 law 10) a compiler may fuse it into
+    // one FMA, and it decides copy by copy. Ubuntu 26.04's amd64v3 build — what Canonical's cloud images
+    // carry, GitHub's ubuntu-latest among them; the plain amd64 one stays baseline — configures GCC for
+    // x86-64-v3, so an x86 row has an FMA to fuse with. GCC 14.3 and 15.2 fused both accumulations here and
+    // not the suite's frozen copy, and its rectangular case moved a float at output 2: its normalised
+    // weights are 1/8, 3/8, 3/8, 1/8 to an ulp, so an exact answer can sit on a float32 midpoint (output 2
+    // does) and one double ulp decides the rounding. So the products in the kernel that meet an add — the
+    // accumulation, the window's 1 - r², the weight `wsum` sums — go through `core::det::mulAdd` /
+    // `core::det::mul`, whose volatile store holds under every contraction mode: the hit, the miss and the
+    // suite's copy round as the source is written, and a GCC x86-64-v3 build resamples to the bits of a
+    // baseline one, `-ffp-contract=fast` included (4.0 M output floats, every standard rate pair). The one
+    // product left bare is `besselI0`'s `term *= …; sum += term`: two statements, which `on` never fuses,
+    // in one function both copies share, and GCC 14.3 and 15.2 emit no FMA there at `fast` either; a pin
+    // there cost 8% of a resample for no bit that moved. That puts `det::` on a per-TAP loop, which
+    // DetMath.h rules out for the audio thread; this is the message thread, at load: 11.1 -> 12.7 ms for a
+    // 4 s IR at 48 -> 44.1 kHz on baseline x86-64 (i9-13900H, GCC 15.2), 8.0 -> 7.1 on arm64 macOS.
     //
     // It pays because audio rates are small rationals. The phase of t repeats with period
     // outSr / gcd(inSr, outSr), and rounding spreads each of those onto a handful of neighbouring
@@ -355,7 +375,7 @@ inline std::vector<float> resampleIr (const float* in, int inLen, double inSr, d
             for (int j = 0; j < taps; ++j)
             {
                 const int k = c - R + 1 + j;
-                if (k >= 0 && k < inLen) acc += (double) in[k] * p.row[(std::size_t) j];
+                if (k >= 0 && k < inLen) acc = core::det::mulAdd ((double) in[k], p.row[(std::size_t) j], acc);
             }
         }
         else
@@ -375,10 +395,10 @@ inline std::vector<float> resampleIr (const float* in, int inLen, double inSr, d
                                                              : std::sin (2.0 * core::kPi * fc * xx) / (core::kPi * xx);
                 const double r    = xx / (double) R;                       // window argument in [-1, 1]
                 const double win  = (r <= -1.0 || r >= 1.0) ? 0.0
-                                  : detail::besselI0 (beta * std::sqrt (1.0 - r * r)) / i0beta;
-                const double w    = sinc * win;
+                                  : detail::besselI0 (beta * std::sqrt (1.0 - core::det::mul (r, r))) / i0beta;
+                const double w    = core::det::mul (sinc, win);
                 wsum += w;                                                 // the WHOLE window: OUTSIDE THE INPUT IS SILENCE
-                if (k >= 0 && k < inLen) acc += (double) in[k] * w;
+                if (k >= 0 && k < inLen) acc = core::det::mulAdd ((double) in[k], w, acc);   // never fused: see PhaseMemo
                 if (p.storable) row[(std::size_t) j] = w;
             }
             if (p.storable) { row[(std::size_t) taps] = wsum; memo.keep (p, row.data()); }
