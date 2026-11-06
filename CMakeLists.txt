@@ -84,6 +84,7 @@ add_subdirectory(modules/basscomp)   # the bass amp's COMP (core's compressor an
 add_subdirectory(modules/dither)
 add_subdirectory(modules/lineareq)
 add_subdirectory(modules/measurement)   # OFFLINE IR-measurement math (sweep/Farina deconv/gate) — double, message-thread
+add_subdirectory(modules/cabinet)   # an amp's cabinet stage (a shot, the player's post baked in, a reference level, the zero-latency convolver) — core + eq + measurement + convolution
 add_subdirectory(modules/blend)   # OFFLINE mic-blend engine (mixer params + kernels + Σ(gain·strip) blend) — double coeffs, float buffers
 add_subdirectory(modules/io)   # OFFLINE file I/O (WAV read/write, moved from OrbitCapture's oc/wav.hpp) — zero-dep, message-thread
 add_subdirectory(modules/text)   # JUCE-free UTF-8 → ASCII romanization for filename slugs (German/ß + Cyrillic), from OrbitCapture NAM's Matrix.h — zero-dep, message-thread
@@ -119,7 +120,7 @@ if(FELITRONICS_BUILD_TESTS AND (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU"))
         felitronics::saturation felitronics::stereo felitronics::multiband felitronics::dynamiceq
         felitronics::deesser felitronics::dither felitronics::lineareq felitronics::measurement felitronics::blend
         felitronics::io felitronics::text felitronics::codecgrid felitronics::dehum felitronics::delay
-        felitronics::reverb felitronics::envfilter felitronics::chorus felitronics::octave felitronics::basscomp)
+        felitronics::reverb felitronics::envfilter felitronics::chorus felitronics::octave felitronics::basscomp felitronics::cabinet)
     target_compile_features(felitronics_header_hygiene PRIVATE cxx_std_20)
     target_compile_options(felitronics_header_hygiene PRIVATE ${FELITRONICS_HYGIENE_WARNINGS})
     # When selected, felitronics::convolution propagates the uniform FELITRONICS_WITH_PFFFT definition
@@ -146,7 +147,7 @@ if(FELITRONICS_BUILD_TESTS AND (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU"))
         felitronics::saturation felitronics::stereo felitronics::multiband felitronics::dynamiceq
         felitronics::deesser felitronics::dither felitronics::lineareq felitronics::measurement felitronics::blend
         felitronics::io felitronics::text felitronics::codecgrid felitronics::dehum felitronics::delay
-        felitronics::reverb felitronics::envfilter felitronics::chorus felitronics::octave felitronics::basscomp)
+        felitronics::reverb felitronics::envfilter felitronics::chorus felitronics::octave felitronics::basscomp felitronics::cabinet)
     target_compile_features(felitronics_no_exceptions_probe PRIVATE cxx_std_20)
     target_compile_options(felitronics_no_exceptions_probe PRIVATE -fno-exceptions -fno-rtti)
 endif()
