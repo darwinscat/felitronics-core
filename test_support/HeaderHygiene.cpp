@@ -78,6 +78,7 @@
 #include <felitronics/dynamics/TransientShaper.h>
 #include <felitronics/envfilter/EnvelopeFilter.h>
 #include <felitronics/envfilter/EnvelopeFilterLaw.h>
+#include <felitronics/eq/BassCuts.h>
 #include <felitronics/eq/Crossover2.h>
 #include <felitronics/eq/EqBand.h>
 #include <felitronics/eq/EqEngine.h>
