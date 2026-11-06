@@ -270,6 +270,41 @@ zero: no subnormal in any state at any block, and the silence holds; the heads s
 and `modules/reverb/tests/AmpReverbTests.cpp` (three minutes after a HALL at DECAY ×2: no subnormal in the room,
 the predelay or the chorus line, and once exact zero is reached it holds).
 
+### Added with the module: `envfilter::EnvelopeFilter` — gridded from the start
+
+**Recursive state.** The swept TPT state-variable filter's two integrators per lane — four lanes, the low-pass
+path and the band-pass path per channel (`envfilter::detail::SweptSvf`, `eq::Svf`'s update) — the two clean-lows
+splits (`eq::DeterministicSvf`, a high pass, and `eq::DeterministicCrossover2`, LR4), the doors' allpass
+(`eq::DeterministicSvf`, the LR4 pair's own), the envelope follower
+(`dynamics::EnvelopeFollower`, peak) and nine glides, one-pole in double: mix, sensitivity, keepLows, resonance,
+the direction blend, the range's two ends, the corner (log2 Hz) and the playing's cutoff smoother (log2 Hz). The
+low-pass door and the band pass's three-stage ladder are counted linear ramps (clean, they land by construction).
+**Verdict: flushed at the house 1e-15 on `core::StateGrid` (audio time), poison healed at the end of every call.**
+The follower, the filters' integrators and both splits decay geometrically toward zero on silence and would
+otherwise park in the subnormal band. The glides LAND (item 6): on their target once the update no longer moves
+them or once within 1e-9 × max(1, |target|) of it, so none of them can creep through the subnormals; the stage
+goes idle on the last counted door's landing, which is exact. A gap (law 11c) runs the same per-sample
+control step as silence and, when keyless, stops once the shared state stands still with the follower at exact
+zero.
+Tested in `modules/envfilter/tests/EnvelopeFilterTests.cpp` (a Q 12 band-pass ring, then 60 s of silence in
+512-sample calls and as ONE 61 s call: no subnormal in any state, exact zero from 1.5 s after the ring; and the
+fastest settings' 20 Hz Q 12 ring dies to exact zero). Removing the flush turns all of them red.
+
+### Added with the module: `chorus::BassChorus` — the eq flush on the grid, the line flushed per write
+
+**Recursive state.** The voice's high pass — two `eq::Svf` sections carried as lanes of one Svf — and the parameter
+glides: depth and centre delay as two one-poles in cascade, rate and crossover as one (depth may glide to zero).
+The mix is a counted linear ramp, and the line is NOT recursive: it holds the high pass's output and is only read
+back, never fed back.
+**Verdict: flushed.** The Svf keeps the eq module's 1e-15 flush on `core::StateGrid` (audio time, 64 samples) and
+heals poison at the end of every call; what is written into the line goes through `core::flushDenormal`, so a
+stored value is zero or ≥ 1e-15. The glides land (item 6): each stage is put on its target once its residual is
+under a landing far below audibility (the heads 1e-9 of a sample, rate 1e-12 Hz, crossover 1e-3 Hz) or an update
+no longer moves it; the mix ramp is counted and lands on an exact zero, which is what lets the stage idle.
+Tested in `modules/chorus/tests/BassChorusTests.cpp` (a minute of silence after a full chorus at 44.1, 48 and
+96 kHz: no subnormal in the lines or the glides at any block, and the last second is exact zeros). The Svf's
+integrators are not visible to that test; they stand on the eq module's own flush contract.
+
 ## How these are tested
 
 State tests, in the style of `modules/dynamics/tests/DynamicsTests.cpp:61` — after a long silence the

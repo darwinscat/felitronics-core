@@ -23,6 +23,8 @@
 #include <felitronics/blend/BlendParams.h>
 #include <felitronics/blend/IrBlend.h>
 #include <felitronics/blend/Overlay.h>
+#include <felitronics/chorus/BassChorus.h>
+#include <felitronics/chorus/ChorusLaw.h>
 #include <felitronics/codecgrid/BackResampler.h>
 #include <felitronics/codecgrid/CodecGridDetector.h>
 #include <felitronics/codecgrid/GridCurve.h>
@@ -73,6 +75,8 @@
 #include <felitronics/dynamics/offline/ThresholdSolver.h>
 #include <felitronics/dynamics/RelativeLevel.h>
 #include <felitronics/dynamics/TransientShaper.h>
+#include <felitronics/envfilter/EnvelopeFilter.h>
+#include <felitronics/envfilter/EnvelopeFilterLaw.h>
 #include <felitronics/eq/Crossover2.h>
 #include <felitronics/eq/EqBand.h>
 #include <felitronics/eq/EqEngine.h>
@@ -102,6 +106,8 @@
 #include <felitronics/multiband/MultibandWidth.h>
 #include <felitronics/neural/Inference.h>
 #include <felitronics/neural/NeuralStage.h>
+#include <felitronics/octave/OctaveLaw.h>
+#include <felitronics/octave/Octaver.h>
 #include <felitronics/oversampling/CascadeOversampler.h>
 #include <felitronics/oversampling/Oversampler.h>
 #include <felitronics/oversampling/PolyphaseOversampler.h>

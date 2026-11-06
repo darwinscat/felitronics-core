@@ -169,6 +169,30 @@ public:
         }
     }
 
+    // True when every column the owner prepared holds exactly +0.0f — the fixed point of the silent recurrence
+    // (input zero, state zero: every word stays +0.0f). An owner that advances a pause AS silence (law 11c) can stop
+    // ticking there and lose nothing; the flush above is what brings a decaying state onto it.
+    bool isAtRest() const noexcept
+    {
+        for (int c = 0; c < ch; ++c)
+            if (! (std::fpclassify (ic1[c]) == FP_ZERO && ! std::signbit (ic1[c])
+                   && std::fpclassify (ic2[c]) == FP_ZERO && ! std::signbit (ic2[c])))
+                return false;
+        return true;
+    }
+
+    // Put column `c` where a constant input `u` held for ever leaves it: band-pass +0, low-pass `u`, whatever the
+    // filter type (the state of the trapezoidal integrators at DC is (0, u)). An owner that starts a voice mid-stream
+    // primes it to the value the voice would have been holding, so its first output is the response to the step
+    // that actually happens and not to a jump from silence.
+    void primeDc (int c, float u) noexcept
+    {
+        if (c < 0 || c >= ch)
+            return;
+        ic1[c] = 0.0f;
+        ic2[c] = u;
+    }
+
     // The POISON half alone, for an owner that runs it at the end of every call while the denormal half
     // rides the audio-time grid — see `eq::Biquad::healPoison()` for why the two halves have different
     // clocks. On a stream whose state stays finite this cannot change a bit, so it costs the grid's

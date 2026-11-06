@@ -31,6 +31,7 @@ crossovers) · `lineareq` (linear- & mixed-phase "Natural" FIR EQ over partition
 `dynamics` (detectors · compressor · noise gate · transient shaper) · `multiband` ·
 `dynamiceq` · `deesser` · `stereo` · `saturation` · `dither` · `oversampling` · `limiter` (true-peak) ·
 `delay` (the amps' tape-style echo) · `reverb` (Freeverb · the amps' six-character room) ·
+`chorus` (the bass chorus: the lows stay dry) ·
 `analysis` (LUFS/LRA · dBTP true-peak · correlation) · `neural` (inference seam) ·
 `fftpffft` (**optional** compiled SIMD FFT backend — vendored pffft, `-DFELITRONICS_WITH_PFFFT=ON`).
 The guitar-amp DSP — NAM, the `.orbitrig` pack player, the tube power amp — lives in

@@ -29,8 +29,11 @@ The guitar-amp modules — `nam` (the NeuralAmpModelerCore backend), `rigplayer`
 
 | Module | What | Key types |
 |---|---|---|
+| `chorus` | bass chorus: the dry untouched plus a voice from the LR4 high band (lows stay dry and centred); two quadrature voices on a stereo bus; the one-slider law | `BassChorus`, `ChorusLaw.h` (`paramsForAmount`, `pitchDeviationCents`) |
 | `delay` | tape-style echo: a gliding (repitching) head, a dark saturated loop, a stereo offset; the knob law (sync ladder, sync policy, DARK) | `TapeDelay`, `DelayLaw.h` (`divisionMs`, `timeMsFor`, `darkHzForPercent`) |
 | `reverb` | Freeverb (the published algorithm, matched to the behaviour the amps were voiced on) and the six-character amp room | `Freeverb`, `AmpReverb` |
+| `envfilter` | the bass envelope filter (auto-wah, the Mu-Tron family): a peak follower places a resonant TPT SVF (low/band pass, up/down) on a log sweep, redesigned every sample; an optional external key; the clean lows kept by a split that cannot cancel them (a complement in low pass, an in-phase LR4 pair in band pass); amount 0 idles (bit-exact dry); the one-slider law | `EnvelopeFilter`, `EnvelopeFilterLaw.h` (`paramsForAmount`) |
+| `octave` | the bass amp's sub-octave: an OC-2-style tracker (band-limited comparator, per-polarity peak thresholds) and divider, −1 and −2, zero latency; the one-slider law | `Octaver`, `OctaveLaw.h` (`paramsForAmount`) |
 
 ## Mastering stages
 

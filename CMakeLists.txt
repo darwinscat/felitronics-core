@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(felitronics_core VERSION 0.61.3 LANGUAGES CXX)
+project(felitronics_core VERSION 0.62.0 LANGUAGES CXX)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)   # so clangd / IDEs parse the headers at the right C++ standard
 
@@ -22,6 +22,8 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/FelitronicsPolicy.cmake)
 #   eq            felitronics::eq         felitronics::eq        core+analysis (matched biquads + Cytomic SVF + EqEngine)
 #   delay         felitronics::delay      felitronics::delay     core         (TapeDelay — the amps' echo)
 #   reverb        felitronics::reverb     felitronics::reverb    core+eq      (Freeverb + AmpReverb — the amps' tail)
+#   envfilter     felitronics::envfilter  felitronics::envfilter core+dynamics+eq (EnvelopeFilter — the bass envelope filter)
+#   chorus        felitronics::chorus     felitronics::chorus    core+eq      (BassChorus — the bass amp's chorus)
 #
 # Consume (pinned by tag, exactly like JUCE) — JUCE-free, so this fetch never pulls JUCE:
 #   include(FetchContent)
@@ -75,6 +77,9 @@ add_subdirectory(modules/deesser)
 add_subdirectory(modules/dehum)   # mains hum canceller (50/60 Hz + harmonics) — core only
 add_subdirectory(modules/delay)   # the amp plugins' tape-style echo — core only
 add_subdirectory(modules/reverb)   # Freeverb + the amp plugins' six-character tail — core + eq
+add_subdirectory(modules/envfilter)   # the bass envelope filter (auto-wah) — core + dynamics + eq
+add_subdirectory(modules/chorus)   # the bass chorus — core + eq
+add_subdirectory(modules/octave)   # the bass amp's sub-octave (an OC-2-style tracker and divider) — core + eq + dynamics
 add_subdirectory(modules/dither)
 add_subdirectory(modules/lineareq)
 add_subdirectory(modules/measurement)   # OFFLINE IR-measurement math (sweep/Farina deconv/gate) — double, message-thread
@@ -113,7 +118,7 @@ if(FELITRONICS_BUILD_TESTS AND (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU"))
         felitronics::saturation felitronics::stereo felitronics::multiband felitronics::dynamiceq
         felitronics::deesser felitronics::dither felitronics::lineareq felitronics::measurement felitronics::blend
         felitronics::io felitronics::text felitronics::codecgrid felitronics::dehum felitronics::delay
-        felitronics::reverb)
+        felitronics::reverb felitronics::envfilter felitronics::chorus felitronics::octave)
     target_compile_features(felitronics_header_hygiene PRIVATE cxx_std_20)
     target_compile_options(felitronics_header_hygiene PRIVATE ${FELITRONICS_HYGIENE_WARNINGS})
     # When selected, felitronics::convolution propagates the uniform FELITRONICS_WITH_PFFFT definition
@@ -140,7 +145,7 @@ if(FELITRONICS_BUILD_TESTS AND (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU"))
         felitronics::saturation felitronics::stereo felitronics::multiband felitronics::dynamiceq
         felitronics::deesser felitronics::dither felitronics::lineareq felitronics::measurement felitronics::blend
         felitronics::io felitronics::text felitronics::codecgrid felitronics::dehum felitronics::delay
-        felitronics::reverb)
+        felitronics::reverb felitronics::envfilter felitronics::chorus felitronics::octave)
     target_compile_features(felitronics_no_exceptions_probe PRIVATE cxx_std_20)
     target_compile_options(felitronics_no_exceptions_probe PRIVATE -fno-exceptions -fno-rtti)
 endif()
