@@ -13,7 +13,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <mutex>
 #include <numeric>
 #include <vector>
 
@@ -45,10 +44,12 @@ namespace felitronics::cabinet
     raw either — 61k taps sum to enormous gain; the reference gain is clamped ±30 dB. The bass's
     reference is felitronics::measurement::bassReferenceUnityGain.
 
-    THREADS. `prepare`, `load`, `setPost`, `setReference` and `flushPending` are the producer's side and take one
-    lock: the convolver allows one producer beside the audio thread, and a host may prepare from a
-    thread of its own while the message thread's pump is loading. `process` and `idle` are the
-    audio thread's and take none. */
+    THREADS. `prepare`, `load`, `setPost`, `setReference` and `flushPending` are the producer's side; `process` and
+    `idle` are the audio thread's. The convolver allows ONE producer beside the audio thread, so the producer's side is
+    one thread at a time — and this class takes no lock for it (the wasm-audio tier is single-threaded by contract,
+    DSP-ARCHITECTURE.md §2): a host whose producer side runs on more than one thread — a plug-in host that prepares from a
+    thread of its own while the message thread's pump loads — holds its own lock around these calls (OrbitAmp's cabinet
+    does). `process` and `idle` take none. */
 class CabinetIr
 {
 public:
@@ -77,8 +78,6 @@ public:
 
     void prepare (double sampleRate, int blockSize, int numChannels)
     {
-        const std::scoped_lock lock (producer);
-
         channels = std::clamp (numChannels, 1, 2);
         // Its schedule is fixed at prepare for the longest IR it will ever be handed — `load` refuses
         // longer — and the loudness is ours, set in `rebuild`, so the convolver applies none.
@@ -122,7 +121,6 @@ public:
 
         std::vector<float> shot (taps, taps + numSamples);
 
-        const std::scoped_lock lock (producer);
         raw     = std::move (shot);
         rawRate = sampleRate;
         atHost.clear();
@@ -133,8 +131,6 @@ public:
     /** Message thread. Rebuilds only when something actually moved. */
     void setPost (const Post& p)
     {
-        const std::scoped_lock lock (producer);
-
         if (p == post)
             return;
 
@@ -150,8 +146,6 @@ public:
 
     void setReference (Reference r)
     {
-        const std::scoped_lock lock (producer);
-
         if (r == reference)
             return;
 
@@ -280,8 +274,6 @@ public:
         tick, so without it the last position of a drag could be the one that never arrives. */
     void flushPending()
     {
-        const std::scoped_lock lock (producer);
-
         if (conv.hasPending() && conv.flushPending())
             handedOver.store (true, std::memory_order_relaxed);
     }
@@ -507,7 +499,6 @@ private:
 
     std::atomic<float> tailSec { 0.0f };
 
-    std::mutex producer;   // prepare, load, setPost, setReference, flushPending — see the class note
     felitronics::convolution::CabConvolver conv;
     bool prepared = false;
     int channels = 2;

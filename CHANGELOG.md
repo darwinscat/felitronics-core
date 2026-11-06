@@ -48,7 +48,9 @@ after it at the shot's own rate against the guitar's reference or the bass's (`s
 either end is cut first. On the audio thread `process` keeps a non-finite sample out of the convolution and silences
 a poisoned output for the impulse's length; `idle` drains the whole schedule once the cabinet stands out of the path,
 so it comes back with no ghost, and runs a cabinet handed over meanwhile in on silence. `prepare`, `load`,
-`setPost`, `setReference` and `flushPending` are the producer's side and take one lock; `process` and `idle` take none.
+`setPost`, `setReference` and `flushPending` are the producer's side, one thread at a time — the class takes no lock
+(the wasm-audio tier is single-threaded): a host whose producer side runs on two threads holds its own around them, as
+OrbitAmp's cabinet does; `process` and `idle` take none.
 
 Measured (`modules/cabinet/tests/CabinetIrTests.cpp`): after the crossfade the output is the direct convolution
 times the reference's gain, guitar and bass, at sample zero (within 2e-4); a quarter of the tail kept reports a
