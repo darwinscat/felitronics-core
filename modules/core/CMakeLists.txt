@@ -20,6 +20,13 @@ if(FELITRONICS_BUILD_TESTS)
     target_compile_features(felitronics_core_polyphasefir_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_core_polyphasefir_tests COMMAND felitronics_core_polyphasefir_tests)
 
+    # The one crossfade of a link that replaces the signal — moved from OrbitAmp, its arithmetic unchanged.
+    add_executable(felitronics_core_bypassfade_tests tests/BypassFadeTests.cpp)
+    target_link_libraries(felitronics_core_bypassfade_tests PRIVATE felitronics::core)
+    target_include_directories(felitronics_core_bypassfade_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_core_bypassfade_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_core_bypassfade_tests COMMAND felitronics_core_bypassfade_tests)
+
     add_executable(felitronics_core_detmath_tests tests/DetMathTests.cpp)   # the deterministic transcendental floor
     target_link_libraries(felitronics_core_detmath_tests PRIVATE felitronics::core)
     target_include_directories(felitronics_core_detmath_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../test_support ${CMAKE_CURRENT_SOURCE_DIR}/tests)

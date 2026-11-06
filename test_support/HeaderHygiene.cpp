@@ -40,6 +40,7 @@
 #include <felitronics/convolution/MatrixConvolverNupc.h>
 #include <felitronics/convolution/NonUniformConvolver.h>
 #include <felitronics/convolution/PartitionedConvolver.h>
+#include <felitronics/core/BypassFade.h>
 #include <felitronics/core/Config.h>
 #include <felitronics/core/DelayLine.h>
 #include <felitronics/core/DeliveryResampler.h>
