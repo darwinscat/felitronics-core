@@ -106,8 +106,8 @@ square's upper partials are heard while its fundamental spends headroom and spea
 ## What it sends down the chain
 
 At the slider's top the sub's square swings to 1.25 × the band's peak before its filters, so the sum can peak well
-over the dry (the default renders: −10.0 dBFS in, see `~/CLAUDE_FILES/bass-fx/octave/README.txt` for the measured
-peaks). SUB HP (default 25 Hz, 2-pole Butterworth) keeps what no amp model or speaker should be asked for out of it:
+over the dry (the default renders: −10.0 dBFS in; `fcore_octave_render`, below, prints the measured peaks of its
+renders). SUB HP (default 25 Hz, 2-pole Butterworth) keeps what no amp model or speaker should be asked for out of it:
 the −1 octave is cut by 9.0 dB on the open B (15.4 Hz), 5.0 dB on the open E (20.6 Hz), 2.3 dB on the open A
 (27.5 Hz), 0.9 dB on D (36.7 Hz), 0.3 dB on G (49.0 Hz); the −2 by 20.4 dB on B (7.7 Hz) and 15.5 dB on E (10.3 Hz).
 The measured cut matches the formula within 0.5 dB (`OctaverTests`). At the default the high pass also turns a held
