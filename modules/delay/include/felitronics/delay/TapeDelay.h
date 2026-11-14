@@ -61,7 +61,8 @@ namespace felitronics::delay
 //     silence (law 11c) and every channel's memory is dropped.
 //   · reset() is a stream RESTART: the lines cleared, the write clocks re-anchored at zero and the heads
 //     snapped to their targets on the next call — what follows a reset does not depend on what came before. The
-//     picture's taps show those targets from the reset on.
+//     picture's taps show those targets from the reset (or a prepare) on; a poison restart inside a call leaves
+//     the picture of the heads that call played, and the next call shows the snap.
 //   · FEED (process's last argument) is the insert's stand-by, and it is a DOOR, not a switch: what enters the
 //     record head is ramped linearly to nothing, or back, over kFeedRampSeconds — a flip on a loud note would
 //     otherwise be recorded as a step that every repeat replays as a tick. Only the input is ramped, never the
@@ -284,6 +285,8 @@ public:
         }
         gainsPrimed_ = false;
         headsMono_   = false;
+        shownTimeMs_.store (timeMs, std::memory_order_relaxed);   // a fresh line shows where its heads will start
+        shownOffsetMs_.store (offsetMs, std::memory_order_relaxed);
         publishHeadTargets();
 
         prepared_ = true;
@@ -300,6 +303,14 @@ public:
         runs once. */
     void reset() noexcept
     {
+        // The picture after a restart shows where the next call puts the heads — on their targets — instead of
+        // where the stopped stream left them. Before the cheap return: a poison restart inside process() leaves
+        // the lines clear but the picture of the heads that call played, and the reset after it must still show
+        // the targets.
+        shownTimeMs_.store (timeMs, std::memory_order_relaxed);
+        shownOffsetMs_.store (offsetMs, std::memory_order_relaxed);
+        publishHeadTargets();
+
         if (cleared)
             return;   // an off block calls this every block; the memset must not be per-block
 
@@ -316,12 +327,6 @@ public:
         primed  = false;
         cleared = true;
         gainsPrimed_ = false;   // the heads snap with the motor, their gains on the next call that carries a channel
-
-        // The picture after a restart shows where the next call puts the heads — on their targets — instead of
-        // where the stopped stream left them.
-        shownTimeMs_.store (timeMs, std::memory_order_relaxed);
-        shownOffsetMs_.store (offsetMs, std::memory_order_relaxed);
-        publishHeadTargets();
     }
 
     /** The whole state: the five knobs in the order the app sets them, then the heads. */

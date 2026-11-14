@@ -12,8 +12,9 @@
 //     alike — and, to the shipping class alone, head calls that must not change the sound (the default re-sent,
 //     silent heads moved anywhere, fields that are not numbers, indices off the array). After EVERY call the
 //     verdict, the audio and every public tap must agree bit for bit — but two, which depart on purpose: the tail
-//     is held to a fresh stage's for the same targets (the frozen tail could go stale), and the picture's time and
-//     offset are not compared from a reset to the next call (the shipping reset shows the targets at once). The
+//     is held to a fresh stage's for the same targets (the frozen tail could go stale), and from a reset or a
+//     prepare to the next call the picture's time and offset are held to the targets instead (the shipping class
+//     shows them at once). The
 //     script is counted as it runs, and the counts are gated, so a generator that never reaches a case fails here
 //     rather than passing blind.
 #include <felitronics_test.h>
@@ -216,8 +217,8 @@ bool sameTaps (const Now& a, const frz::TapeDelay& b, bool deep, bool pictureCom
 {
     return a.isPrepared() == b.isPrepared() && a.maxChannels() == b.maxChannels() && a.maxBlock() == b.maxBlock()
         && sameBits (a.tailSeconds(), freshTail (a.targets()))
-        && (! pictureComparable || (sameBits (a.shownTimeMs(), b.shownTimeMs())
-                                    && sameBits (a.shownOffsetMs(), b.shownOffsetMs())))
+        && (pictureComparable ? sameBits (a.shownTimeMs(), b.shownTimeMs()) && sameBits (a.shownOffsetMs(), b.shownOffsetMs())
+                              : sameBits (a.shownTimeMs(), a.targets().timeMs) && sameBits (a.shownOffsetMs(), a.targets().offsetMs))
         && sameBits (a.inputPeak(), b.inputPeak())
         && sameBits (a.headSamples(), b.headSamples()) && sameBits (a.offsetHeadSamples (0), b.offsetHeadSamples (0))
         && sameBits (a.offsetHeadSamples (1), b.offsetHeadSamples (1))
@@ -327,6 +328,8 @@ int session (std::uint64_t seed, int ops, Census& n)
                 }
             }
             const bool va = a.prepare (sr, block, ch), vb = b.prepare (sr, block, ch);
+            if (va)
+                picture = false;   // the shipping prepare shows the targets at once, the frozen one at the next call
             verdictsAgree = va == vb && va == ! refuse;
             maxCh = va ? ch : 0;
             ++n.prepares;

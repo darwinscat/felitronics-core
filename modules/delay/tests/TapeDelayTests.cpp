@@ -575,7 +575,7 @@ void tailAndPictureFollowTargets()
                 d.setRepeats (zero);
                 lands = lands && sameFloat (d.tailSeconds(), oneTime);
             }
-        // Catches: setRepeats guarded by nearlyEqual alone (the tail stays at ~0.54 s of echoes that are not there).
+        // Catches: setRepeats guarded by nearlyEqual alone (the tail keeps counting echoes that are not there).
         ok (lands, "REPEATS ~1e-38, a subnormal or -1e-38, then exactly 0 (or -0): the tail is one TIME (0.35 s), not more");
     }
     {
@@ -616,6 +616,20 @@ void tailAndPictureFollowTargets()
         ok (gliding && sameFloat (d.shownTimeMs(), 2000.0f) && sameFloat (d.shownOffsetMs(), -15.0f)
                 && sameFloat (d.shownHeadMs (1), 1000.0f) && sameFloat (d.shownHeadMs (0), 2000.0f),
             "reset() mid-glide: TIME 2000 ms, OFFSET -15 ms and the heads at 1000 and 2000 ms shown at once");
+
+        // ...and a reset after a re-prepare (the cheap one: the lines are clear already), and a prepare alone.
+        for (int b = 0; b < 10; ++b)
+            test::run (d.process (lr, 2, 512));
+        d.setTimeMs (600.0f);
+        for (int b = 0; b < 4; ++b)
+            test::run (d.process (lr, 2, 512));
+        const bool glidingAgain = d.shownTimeMs() < 1999.0f && d.shownTimeMs() > 601.0f;
+        test::run (d.prepare (48000.0, 512, 2));
+        const bool onPrepare = sameFloat (d.shownTimeMs(), 600.0f) && sameFloat (d.shownOffsetMs(), -15.0f);
+        d.reset();
+        // Catches: a prepare() that leaves the stopped stream's picture up (the reset after it is the cheap one).
+        ok (glidingAgain && onPrepare && sameFloat (d.shownTimeMs(), 600.0f) && sameFloat (d.shownHeadMs (1), 300.0f),
+            "prepare() mid-glide, then reset(): the targets shown on both (TIME 600 ms, a head at 300 ms)");
     }
 }
 
