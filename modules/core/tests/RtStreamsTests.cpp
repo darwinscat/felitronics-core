@@ -213,16 +213,23 @@ void rec()
     ok (r.tryReserve (4096), "reserve");
 
     std::atomic<bool> go { true };
+    std::atomic<long> lastSeq { 0 };
     Hold hold;
     std::thread pusher ([&] {
+        // A block is numbered only when it records something: a full take admits blocks that push nothing, and a
+        // number per admitted block outran float's 2^24 exact integers on slow CI runners (6-11 s of spinning),
+        // where neighbouring numbers then read as equal.
         long seq = 0;
         while (go.load (rlx)) {
             auto b = r.beginBlock();
             if (! b) { std::this_thread::yield(); continue; }
-            const float v = (float) ++seq;
-            for (int i = 0; i < 8; ++i) b.push (v);
+            if (! b.full()) {
+                const float v = (float) ++seq;
+                for (int i = 0; i < 8; ++i) b.push (v);
+            }
             hold.insideBlock();
         }
+        lastSeq.store (seq, rlx);
     });
 
     long refusedStart = 0, refusedHarvest = 0, bad = 0, notRising = 0, shortTakes = 0, timeouts = 0;
@@ -270,6 +277,7 @@ void rec()
     pusher.join();
 
     ok (timeouts == 0, "the pusher kept recording (no wait timed out)");
+    ok (lastSeq.load() < (1L << 24), "every block number is an exact float (" + std::to_string (lastSeq.load()) + " < 2^24)");
     ok (bad == 0, "every block's pushes are whole and in order (" + std::to_string (bad) + ")");
     ok (notRising == 0, "no take holds a sample of an earlier block than its own start (" + std::to_string (notRising) + ")");
     ok (shortTakes == 0, "every take kept what was recorded into it");
