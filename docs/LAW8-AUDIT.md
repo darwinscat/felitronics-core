@@ -265,9 +265,18 @@ longer moves a head, it is put on its target. In float — as the app had them �
 value once `(T − d)·c` falls under half an ulp of `d`, which is `1/(2c)` ulps short: 112 samples (2.3 ms) short
 of a 6 s target at 48 kHz, parked there for good. In double that distance is ~1e-6 of a sample, so the landing
 step is inaudible. The room's glides are linear and land by construction.
+**The playback heads.** A head's position glides in double like the motor and lands; its floor is the smallest
+normal float, so no position glide ever heads for zero. Its level and pan reach it as two side gains on counted
+linear ramps, which end exactly on target, and a level under 1e-15 is taken as 0 where it is set. What a head
+plays goes into the offset line, a pure delay: a contribution at a gain of exactly 1 is the line's own tap (zero
+or at least ~1e-15 times an interpolation fraction, as before), and every scaled contribution is flushed at the
+house 1e-15 before it is summed, so a tiny gain on a quiet tap cannot store a subnormal there. The law-8 witness
+(`anySubnormalState`) reads the offset lines and every head's position and gains too.
 Tested in `modules/delay/tests/TapeDelayTests.cpp` (a minute of silence after a bloom with the offset gliding to
-zero: no subnormal in any state at any block, and the silence holds; the heads stand exactly on their targets)
-and `modules/reverb/tests/AmpReverbTests.cpp` (three minutes after a HALL at DECAY ×2: no subnormal in the room,
+zero: no subnormal in any state at any block, and the silence holds; the heads stand exactly on their targets),
+`modules/delay/tests/TapeDelayHeadsTests.cpp` (a level fading to nothing under a ringing loop with the offset
+on, tiny levels and subnormal input: no subnormal at any block end, and the gains land on their targets in a
+counted number of samples) and `modules/reverb/tests/AmpReverbTests.cpp` (three minutes after a HALL at DECAY ×2: no subnormal in the room,
 the predelay or the chorus line, and once exact zero is reached it holds).
 
 ### Added with the module: `envfilter::EnvelopeFilter` — gridded from the start

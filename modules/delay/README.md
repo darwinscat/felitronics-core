@@ -12,22 +12,39 @@ target_link_libraries(app PRIVATE felitronics::delay)
 
 ## `TapeDelay`
 
-A tape head, not a sampler: TIME is a target the read head glides to (~150 ms), and the glide bends the
-repeats' pitch. Every pass through the loop — the first echo included — goes through a one-pole low pass
-(DARK) and a fixed `tanh` saturator, so repeats darken and compress as they recirculate. OFFSET holds one
+A tape head, not a sampler: TIME is a target the motor glides to (a ~150 ms time constant), and the glide
+bends the repeats' pitch. Every pass through the loop — the first echo included — goes through a one-pole low
+pass (DARK) and a fixed `tanh` saturator, so repeats darken and compress as they recirculate. OFFSET holds one
 channel's wet back by up to ±31 ms (its own ~30 ms glide). The dry is never touched; the wet is added.
+
+**Up to `kMaxHeads` (4) playback heads** read the one tape. Each has a POSITION, a fraction of TIME in (0, 1]
+— TIME stays the one motor, so turning it moves every head, and a head moved on its own glides under TIME's law
+and bends that repeat — a LEVEL (0 … 1, 0 is off) and a PAN. The loop feeds back from 1x TIME, never from a
+head, so the heads' figure repeats once per TIME and decays with REPEATS: heads at 1/3, 2/3 and 1 play a
+triplet, at 1/4 … 1 four on the beat, and the third echo can be louder than the second. PAN is a balance on the
+head's own lines at constant power, the centre at unity on both sides (+3 dB on its side at hard pan); on dual
+mono — one guitar on both lines, as the amps feed it — heads panned apart are a ping-pong. A mono call has no
+pan. Level and pan arrive over 20 ms ramps; a silent head stands where it was sent. The default layout, one head
+at 1x, level 1, centre, is the one-head stage byte for byte — every existing preset plays as it did.
 
 ```cpp
 felitronics::delay::TapeDelay d;
 d.prepare (sampleRate, maxBlock, maxChannels);   // [[nodiscard]] bool; 1 or 2 channels, 1 … 768 kHz
-d.setParams ({ .timeMs = 350, .repeats = 0.35f, .darkHz = 4000, .offsetMs = 0, .mix = 0.25f });
+felitronics::delay::TapeDelayParams p { .timeMs = 350, .repeats = 0.35f, .darkHz = 4000, .offsetMs = 0, .mix = 0.25f };
+p.heads[0] = { .position = 1.0f / 3, .level = 0.4f, .pan = -1.0f };   // a ping-pong triplet
+p.heads[1] = { .position = 2.0f / 3, .level = 0.7f, .pan = +1.0f };
+p.heads[2] = { .position = 1.0f,     .level = 1.0f, .pan =  0.0f };
+d.setParams (p);                                 // the whole state, heads included
+d.setHead (1, { .position = 0.5f, .level = 0.7f, .pan = 1.0f });   // or one head (an index off the array is ignored)
 d.process (io, nch, n, feed);                    // [[nodiscard]] bool, in place; feed=false = stand-by
 d.reset();                                       // stream restart, idempotent (cheap to call every block)
-d.tailSeconds(); d.shownTimeMs(); d.shownOffsetMs(); d.inputPeak();   // relaxed atomics, any thread
+d.tailSeconds(); d.shownTimeMs(); d.shownOffsetMs(); d.shownHeadMs (k); d.inputPeak();   // relaxed atomics, any thread
 ```
 
-The setters (`setTimeMs`, `setRepeats`, `setDarkHz`, `setOffsetMs`, `setMix`) are public too, each guarded
-against re-sending the value it already holds; `setParams` calls them in that order.
+The setters (`setTimeMs`, `setRepeats`, `setDarkHz`, `setOffsetMs`, `setMix`, `setHead`, `setHeads`) are public
+too, each guarded against re-sending the value it already holds; `setParams` calls them in that order. It is the
+whole state: a `TapeDelayParams` built without heads carries the default layout, so a caller that sets heads with
+`setHead` and hands over a fresh struct every block hands the default back every block — use one door.
 
 ## `DelayLaw.h` — the knob law
 
@@ -56,19 +73,31 @@ same number.
   (`core::flushDenormal`). Bit-identical under any re-slicing. The heads glide in double and land exactly
   on their targets.
 - Knobs: a non-finite value is ignored, a finite one clamped (TIME 1 … 6100 ms, DARK 1 Hz … 100 kHz,
-  OFFSET ±31 ms, REPEATS and MIX 0 … 1) — no knob can reach an index off the line.
-- Threads: prepare, reset, the setters and process belong to one thread; the four taps above may be read
-  from any thread.
+  OFFSET ±31 ms, REPEATS and MIX 0 … 1) — no knob can reach an index off the line. A head's three fields are
+  bounded each on its own: POSITION to [smallest normal float, 1] (anything under one sample of delay plays at
+  one sample, the motor's own floor), LEVEL to 0 … 1 (under 1e-15 it is 0), PAN to −1 … +1.
+- The heads' controls are sample-clocked like the motor: positions glide per sample and land, the gains ride
+  counted ramps that land on target, a pause steps them as silence would, and a silent head stands on its target.
+  A mono call ramps each head's side 0 to its level (pan aside) and a stereo call back — no step at the width
+  edge. After `prepare`/`reset` the positions snap with the motor, and the gains on the first call that carries a
+  channel. Bit-identical under any re-slicing, live head moves included.
+- `tailSeconds()` counts the heads: stacked heads add and hard pan is +3 dB, so the first echo is taken at the sum
+  of each head's level times its louder side; the default layout gives the one-head stage's estimate to the bit.
+- Threads: prepare, reset, the setters and process belong to one thread; the taps above may be read from any
+  thread (each its own atomic — the heads' taps are not one snapshot).
 - Math: `core::det` for every transcendental — `exp2`/`log2`/`pow` for the coefficients and the tail, a
   det-built `tanh` per sample in the loop (~5 ns a call) — so the same bits on every row up to FMA
-  contraction (law 10: arm64 fuses `a*b + c`, x86-64 and wasm cannot).
+  contraction (law 10: arm64 fuses `a*b + c`, x86-64 and wasm cannot). The pan law is rational,
+  gL = (1 − p)/√(1 + p²) and gR = (1 + p)/√(1 + p²), every operation correctly rounded, so it needs no `det`
+  call; the gain ramps are pinned against contraction (`core::det::mulAdd`).
 
 ## Provenance and parity
 
 The signal path is OrbitAmp's own `DelayStage` (feat/titan, by the same authors), expression for
 expression. What changed on the way in is listed below; an out-of-tree harness renders the app's class and
 this one side by side and reports the distance. `tests/delay_golden.h` holds regression excerpts of this
-module's own renders, so CI guards the sound.
+module's own renders, so CI guards the sound; `tests/TapeDelayFrozen.h` is the one-head class as it stood before
+the heads, and `tests/TapeDelayParityTests.cpp` holds the default layout to it byte for byte.
 
 Measured on arm64 against the app's class (impulse, noise, sweep and their silent tails; 44.1/48/96 kHz;
 blocks 1, 64, 512, 333; mono and stereo; six free settings, all 13 divisions, 1/1 at 40 and 1/16T at 240):
