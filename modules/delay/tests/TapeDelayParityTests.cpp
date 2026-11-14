@@ -9,7 +9,8 @@
 //   · random SESSIONS: a seeded script of prepares (refused ones too), knob setters (absurd values, re-sends and
 //     one-ulp nudges included), process calls of every width the contract names (stereo, a narrower mono call,
 //     the pause nch == 0, refused widths and extents), stand-by flips, resets and poison, sent to both classes
-//     alike. After EVERY call the verdict, the audio and every public tap must agree bit for bit. The script is
+//     alike — and, to the shipping class alone, head calls that must not change the sound (the default re-sent,
+//     silent heads moved anywhere, fields that are not numbers, indices off the array). After EVERY call the verdict, the audio and every public tap must agree bit for bit. The script is
 //     counted as it runs, and the counts are gated, so a generator that never reaches a case fails here rather
 //     than passing blind.
 #include <felitronics_test.h>
@@ -121,6 +122,7 @@ struct Census
     long long longCalls = 0, poisonCalls = 0, subnormalInput = 0, feedFlips = 0, standByCalls = 0, resets = 0;
     long long prepares = 0, refusedPrepares = 0, setParams = 0, singleSetters = 0, absurdKnobs = 0, reSends = 0;
     long long ulpNudges = 0, samples = 0, mismatches = 0;
+    long long headOps = 0, silentHeadMoves = 0, defaultReSends = 0;
 };
 
 /** The last value the script sent to each knob, so a re-send and a one-ulp nudge have something to repeat. */
@@ -221,6 +223,31 @@ float drawKnob (Rng& r, int which, const Sent& s, Census& n)
     }
 }
 
+/** A head call the default sound must survive: the default re-sent (whole, or head 0 alone, or through a -0 pan);
+    a SILENT head sent anywhere, panned anywhere, or given a level that flushes to nothing; a head with no finite
+    field; an index off the array. None of them may move a bit of the output, a tap or the tail. */
+template <class Now>
+void headOp (Now& a, Rng& r, Census& n)
+{
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    switch (r.below (7))
+    {
+        case 0:  a.setHeads (delay::TapeDelayParams {}.heads); ++n.defaultReSends; break;
+        case 1:  a.setHead (0, { 1.0f, 1.0f, r.chance (50) ? 0.0f : -0.0f }); ++n.defaultReSends; break;
+        case 2:  a.setHead (0, { nan, nan, nan }); break;
+        case 3:  a.setHead (r.chance (50) ? -1 - r.below (3) : delay::kMaxHeads + r.below (3), { 0.5f, 1.0f, -1.0f }); break;
+        case 4:  a.setHead (0, { 1.0f, std::numeric_limits<float>::infinity(), 0.0f }); break;   // inf level: ignored
+        default:
+        {
+            const int k = 1 + r.below (delay::kMaxHeads - 1);
+            const float level = r.chance (30) ? 1.0e-16f * r.unit() : 0.0f;   // under 1e-15: a head that is off
+            a.setHead (k, { r.chance (10) ? -3.0f : r.unit(), level, 2.4f * r.signedUnit() });
+            ++n.silentHeadMoves;
+            break;
+        }
+    }
+}
+
 /** One session: `ops` calls drawn from `seed`, both classes driven alike, compared after every call. Returns the
     index of the first call after which they differ, or -1. */
 template <class Now>
@@ -300,6 +327,11 @@ int session (std::uint64_t seed, int ops, Census& n)
             if (r.chance (30)) { a.reset(); b.reset(); }
             ++n.resets;
         }
+        else if (pick < 38)   // the shipping class only: head calls that must leave today's sound as it is
+        {
+            headOp (a, r, n);
+            ++n.headOps;
+        }
         else   // process
         {
             if (r.chance (12)) { feed = ! feed; ++n.feedFlips; }
@@ -354,6 +386,14 @@ int session (std::uint64_t seed, int ops, Census& n)
 
         if (! (verdictsAgree && audioAgrees && sameTaps (a, b, op % 16 == 15 || op + 1 == ops)))
         {
+            if (n.mismatches < 5)
+                std::printf ("      [call %d, pick %d: verdicts %s, audio %s, tail %s, time %s, offset %s, head %s, peak %s]\n",
+                             op, pick, verdictsAgree ? "agree" : "DIFFER", audioAgrees ? "agrees" : "DIFFERS",
+                             sameBits (a.tailSeconds(), b.tailSeconds()) ? "=" : "DIFFERS",
+                             sameBits (a.shownTimeMs(), b.shownTimeMs()) ? "=" : "DIFFERS",
+                             sameBits (a.shownOffsetMs(), b.shownOffsetMs()) ? "=" : "DIFFERS",
+                             sameBits (a.headSamples(), b.headSamples()) ? "=" : "DIFFERS",
+                             sameBits (a.inputPeak(), b.inputPeak()) ? "=" : "DIFFERS");
             ++n.mismatches;
             return op;
         }
@@ -383,10 +423,11 @@ void sessions (int count, int ops)
     std::printf ("      [census: %lld calls (%lld refused), %lld stereo, %lld narrower, %lld pauses, %lld zero-length, "
                  "%lld long, %lld poison, %lld subnormal-input, %lld stand-by, %lld feed flips, %lld resets, "
                  "%lld prepares (%lld refused, %lld mono), %lld setParams, %lld single setters, %lld absurd knobs, "
-                 "%lld re-sends, %lld one-ulp nudges, %lld samples]\n",
+                 "%lld re-sends, %lld one-ulp nudges, %lld samples; %lld head calls (%lld silent moves, %lld default re-sends)]\n",
                  n.calls, n.refusedCalls, n.stereo, n.narrower, n.pauses, n.zeroLength, n.longCalls, n.poisonCalls,
                  n.subnormalInput, n.standByCalls, n.feedFlips, n.resets, n.prepares, n.refusedPrepares, n.monoPrepared,
-                 n.setParams, n.singleSetters, n.absurdKnobs, n.reSends, n.ulpNudges, n.samples);
+                 n.setParams, n.singleSetters, n.absurdKnobs, n.reSends, n.ulpNudges, n.samples, n.headOps,
+                 n.silentHeadMoves, n.defaultReSends);
 
     // The script reached every case it names — a floor on each, not a hope.
     ok (n.stereo >= 1000 && n.narrower >= 200 && n.pauses >= 200 && n.zeroLength >= 50 && n.longCalls >= 200,
@@ -397,6 +438,8 @@ void sessions (int count, int ops)
         "the census: poison, subnormal input, stand-by, feed flips and resets all reached");
     ok (n.setParams >= 200 && n.singleSetters >= 200 && n.absurdKnobs >= 200 && n.reSends >= 100 && n.ulpNudges >= 100,
         "the census: whole and single knob sets, absurd values, re-sends and one-ulp nudges all reached");
+    ok (n.headOps >= 500 && n.silentHeadMoves >= 200 && n.defaultReSends >= 100,
+        "the census: head calls that keep the default — silent heads moved, the default re-sent — all reached");
 }
 } // namespace
 
