@@ -179,7 +179,7 @@ public:
     // restart before the 50 ms crossfade ends. reset() below used to drop the incoming operator on the
     // floor there — `cur_` stayed on the OLD one and `CabConvolver::pendingRetry_` is already false after
     // a successful publish, so nothing ever re-staged it, and the knob move was lost until the next knob
-    // move. P88 closed that at the source: reset() now ADOPTS the publication. This verb remains the half
+    // move. That was closed at the source: reset() now ADOPTS the publication. This verb remains the half
     // that decides nothing and leaves a fade running — which is also why it does NOT give law 11a
     // independence mid-fade (CabConvolver::clearAudioState(), which forwards here, has the number); a
     // restart that owes independence calls reset().
@@ -296,8 +296,8 @@ public:
         // the caller its geometry is fine right up until the first non-empty block. Law 11's check order.
         // LAW 11(b)+(c): the matrix width is EXACT. A NARROW call is refused because a 2x2 matrix needs
         // BOTH input planes to compute either output — refused OBSERVABLY now, where it used to return
-        // void, so a caller that pre-zeroed `out` got DIGITAL SILENCE and no way to find out (P18 F35,
-        // measured through CabConvolver as a 9.12e-02 "leak" that was really forty unprocessed blocks
+        // void, so a caller that pre-zeroed `out` got DIGITAL SILENCE and no way to find out
+        // (measured through CabConvolver as a 9.12e-02 "leak" that was really forty unprocessed blocks
         // and a tail). A WIDER call is refused for the ordinary reason: the planes past `channels_` have
         // no operator to run and would have gone out DRY while the first two were convolved.
         if (numChannelsToProcess != channels_) return false;
