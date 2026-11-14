@@ -75,6 +75,10 @@ namespace felitronics::convolution
 // So for each sample it processes a call carries at most three sums' share of units (the live slot's; in a swap,
 // the incoming slot's first-hop and own sums too) plus, at a boundary, the j = 0 products and the inverses.
 // maxSwapSamples() says how long a swap can take.
+// THE PRICE OF THE THRESHOLD: just under it the old path stays, burst and all — an unspread swap's first call can
+// prime the whole stage and recompute both slots at a boundary, about 3 x 255 MACs. That is the worst call left in
+// the tree (lineareq's maximum quality in Full, a 5 s cabinet at 48 kHz), bought on purpose: those operators keep
+// their output to the bit and their swaps their timing. fcore_convburst measures the edge.
 //
 // MEMORY NOTE. The same split. The shared FDL is sized to maxIrSamples at prepare(), because it is ONE history
 // that both slots read: a new operator answers the last maxIrSamples of input at once, which is what keeps a
@@ -282,13 +286,16 @@ public:
     bool isBusy() const noexcept { return state_.load (std::memory_order_acquire) != 0; }
 
     // The most samples a published operator can take, from the process() call that picks it up to the end of its
-    // fade: the crossfade, plus one B_max hop when this geometry can spread (a spread operator's fade starts one
-    // hop after it is picked up — the COST NOTE). A caller that feeds silence until a swap has landed (a cabinet
-    // standing out of the path) must feed this long, not a fade's length.
+    // fade: the crossfade, plus one B_max hop when an operator of `numBanks` banks at this cap could be spread (a
+    // spread operator's fade starts one hop after it is picked up — the COST NOTE). A caller that only ever stages
+    // fewer banks than four (CabConvolver: LRDiag, two) passes its count and gets the tighter bound. A caller that
+    // feeds silence until a swap has landed (a cabinet standing out of the path) must feed this long, not a fade's.
     // Saturates: prepare() takes any positive crossfade, and one near INT_MAX plus a hop does not fit an int.
-    int maxSwapSamples() const noexcept
+    int maxSwapSamples (int numBanks = kMaxBanks) const noexcept
     {
-        const long long v = (long long) warmXfade_ + (dst_ >= 0 ? spec_[dst_].B : 0);
+        const int nb = mono_ ? 1 : std::clamp (numBanks, 1, kMaxBanks);
+        const bool canSpread = dst_ >= 0 && (spec_[dst_].C - 1) * nb >= kSpreadFromMacs;
+        const long long v = (long long) warmXfade_ + (canSpread ? spec_[dst_].B : 0);
         return (int) std::min<long long> (v, std::numeric_limits<int>::max());
     }
     int  numChannels() const noexcept { return channels_; }

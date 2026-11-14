@@ -270,9 +270,10 @@ public:
     static constexpr int latencySamples() noexcept { return 0; }   // NUPC guarantees sample-zero latency
 
     // The most samples a handed-over IR can take to land, from the process() call that picks it up: the 50 ms
-    // crossfade, plus one B_max hop when the IR is long enough for the convolver to spread its last stage
-    // (MatrixConvolverNupc::maxSwapSamples()). A caller that feeds silence until a swap lands feeds this long.
-    int maxSwapSamples() const noexcept { return convolution_.maxSwapSamples(); }
+    // crossfade, plus one B_max hop when the cap is long enough for a two-bank IR to be spread — this class stages
+    // LRDiag only, so it asks for two banks (MatrixConvolverNupc::maxSwapSamples()). Below about 5.5 s of cap at
+    // 48 kHz that is the crossfade alone. A caller that feeds silence until a swap lands feeds this long.
+    int maxSwapSamples() const noexcept { return convolution_.maxSwapSamples (2); }
 
     // Message thread, driven by the reload poll. If a load was rejected while the convolver was
     // mid-crossfade, retry it now from the retained taps. Returns true when nothing is pending.
