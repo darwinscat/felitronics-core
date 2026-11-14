@@ -25,8 +25,10 @@
 >
 > **🟡 What is actually still open** is one named thing, not the item as a whole: the **worst-buffer spike**
 > — all stages' FFTs coincide every `lcm = B_max` samples (7.8 % @ block 64 for `B_max=4096`; `B_max=2048`
-> is the default because it halves the spike at the same mean). Time-distributing the large FFTs over their
-> deadline is the RT-hardening that closes it. Separately and permanently NOT a goal: JUCE stays cheaper on
+> is the default because it halves the spike at the same mean). Its biggest part for a long IR is CLOSED since
+> v0.65.0 (#270): the `B_max` stage's spectral MACs are spread across the hop, and a swap's priming over one hop,
+> for an operator at or above `kSpreadFromMacs` — `MatrixConvolverNupc`'s COST NOTE. What still coincides is the
+> stages' own FFTs, and below the threshold the old burst (at most about 3 × 255 MACs in a swap's call). Separately and permanently NOT a goal: JUCE stays cheaper on
 > the *mean* at large oracle-tuned blocks — that is a theorem, the price of near-field zero-latency
 > coverage, not a gap to chase. [`PERF-CONVOLVER-JUCE-GAP.md`](PERF-CONVOLVER-JUCE-GAP.md) ·
 > [`PERF-NUPC-VS-JUCE.md`](PERF-NUPC-VS-JUCE.md).

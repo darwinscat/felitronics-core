@@ -14,11 +14,16 @@ topology reads — reaches `kSpreadFromMacs` (256 MACs a hop).
   alone, and its fade starts one hop (2048 samples, 43 ms at 48 kHz) after the pickup. Over a cold history (nothing
   through that stage since `prepare()` or `clearAudioState()`) the fade starts at once.
 - **Output.** A spread operator's sum is taken in another order, so its output differs from the unspread one by
-  float noise. Below the threshold everything runs as before, to the bit and with an immediate fade: at 44.1 and
-  48 kHz that is every cabinet and every lineareq EQ in the tree.
+  float noise. Below the threshold everything runs as before, to the bit and with an immediate fade. That is every
+  lineareq EQ at every rate (its FIR length is in samples: at most 252 MACs a hop), and every cabinet at 44.1 and
+  48 kHz (a 5 s two-bank cap: 232).
+- **The price of the threshold.** Just under it the old burst stays: an unspread swap's first call can prime the
+  whole stage and recompute both slots at a boundary, about 3 × 255 MACs. That is now the worst call in the tree
+  (lineareq's maximum quality in Full, a 5 s cabinet at 48 kHz), bought on purpose to keep those outputs to the bit
+  and their swaps on time; the measured edge is below.
 - **New API.**
-  - `maxSwapSamples()` (also on `CabConvolver`): the most samples a swap can take, the crossfade plus a hop where
-    the geometry can spread.
+  - `maxSwapSamples (numBanks = 4)` (and `CabConvolver::maxSwapSamples()`, which asks for its two banks): the most
+    samples a swap can take, the crossfade plus a hop where an operator of that many banks could spread at this cap.
   - The threshold is the class's second template parameter, `MatrixConvolverNupc<Fft, SpreadFromMacs = 256>`, a
     test seam.
 - **Memory.** `prepare()` adds the spread state, 96 KiB at most, only where a cap-length operator could spread.

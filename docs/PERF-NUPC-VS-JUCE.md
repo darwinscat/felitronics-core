@@ -66,7 +66,8 @@ host buffer, shown only to characterise) that single worst buffer can exceed rea
 > only *adds* time, so a tight spread means the mean equals the true cost, and the median tracked the mean. (2) On a
 > hybrid CPU (the 13900H) pin the bench to a performance core — an E-core reads ~2× slower. (3) JUCE's tiny-block cost
 > still carries a few-% run-to-run variance (e.g. M5 @16 measured 96–108 % across runs). (4) The `B_max=2048` cap
-> bounds the worst-buffer spike (a smaller cap trims it; time-distributed scheduling is the planned RT hardening).
+> bounds the worst-buffer spike (a smaller cap trims it; since v0.65.0 the `B_max` stage's MACs are spread across the
+> hop for long IRs, #270).
 
 ## Per topology (all flat, block-independent)
 
@@ -89,8 +90,9 @@ MSDiag / Full add the ½(X_L±X_R) view / the 4-bank cross sums — a modest, fl
   `P=maxBlock`) — surrendering the thing it structurally cannot do.
 - **The worst-buffer spike.** Every stage's FFT coincides once per `lcm = B_max` samples; at tiny blocks that one
   buffer is expensive (LRDiag ~25 % of a single 64-sample buffer, dropping to ~1 % by block 512). The *mean* is
-  flat ~0.62 %; the spike is bounded and < 100 % (no xrun on its own). Distributing the large FFTs over their
-  deadline (time-distributed scheduling) is a later-phase RT-hardening; a smaller `B_max` already trims it.
+  flat ~0.62 %; the spike is bounded and < 100 % (no xrun on its own). Since v0.65.0 the `B_max` stage's MACs —
+  the spike's bulk for a long IR — are spread across the hop for an operator at or above `kSpreadFromMacs` (#270);
+  the stages' FFTs still coincide, and a smaller `B_max` trims that part.
 - **Variable buffers — the real-world edge.** JUCE's cost tracks the *actual* block: prepared for maxBlock=8192
   but fed 256, it stays zero-latency yet pays 2.67 % (worse than its own 256-tuned 2.00 %). NUPC is flat ~0.62 %
   from one prepare — cheaper and steadier for a host that delivers small or variable buffers.

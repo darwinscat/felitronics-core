@@ -5,9 +5,10 @@
 **Status: COMPLETE — acceptance bar MET, every phase landed.** The Phase-1 result below is the mono/LRDiag
 `NonUniformConvolver` primitive; the later phases it promised have since shipped too, in
 `MatrixConvolverNupc` — all topologies (mono / LRDiag / MSDiag / Full) plus the click-free 2-slot smoothstep
-warm crossfade — and `lineareq`'s linear- and natural-phase EQs convolve on it. One RT-hardening remains
-open and is named at the end of the Phase-1 result: time-distributing the large FFTs so the worst-buffer
-spike (all stages coinciding every `lcm = B_max` samples) stops being bounded-but-lumpy. The original #1
+warm crossfade — and `lineareq`'s linear- and natural-phase EQs convolve on it. The RT-hardening named at the
+end of the Phase-1 result — the worst-buffer spike, all stages coinciding every `lcm = B_max` samples — is closed
+for long IRs since v0.65.0 (#270): the `B_max` stage's MACs are spread across the hop for an operator at or above
+`kSpreadFromMacs`. The stages' own FFTs still coincide. The original #1
 debt (scalar-FFT + O(P) direct-head cost
 that EXPLODED with the host block) is RESOLVED by #23–#26 (SIMD pffft backend + fixed `P=128` → block-
 independent). This document records a
@@ -111,8 +112,8 @@ on top of it as `MatrixConvolverNupc`; the numbers below are the primitive's and
 - **The worst-buffer spike** (all stages' FFTs coincide every `lcm=B_max` samples) is the RT trade-off: bounded,
   worst at tiny blocks (7.8% @block 64 for `B_max=4096`). A `B_max` sweep shows the *mean* is flat ~0.8% for any
   `B_max`, but the spike grows with `B_max` (block 64: `B_max=2048`→6.4%, `4096`→7.9%, `8192`→12%) — so
-  **`B_max=2048` is the small-block default** (same mean, smaller spike). Distributing the large FFTs over their
-  deadline (time-distributed scheduling) is a later-phase RT-hardening.
+  **`B_max=2048` is the small-block default** (same mean, smaller spike). The time-distributed schedule for the
+  `B_max` stage's MACs landed in v0.65.0 (#270) for operators at or above `kSpreadFromMacs`; the FFTs still coincide.
 
 **Correctness:** NULL-verified sample-by-sample vs a direct time-domain convolution AND the proven
 `PartitionedConvolver` (rel ~2e-7); true zero latency proven by an impulse (in → IR out, no shift); a pffft-vs-
