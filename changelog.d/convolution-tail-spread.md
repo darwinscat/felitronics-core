@@ -6,7 +6,7 @@ true-stereo (Full) IR at 48 kHz that is 1872, and a swap's first call primed eve
 (#270). The worst call outgrew a 64-sample block on an Intel i9 core and, in a swap, a 128-sample one.
 
 Now that stage is **spread** for an operator whose deferred work there — (P − 1) partitions times the banks its
-topology reads — reaches `kSpreadFromMacs` (256 MACs a hop).
+topology reads — reaches `kSpreadFromMacs` (64 MACs a hop).
 - **The schedule.** For the hop ahead, every product with j ≥ 1 reads history that is already final. Those products
   are accumulated through the hop on a schedule of sample positions, so the work and its order never depend on how
   the host slices the stream. The boundary adds only j = 0 and inverts.
@@ -14,17 +14,18 @@ topology reads — reaches `kSpreadFromMacs` (256 MACs a hop).
   alone, and its fade starts one hop (2048 samples, 43 ms at 48 kHz) after the pickup. Over a cold history (nothing
   through that stage since `prepare()` or `clearAudioState()`) the fade starts at once.
 - **Output.** A spread operator's sum is taken in another order, so its output differs from the unspread one by
-  float noise. Below the threshold everything runs as before, to the bit and with an immediate fade. That is every
-  lineareq EQ at every rate (its FIR length is in samples: at most 252 MACs a hop), and every cabinet at 44.1 and
-  48 kHz (a 5 s two-bank cap: 232).
-- **The price of the threshold.** Just under it the old burst stays: an unspread swap's first call can prime the
-  whole stage and recompute both slots at a boundary, about 3 × 255 MACs. That is now the worst call in the tree
-  (lineareq's maximum quality in Full, a 5 s cabinet at 48 kHz), bought on purpose to keep those outputs to the bit
-  and their swaps on time; the measured edge is below.
+  float noise (about 1e-7 of the peak). Below the threshold everything runs as before, to the bit and with an
+  immediate fade: an operator under 17 partitions of that stage in Full (34816 taps), 33 in LRDiag or MSDiag
+  (67584 taps: a cabinet up to 1.41 s at 48 kHz, 0.70 s at 96 kHz), 65 mono. lineareq's two top qualities in Full
+  (65536 and 131072 taps) and its top one in LRDiag / MSDiag now spread: a band move lands a hop (43 ms at 48 kHz)
+  later, beside the 0.7–1.4 s of latency those qualities carry anyway.
+- **Why 64.** Below it a stage's deferred work is too small to be worth a hop of delay. Just under it the old burst
+  stays, about 3 × 63 MACs in an unspread swap's first call — the worst call left in the tree, and a small one
+  (measured below).
 - **New API.**
   - `maxSwapSamples (numBanks = 4)` (and `CabConvolver::maxSwapSamples()`, which asks for its two banks): the most
     samples a swap can take, the crossfade plus a hop where an operator of that many banks could spread at this cap.
-  - The threshold is the class's second template parameter, `MatrixConvolverNupc<Fft, SpreadFromMacs = 256>`, a
+  - The threshold is the class's second template parameter, `MatrixConvolverNupc<Fft, SpreadFromMacs = 64>`, a
     test seam.
 - **Memory.** `prepare()` adds the spread state, 96 KiB at most, only where a cap-length operator could spread.
 
@@ -41,19 +42,20 @@ where a loader publishes growing, shrinking and topology-changing operators besi
 **tools.** `fcore_convburst` measures the worst call against the block's budget, out of a swap and through one, with
 its 99.9th percentile and how long a swap keeps the convolver busy.
 
-Measured with `fcore_convburst`: worst `process()` call, 20 s Full IR under a 20 s cap at 48 kHz, 50 ms fade, pffft.
+Measured with `fcore_convburst`: the worst `process()` call as a share of the block's budget (its 99.9th percentile in
+parentheses), Full IR under a 20 s cap at 48 kHz, 50 ms fade, pffft. "Before" is v0.64.0.
 
-| machine | block | idle, before → after | swap, before → after |
-|---|---|---|---|
-| Apple M5 Pro | 64 | 64 % → 6.3 % | 190 % → 12.7 % |
-| Apple M5 Pro | 128 | 33 % → 4.8 % | 105 % → 10.0 % |
-| Intel i9-13900H (unpinned) | 64 | 174 % → 10 % | 460 % → 18 % |
-| Intel i9-13900H (unpinned) | 128 | 77 % → 12.5 % | 245 % → 18 % |
-| Intel i9-13900H (E-core) | 128 | — → 26 % | — → 36 % |
+| machine | IR | block | idle, before → after | swap, before → after |
+|---|---|---|---|---|
+| Apple M5 Pro | 20 s | 64 | 64 % → 6.3 % (4.6 %) | 190 % → 12.7 % (10.1 %) |
+| Apple M5 Pro | 20 s | 128 | 33 % → 4.8 % (4.2 %) | 105 % → 10.0 % (9.0 %) |
+| Intel i9-13900H, unpinned | 20 s | 64 | 174 % → 33 % (9 %) | 460 % → 41 % (19 %) |
+| Intel i9-13900H, unpinned | 20 s | 128 | 77 % → 19 % (8 %) | 245 % → 23 % (21 %) |
+| Intel i9-13900H, E-core | 20 s | 128 | — → 26 % (16 %) | — → 37 % (32 %) |
+| Intel i9-13900H, E-core | 2 s | 64 | — → 10 % (8 %) | 69 % → 16 % (14 %) |
+| Intel i9-13900H, E-core | 34816 taps, just under | 64 | — → 17 % (13 %) | — → 31 % (30 %) |
+| Intel i9-13900H, E-core | 36864 taps, just over | 64 | — → 10 % (8 %) | — → 16 % (13 %) |
 
-A swap of such an IR keeps the convolver busy 93 ms (the 50 ms fade and the one-hop preparation); the 2 s IR is under
-the threshold, swaps in 50.7 ms as before, and its worst call is 19 % of a 64-sample block on the M5, 34 % on the i9.
-
-The threshold's edge for Full at 48 kHz (same tool and conditions, Intel i9-13900H, block 64, worst call in a swap):
-133120 taps (P = 64, 252 MACs a hop: the old path, busy 50.7 ms) read 48 % of the budget unpinned and 97 % on an
-E-core; 135168 taps (P = 65, 256: spread, busy 93.3 ms) read 8 % and 17 %.
+A spread operator's swap keeps the convolver busy 93 ms (the 50 ms fade and the one-hop preparation); one under the
+threshold, 50.7 ms as before. The i9's isolated maxima of about 0.4 ms against a far lower 99.9th percentile recur on
+idle rows too and are the shared machine, not the code: the work per call is bounded by the test suite's counts.
