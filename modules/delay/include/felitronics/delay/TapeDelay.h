@@ -487,6 +487,15 @@ public:
         if (nch > 0)
             aimWidth (nch == 1);
 
+        // AT REST: every head on its target and every ramp landed. The setters run between calls and nothing
+        // inside one moves a target, so heads at rest stay at rest to the call's end, and stepHeads() would be
+        // an exact no-op on every sample of it (a snap onto the target a head stands on, a glide of zero that
+        // lands where it is, ramps that are done) — skipped. And when the one head sounding is a 1x head at a
+        // gain of exactly 1 on every side the call reads — the default layout — the heads play the loop's own
+        // tap, which is what the general sum would make of it.
+        const bool atRest = headsAtRest();
+        const bool plain  = atRest && plainLoopHead (nch);
+
         const float tgtOff[2] = {
             offsetMs < 0.0f ? -offsetMs * 0.001f * (float) sampleRate : 0.0f,
             offsetMs > 0.0f ?  offsetMs * 0.001f * (float) sampleRate : 0.0f,
@@ -510,7 +519,8 @@ public:
             for (int i = 0; i < numSamples; ++i)
             {
                 glide (currentDelay, tgtDelay, glideCoeff);
-                stepHeads();   // ...and so do the heads' positions and gains
+                if (! atRest)
+                    stepHeads();   // ...and so do the heads' positions and gains
             }
 
             feedPos_ = feedAfter (numSamples, feed);   // the door travels on, as through silence
@@ -545,11 +555,12 @@ public:
             // sample, shared by the channels like the motor. A head at 1x reads where the loop does, so it is
             // the loop's own tap; any other stands at position x the motor's glided time, floored at one sample
             // like the motor, and reads with the loop tap's own arithmetic below.
-            stepHeads();
+            if (! atRest)
+                stepHeads();
             int   h0[kMaxHeads] {}, h1[kMaxHeads] {};
             float hf[kMaxHeads] {};
             bool  hLoop[kMaxHeads] {};
-            for (int k = 0; k < kMaxHeads; ++k)
+            for (int k = 0; k < kMaxHeads && ! plain; ++k)
             {
                 hLoop[k] = headPos_[k] >= 1.0;   // the glide never overshoots its target, and no target is past 1
                 if (hLoop[k] || ! (headGain_[k][0] > 0.0f || headGain_[k][1] > 0.0f))
@@ -600,9 +611,9 @@ public:
                 // (law 8: a landed ramp still scales, and a tiny product would reach the offset line's band). The
                 // sum starts from the first contribution; with none, the heads play +0 and the loop runs on. A
                 // mono call reads side 0, which aimWidth has aimed at each head's level.
-                float heard = 0.0f;
+                float heard = plain ? tap : 0.0f;
                 bool  sounding = false;
-                for (int k = 0; k < kMaxHeads; ++k)
+                for (int k = 0; k < kMaxHeads && ! plain; ++k)
                 {
                     const float g = headGain_[k][ch];
                     if (! (g > 0.0f))
@@ -825,6 +836,39 @@ private:
                                                                          from);
             }
         }
+    }
+
+    /** Every head standing on its target and every ramp landed — see AT REST in process(). */
+    bool headsAtRest() const noexcept
+    {
+        for (int k = 0; k < kMaxHeads; ++k)
+            if (! detail::sameValue (headPos_[k], (double) headWant_[k].position)
+                || headGainLeft_[k][0] != 0 || headGainLeft_[k][1] != 0)
+                return false;
+        return true;
+    }
+
+    /** Exactly one head sounds on the sides a call of `nch` channels reads (side 0 alone in a mono call), it reads
+        where the loop does (position 1), and it plays them at a gain of exactly 1; every other head is silent on
+        them. Then the heads' sum is the loop's tap, unscaled. */
+    bool plainLoopHead (int nch) const noexcept
+    {
+        int unity = 0;
+        for (int k = 0; k < kMaxHeads; ++k)
+        {
+            bool silent = true, one = headPos_[k] >= 1.0;
+            for (int s = 0; s < nch && s < 2; ++s)
+            {
+                const float g = headGain_[k][s];
+                silent = silent && ! (g > 0.0f);
+                one    = one && g >= 1.0f && g <= 1.0f;
+            }
+            if (one)
+                ++unity;
+            else if (! silent)
+                return false;
+        }
+        return unity == 1;
     }
 
     /** A, the tail's first-echo level: the sum over the heads of level x the louder side gain — at least the

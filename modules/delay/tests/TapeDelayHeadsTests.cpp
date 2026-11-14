@@ -314,6 +314,59 @@ void placement()
 }
 
 //==============================================================================
+// 2a · STACKED HEADS ADD — two, then every head, at 1x, level 1, centre: each plays the loop's own tap, and the
+//      heads play their sum in index order. The default layout's fast path (one 1x head at unity IS the tap) must
+//      not take two such heads for one.
+//==============================================================================
+void stackedHeads()
+{
+    group ("stacked heads add: two, then every head, at 1x, level 1, centre — the frozen one-head wet summed, byte for byte");
+    if (! haveHeads (2, "stacked heads"))
+        return;
+
+    constexpr double sr = 48000.0;
+    constexpr int D = 14400, L = 2000, N = 2 * D + 1200;
+    const Planes in = burst (N, L, 31u, 0.8f, false);
+
+    frz::TapeDelay then;
+    test::run (then.prepare (sr, 512, 2));
+    then.setParams (frozenKnobs (300.0f, 0.6f, 1500.0f, 0.0f, 1.0f));
+    Planes wetD = in;
+    test::run (renderBlocks (then, wetD, 512));
+
+    for (int count : { 2, kHeads })
+    {
+        Heads h {};
+        for (int k = 0; k < count; ++k)
+            h[(std::size_t) k] = { 1.0f, 1.0f, 0.0f };
+
+        delay::TapeDelay now;
+        test::run (now.prepare (sr, 512, 2));
+        now.setParams (knobs (300.0f, 0.6f, 1500.0f, 0.0f, 1.0f, h));
+        Planes out = in;
+        test::run (renderBlocks (now, out, 512));
+
+        // After the burst the dry is silent and OFFSET is 0, so the output IS what the heads played: each head's
+        // contribution is the loop's tap (a gain of exactly 1), summed in index order — computed here from the
+        // frozen class's own output.
+        bool all = true, heard = false;
+        for (int ch = 0; ch < 2; ++ch)
+            for (int i = L; i < N; ++i)
+            {
+                const float t = get (wetD[(std::size_t) ch], i);
+                float want = t;
+                for (int k = 1; k < count; ++k)
+                    want = want + t;
+                all = all && same (get (out[(std::size_t) ch], i), want);
+                heard = heard || std::fabs (t) > 1.0e-3f;
+            }
+        // Catches: the fast path taking stacked unity heads for the one default head (they would play one tap).
+        ok (all && heard, std::to_string (count) + " heads at 1x, level 1, centre: the frozen wet summed "
+                          + std::to_string (count) + " times in index order, both lines, byte for byte");
+    }
+}
+
+//==============================================================================
 // 2 · THE TRIPLET FIGURE — three shifted copies, each scaled, rounded once, flushed, summed in index order
 //==============================================================================
 void tripletFigure()
@@ -1665,6 +1718,7 @@ int main()
 {
     std::printf ("felitronics::delay::TapeDelay — the playback heads (%d)\n", kHeads);
     placement();
+    stackedHeads();
     tripletFigure();
     pingPong();
     panLaw();
