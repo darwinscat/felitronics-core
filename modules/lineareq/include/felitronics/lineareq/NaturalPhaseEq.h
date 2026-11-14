@@ -144,7 +144,7 @@ public:
             return conv_.setIr (fir_[0].data(), L_);
         }
 
-        using Topo = Conv::Topology;
+        using Topo = typename Conv::Topology;
         const eq::MatrixBasis basis = eq::detectBasis (bands, numBands);
         Topo topo = Topo::MSDiag;
         int  numBanks = 2;
