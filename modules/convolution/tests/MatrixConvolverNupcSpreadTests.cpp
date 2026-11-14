@@ -740,11 +740,11 @@ long long belowThreshold (const char* be)
     using CF = CountingFft<Fft>;
     using C = convolution::MatrixConvolverNupc<CF>;
     using F = convolution::frozen::MatrixConvolverNupc<CF>;
-    constexpr int L = 960, len = 96000;   // 2 s at 48 kHz
+    constexpr int L = 960, len = 30000;   // 0.625 s at 48 kHz: 14 partitions in the last stage, (14 - 1) * 4 = 52
     const int P = partsOf (len, kBigCap);
     test::ok (! spreads (len, 4, kBigCap, C::kSpreadFromMacs) && ! spreads (len, 2, kBigCap, C::kSpreadFromMacs)
               && spreads (kBigCap, 4, kBigCap, C::kSpreadFromMacs),
-              std::string (be) + " 2 s operators are under the threshold (P = " + std::to_string (P) + ": " + std::to_string ((P - 1) * 4)
+              std::string (be) + " 30000-tap operators are under the threshold (P = " + std::to_string (P) + ": " + std::to_string ((P - 1) * 4)
               + " < " + std::to_string (C::kSpreadFromMacs) + ") at a cap that can spread");
     const std::vector<Op> ops { makeOp (Topo::Full, len, 91), makeOp (Topo::Full, len, 92), makeOp (Topo::MS, len, 93) };
     // A clear mid-fade, a reset mid-fade, an adoption by reset() before any process(), a clear on a publish sample.
@@ -806,8 +806,9 @@ long long belowThreshold (const char* be)
 //==============================================================================
 
 // THE THRESHOLD'S EDGE, at the shipping value: one partition below it runs the old path (the burst at the boundary,
-// an immediate fade), one partition more spreads (no burst, the fade a hop later). Full: (P-1)*4 = 252 against 256;
-// LRDiag: (P-1)*2 = 254 against 256 — the 264192 taps CabConvolver's comment states. A new operator published
+// an immediate fade), one partition more spreads (no burst, the fade a hop later). The edge is computed from the
+// threshold itself: at 64, Full (P-1)*4 = 60 against 64 (34816 / 36864 taps), LRDiag (P-1)*2 = 62 against 64 (67584 /
+// 69632 taps, the length CabConvolver's comment states). A new operator published
 // while the spread one is being prepared is refused, and the convolver says it is busy.
 template <class Fft>
 long long thresholdEdge (const char* be)
@@ -816,8 +817,12 @@ long long thresholdEdge (const char* be)
     constexpr int xfade = 64;
     long long allocs = 0;
     struct Edge { Topo topo; int cap, below, at; };
-    const Edge edges[] { { Topo::Full, kB + 65 * kB, kB + 64 * kB, kB + 65 * kB },
-                         { Topo::LR,   kB + 129 * kB, kB + 128 * kB, kB + 129 * kB } };
+    auto edgeOf = [] (Topo t)   // the fewest partitions P with (P - 1) * banks >= the threshold, and one fewer
+    {
+        const int nb = banksOf (t), at = (C::kSpreadFromMacs + nb - 1) / nb + 1;
+        return Edge { t, kB + at * kB, kB + (at - 1) * kB, kB + at * kB };
+    };
+    const Edge edges[] { edgeOf (Topo::Full), edgeOf (Topo::LR) };
     for (const Edge& e : edges)
         for (int len : { e.below, e.at })
         {

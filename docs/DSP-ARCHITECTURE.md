@@ -28,7 +28,7 @@
 > is the default because it halves the spike at the same mean). Its biggest part for a long IR is CLOSED since
 > v0.65.0 (#270): the `B_max` stage's spectral MACs are spread across the hop, and a swap's priming over one hop,
 > for an operator at or above `kSpreadFromMacs` — `MatrixConvolverNupc`'s COST NOTE. What still coincides is the
-> stages' own FFTs, and below the threshold the old burst (at most about 3 × 255 MACs in a swap's call). Separately and permanently NOT a goal: JUCE stays cheaper on
+> stages' own FFTs, and below the threshold the old burst (at most about 3 × 63 MACs in a swap's call). Separately and permanently NOT a goal: JUCE stays cheaper on
 > the *mean* at large oracle-tuned blocks — that is a theorem, the price of near-field zero-latency
 > coverage, not a gap to chase. [`PERF-CONVOLVER-JUCE-GAP.md`](PERF-CONVOLVER-JUCE-GAP.md) ·
 > [`PERF-NUPC-VS-JUCE.md`](PERF-NUPC-VS-JUCE.md).

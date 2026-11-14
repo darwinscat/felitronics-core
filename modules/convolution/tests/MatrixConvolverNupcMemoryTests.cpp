@@ -579,7 +579,8 @@ void checkMemory (const char* backend)
         test::ok (again == againO, be + " a re-prepare at the same geometry requests the whole history and the spread state again (" + std::to_string (again)
                                    + " B, oracle " + std::to_string (againO) + ")");
         test::ok (ok1 && swapAgain == 4 * growthO (sch, 0, cap), be + " ...and the next swap requests the bank bytes again (" + std::to_string (swapAgain) + " B)");
-        test::ok (down == fdlO (schSmall, 2), be + " a re-prepare to a smaller cap requests the smaller history exactly (" + std::to_string (down) + " B)");
+        const long long downO = fdlO (schSmall, 2) + spreadStateO (schSmall, 2, C::kSpreadFromMacs);
+        test::ok (down == downO, be + " a re-prepare to a smaller cap requests the smaller history and spread state exactly (" + std::to_string (down) + " B, oracle " + std::to_string (downO) + ")");
         test::ok (ok2 && swapDown == 4 * growthO (schSmall, 0, small), be + " ...and its first swap the smaller banks (" + std::to_string (swapDown) + " B)");
     }
 
@@ -590,7 +591,7 @@ void checkMemory (const char* backend)
     // nothing else differs between the two re-prepares; at a larger cap the spread state's own releases covered a
     // kept right channel (found in review).
     {
-        const int capNoSpread = 48000;
+        const int capNoSpread = 30000;   // 14 partitions in the last stage: 13 * 4 = 52, under the threshold
         const std::vector<StageO> schNo = scheduleOracle<Fft> (P0, capNoSpread);
         test::ok (spreadStateO (schNo, 2, C::kSpreadFromMacs) == 0, be + " the release fixture's cap has no spread state");
         C fromStereo;

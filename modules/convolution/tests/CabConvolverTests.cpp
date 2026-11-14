@@ -1117,15 +1117,15 @@ int main()
     }
 
     // maxSwapSamples(): the 50 ms crossfade, plus one 2048-sample hop only where a two-bank IR at this cap could be
-    // spread (this class stages LRDiag only). A 5 s cap at 48 kHz cannot spread a two-bank IR (232 MACs a hop, under
-    // 256), so its swaps land in the fade; at 96 kHz the same cap can (466), and the bound adds the hop.
+    // spread (this class stages LRDiag only). A 1 s cap at 48 kHz cannot spread a two-bank IR (22 partitions in the
+    // last stage: 42 MACs a hop, under 64), so its swaps land in the fade; a 5 s cap can (232), and the bound adds the hop.
     test::group ("maxSwapSamples: the fade, plus a hop only where a two-bank IR can spread");
     {
-        CabConvolver at48, at96;
-        felitronics::test::run (at48.prepare (48000.0, 512, 2, 5.0));
-        felitronics::test::run (at96.prepare (96000.0, 512, 2, 5.0));
-        test::ok (at48.maxSwapSamples() == 2400, "5 s cap at 48 kHz: the fade alone (" + std::to_string (at48.maxSwapSamples()) + ")");
-        test::ok (at96.maxSwapSamples() == 4800 + 2048, "5 s cap at 96 kHz: the fade and a hop (" + std::to_string (at96.maxSwapSamples()) + ")");
+        CabConvolver short48, long48;
+        felitronics::test::run (short48.prepare (48000.0, 512, 2, 1.0));
+        felitronics::test::run (long48.prepare (48000.0, 512, 2, 5.0));
+        test::ok (short48.maxSwapSamples() == 2400, "1 s cap at 48 kHz: the fade alone (" + std::to_string (short48.maxSwapSamples()) + ")");
+        test::ok (long48.maxSwapSamples() == 2400 + 2048, "5 s cap at 48 kHz: the fade and a hop (" + std::to_string (long48.maxSwapSamples()) + ")");
     }
 
     return test::report();

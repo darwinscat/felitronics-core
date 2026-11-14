@@ -75,10 +75,11 @@ namespace felitronics::convolution
 // So for each sample it processes a call carries at most three sums' share of units (the live slot's; in a swap,
 // the incoming slot's first-hop and own sums too) plus, at a boundary, the j = 0 products and the inverses.
 // maxSwapSamples() says how long a swap can take.
-// THE PRICE OF THE THRESHOLD: just under it the old path stays, burst and all — an unspread swap's first call can
-// prime the whole stage and recompute both slots at a boundary, about 3 x 255 MACs. That is the worst call left in
-// the tree (lineareq's maximum quality in Full, a 5 s cabinet at 48 kHz), bought on purpose: those operators keep
-// their output to the bit and their swaps their timing. fcore_convburst measures the edge.
+// THE THRESHOLD, 64 MACs a hop: an operator of fewer than 17 partitions there in Full (34816 taps), 33 in LRDiag or
+// MSDiag (67584 taps), 65 mono, runs the old path — its output to the bit and its swap at once — because its work
+// there is too small to be worth a hop of delay. Just under it an unspread swap's first call can prime the whole
+// stage and recompute both slots at a boundary, about 3 x 63 MACs: the worst call left in the tree, a small one.
+// fcore_convburst measures the edge.
 //
 // MEMORY NOTE. The same split. The shared FDL is sized to maxIrSamples at prepare(), because it is ONE history
 // that both slots read: a new operator answers the last maxIrSamples of input at once, which is what keeps a
@@ -90,7 +91,7 @@ namespace felitronics::convolution
 // per channel (~16 B stereo); a sample of loaded IR costs ~8 B per bank, in each slot that holds it.
 //
 // RT-safe: prepare()/setOperator() allocate (message thread); process() is alloc/lock/throw-free, zero latency.
-template <core::fft::RealFftBackend Fft = core::fft::DefaultRealFft, int SpreadFromMacs = 256>
+template <core::fft::RealFftBackend Fft = core::fft::DefaultRealFft, int SpreadFromMacs = 64>
 class MatrixConvolverNupc
 {
 public:

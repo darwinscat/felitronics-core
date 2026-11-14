@@ -116,9 +116,9 @@ int main (int argc, char** argv)
     felitronics::core::ScopedFlushToZero ftz;
     const double seconds = argc > 1 ? std::atof (argv[1]) : 20.0;
     std::printf ("MatrixConvolverNupc worst process() call: Full, cap 20 s, 48 kHz, 50 ms fade — out of a swap, and from publish to the fade's end\n");
-    // 2.773 s and 2.816 s are the threshold's edge for Full at 48 kHz: 133120 taps (P = 64, 252 MACs a hop, the old
-    // path — the worst unspread swap in the tree, lineareq's maximum) and 135168 (P = 65, 256, spread).
-    for (double irSec : { 20.0, 4.0, 133120.0 / 48000.0, 135168.0 / 48000.0, 2.0 })
+    // 0.725 s and 0.768 s are the threshold's edge for Full at 48 kHz: 34816 taps (P = 16, 60 MACs a hop, the old
+    // path — the worst unspread swap in the tree) and 36864 (P = 17, 64, spread).
+    for (double irSec : { 20.0, 4.0, 2.0, 34816.0 / 48000.0, 36864.0 / 48000.0 })
         for (int block : { 64, 128, 256 })
         {
 #if defined(FELITRONICS_WITH_PFFFT)

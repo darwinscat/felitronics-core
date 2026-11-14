@@ -57,8 +57,8 @@
 // build all allocate). MatrixConvolverNupc::setIr()/setOperator() build synchronously into the INACTIVE
 // slot then publish; process() picks up the new operator and crossfades it in over ~50 ms (click-free), so
 // a live swap never touches the audio thread's active operator. An IR long enough for the convolver to spread
-// its last stage (MatrixConvolverNupc's COST NOTE; for this class's two banks, longer than 264192 taps: 5.5 s at
-// 48 kHz, 2.75 s at 96 kHz) starts that fade one 2048-sample hop after the pickup instead; maxSwapSamples()
+// its last stage (MatrixConvolverNupc's COST NOTE; for this class's two banks, longer than 67584 taps: 1.41 s at
+// 48 kHz, 0.70 s at 96 kHz) starts that fade one 2048-sample hop after the pickup instead; maxSwapSamples()
 // states the worst case. While a crossfade is in flight the convolver
 // REJECTS a new load (returns false) — we retain the staged taps and retry on the reload poll (flushPending),
 // latest-wins (coalescing). Zero latency — latencySamples() == 0.
@@ -271,7 +271,7 @@ public:
 
     // The most samples a handed-over IR can take to land, from the process() call that picks it up: the 50 ms
     // crossfade, plus one B_max hop when the cap is long enough for a two-bank IR to be spread — this class stages
-    // LRDiag only, so it asks for two banks (MatrixConvolverNupc::maxSwapSamples()). Below about 5.5 s of cap at
+    // LRDiag only, so it asks for two banks (MatrixConvolverNupc::maxSwapSamples()). Below about 1.4 s of cap at
     // 48 kHz that is the crossfade alone. A caller that feeds silence until a swap lands feeds this long.
     int maxSwapSamples() const noexcept { return convolution_.maxSwapSamples (2); }
 
