@@ -32,14 +32,20 @@ namespace
 {
 struct Lcg { unsigned long long s; float next() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return (float) ((s >> 40) & 0xffff) / 32768.0f - 1.0f; } };
 
-struct Worst { double meanUs = 0.0, maxUs = 0.0; long calls = 0; };
+struct Worst { double meanUs = 0.0, p999Us = 0.0, maxUs = 0.0; long calls = 0; };
 
-Worst worstOf (const std::vector<double>& t)
+// The maximum, and the 99.9th percentile beside it: on a laptop an isolated maximum can be the machine (an
+// interrupt, a frequency step) rather than the code, and the two together say which.
+Worst worstOf (std::vector<double> t)
 {
     Worst w; w.calls = (long) t.size();
+    if (t.empty()) return w;
     double sum = 0.0;
-    for (double v : t) { sum += v; w.maxUs = std::max (w.maxUs, v); }
-    if (! t.empty()) w.meanUs = sum / (double) t.size();
+    for (double v : t) sum += v;
+    w.meanUs = sum / (double) t.size();
+    std::sort (t.begin(), t.end());
+    w.p999Us = t[(std::size_t) std::min ((double) t.size() - 1.0, std::floor (0.999 * (double) t.size()))];
+    w.maxUs = t.back();
     return w;
 }
 
@@ -84,20 +90,24 @@ void row (const char* backend, double sr, double capSec, double irSec, int block
     for (long c = 0; c < calls; ++c) idle.push_back (call());
 
     std::vector<double> swap;
+    long busyCalls = 0, busyMax = 0;
     const int swaps = std::max (8, (int) (seconds * sr / (xfade + 8192)));
     for (int k = 0; k < swaps; ++k)
     {
         (void) mc.setOperator (C::Topology::Full, banks, 4, len);   // the message thread's work: untimed
-        do swap.push_back (call()); while (mc.isBusy());
+        long busy = 0;
+        do { swap.push_back (call()); ++busy; } while (mc.isBusy());
+        busyCalls += busy; busyMax = std::max (busyMax, busy);
         const int gap = 1 + (int) ((unsigned) (r.next() * 1000.0f + 1000.0f) % 2048u);   // the next publish at another phase
         for (int s = 0; s < gap; s += block) (void) call();
     }
 
     const Worst a = worstOf (idle), f = worstOf (swap);
-    const double budget = 1e6 * block / sr;
-    std::printf ("  %-6s %5.1f kHz  IR %4.1f s  block %4d  budget %7.1f us | idle mean %6.1f  max %7.1f us (%5.1f%%) | swap mean %6.1f  max %7.1f us (%5.1f%%)  [%ld/%ld calls]\n",
-                 backend, sr / 1000.0, irSec, block, budget, a.meanUs, a.maxUs, 100.0 * a.maxUs / budget,
-                 f.meanUs, f.maxUs, 100.0 * f.maxUs / budget, a.calls, f.calls);
+    const double budget = 1e6 * block / sr, ms = 1e3 * block / sr;
+    std::printf ("  %-6s IR %4.1f s  block %4d (budget %6.1f us) | idle mean %6.1f p99.9 %7.1f max %7.1f us (%5.1f%%) | swap mean %6.1f p99.9 %7.1f max %7.1f us (%5.1f%%) | busy %5.1f ms mean, %5.1f max\n",
+                 backend, irSec, block, budget, a.meanUs, a.p999Us, a.maxUs, 100.0 * a.maxUs / budget,
+                 f.meanUs, f.p999Us, f.maxUs, 100.0 * f.maxUs / budget,
+                 ms * (double) busyCalls / (double) swaps, ms * (double) busyMax);
 }
 } // namespace
 
