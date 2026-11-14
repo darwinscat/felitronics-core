@@ -104,7 +104,7 @@ void row (const char* backend, double sr, double capSec, double irSec, int block
 
     const Worst a = worstOf (idle), f = worstOf (swap);
     const double budget = 1e6 * block / sr, ms = 1e3 * block / sr;
-    std::printf ("  %-6s IR %4.1f s  block %4d (budget %6.1f us) | idle mean %6.1f p99.9 %7.1f max %7.1f us (%5.1f%%) | swap mean %6.1f p99.9 %7.1f max %7.1f us (%5.1f%%) | busy %5.1f ms mean, %5.1f max\n",
+    std::printf ("  %-6s IR %6.3f s  block %4d (budget %6.1f us) | idle mean %6.1f p99.9 %7.1f max %7.1f us (%5.1f%%) | swap mean %6.1f p99.9 %7.1f max %7.1f us (%5.1f%%) | busy %5.1f ms mean, %5.1f max\n",
                  backend, irSec, block, budget, a.meanUs, a.p999Us, a.maxUs, 100.0 * a.maxUs / budget,
                  f.meanUs, f.p999Us, f.maxUs, 100.0 * f.maxUs / budget,
                  ms * (double) busyCalls / (double) swaps, ms * (double) busyMax);
@@ -116,7 +116,9 @@ int main (int argc, char** argv)
     felitronics::core::ScopedFlushToZero ftz;
     const double seconds = argc > 1 ? std::atof (argv[1]) : 20.0;
     std::printf ("MatrixConvolverNupc worst process() call: Full, cap 20 s, 48 kHz, 50 ms fade — out of a swap, and from publish to the fade's end\n");
-    for (double irSec : { 20.0, 4.0, 2.0 })
+    // 2.773 s and 2.816 s are the threshold's edge for Full at 48 kHz: 133120 taps (P = 64, 252 MACs a hop, the old
+    // path — the worst unspread swap in the tree, lineareq's maximum) and 135168 (P = 65, 256, spread).
+    for (double irSec : { 20.0, 4.0, 133120.0 / 48000.0, 135168.0 / 48000.0, 2.0 })
         for (int block : { 64, 128, 256 })
         {
 #if defined(FELITRONICS_WITH_PFFFT)
