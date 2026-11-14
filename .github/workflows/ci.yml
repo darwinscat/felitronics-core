@@ -230,8 +230,8 @@ jobs:
           -DFELITRONICS_ENABLE_TSAN=ON
           -DFELITRONICS_WITH_PFFFT=ON
       - name: Symbolizer
-        # tools/ci/tsan.supp matches a SYMBOLIZED function name. Without llvm-symbolizer TSan prints raw addresses, the
-        # name never matches, and the job would fail on the one race the code documents — so find it, or stop here.
+        # A report without symbols is raw addresses nobody can act on, and tools/ci/tsan.supp (empty today) can only
+        # ever match a SYMBOLIZED function name — so find the symbolizer, or stop here.
         run: |
           sym=$(command -v llvm-symbolizer || ls /usr/bin/llvm-symbolizer-* 2>/dev/null | sort -V | tail -1)
           [ -n "$sym" ] || { echo "no llvm-symbolizer on this runner"; exit 1; }
@@ -241,12 +241,15 @@ jobs:
         run: cmake --build build-tsan -j "$(nproc)" --target felitronics_convolution_restart_race_tests felitronics_convolution_spread_race_tests felitronics_core_rtstreams_tests
       - name: Test
         env:
-          # tools/ci/tsan.supp names the one race the code documents as known (#273); nothing else is suppressed.
+          # Nothing is suppressed: tools/ci/tsan.supp is empty since RtStreams' gate removed the one documented race.
           TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1:suppressions=${{ github.workspace }}/tools/ci/tsan.supp:external_symbolizer_path=${{ env.TSAN_SYMBOLIZER }}
         run: |
-          found=$(ctest --test-dir build-tsan -N -R 'restart_race|spread_race|rtstreams' | sed -n 's/^Total Tests: *//p')
+          # The rtstreams INTERLEAVING suite is not here on purpose: it is single-threaded (nothing for TSan to
+          # see), and its allocation counter replaces operator new/delete, which clang's statically linked TSan
+          # runtime also defines. `rtstreams_tests` matches the threaded suite alone.
+          found=$(ctest --test-dir build-tsan -N -R 'restart_race|spread_race|rtstreams_tests' | sed -n 's/^Total Tests: *//p')
           [ "${found:-0}" -ge 3 ] || { echo "expected at least 3 threaded suites, found ${found:-0}"; exit 1; }
-          ctest --test-dir build-tsan --output-on-failure -R 'restart_race|spread_race|rtstreams'
+          ctest --test-dir build-tsan --output-on-failure -R 'restart_race|spread_race|rtstreams_tests'
 
   # Dedicated gcc-14 job. The matrix above has no "compiler" dimension — each OS row takes whatever its
   # image ships — so the newest GCC is simply not built anywhere: ubuntu-latest defaults to g++-13. That is
