@@ -572,7 +572,8 @@ void noAllocation()
     test::run (d.process (nullptr, 0, 1024));
     d.reset(); d.reset();
     test::run (d.process (lr, 2, 1024, false));
-    felitronics::test::okNoAlloc (alloc::count.load() == before, "no allocation: setParams, process (stereo, mono, pause, stand-by), reset");
+    const long long delta = alloc::count.load() - before;   // read before the message is built: it allocates
+    ok (delta == 0, "no allocation: setParams, process (stereo, mono, pause, stand-by), reset (" + std::to_string (delta) + ")");
 }
 } // namespace
 

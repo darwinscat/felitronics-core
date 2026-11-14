@@ -9,9 +9,14 @@
 //     head makes, a silent head standing on its target, the mono rule as a ramp, the snap after a restart;
 //   · re-slicing at absolute event samples and the held layout re-sent every block; a pause moving the heads as
 //     silence; back at the default layout, the frozen class's bytes; law 8; the tail; the setter's bounds; a head
-//     under one sample; the picture's taps; no allocation.
-// Every gate says in a comment which defect it is there to catch. The suite is written against delay::kMaxHeads, not
-// a count: a check that needs more heads than a build carries says so and is skipped.
+//     under one sample; the picture's taps; no allocation;
+//   · the wake after a restart, the default layout's fast path decided per call and on every side, the order of
+//     the sum, the exact guard, a retarget from where the gain stands, side 1's own ramp, glide and mono hold, and
+//     the ramp's pinned double formula.
+// Every group says in a comment which defects its gates are there to catch; a check with no such comment is the
+// fixture's own sanity (the comparison is not of silence, the reference reads where the oracle assumes). The suite is
+// written against delay::kMaxHeads, not a count: a check that needs more heads than a build carries says so and is
+// skipped.
 #include <felitronics_test.h>
 #include <alloc_counter.h>   // installs the allocation counter
 
@@ -306,8 +311,7 @@ void placement()
                 std::printf ("      [position %.9g, repeats %.2f: the shifted copy differs]\n", (double) p, (double) repeats);
             all = all && here;
         }
-        // Catches: a head distance off by a sample; a pan law that does not leave the centre at unity; a head read
-        // after the record head has written.
+        // Catches: a head distance off by a sample; a pan law that does not leave the centre at unity.
         ok (all, std::string ("heads at 1/2, 1/4, 1/3, 2/3: out(t) == frozen wet(t + D - d), both lines, byte for byte, REPEATS ")
                      + (pass == 0 ? "0" : "0.6 with DARK at 1.5 kHz"));
     }
@@ -424,8 +428,9 @@ void tripletFigure()
         for (int ch = 0; ch < 2; ++ch)
             for (int t = L; t < N - (D - dist[0]); ++t)
                 bad += same (get (out[(std::size_t) ch], t), expected (ch, t, lvl)) ? 0 : 1;
-        // Catches: contributions not flushed / not rounded once; a sum seeded or ordered differently; the exact-unity
-        // path for the 1x head; a head read at the wrong place.
+        // Catches: contributions not flushed / not rounded once; the exact-unity path for the 1x head; a head read at
+        // the wrong place. (The burst is shorter than the heads' spacing, so at most one copy is nonzero at a sample:
+        // the ORDER of the sum is orderedSum()'s to catch.)
         ok (bad == 0, "wet = flush(tap(1/3) x 0.3) + flush(tap(2/3) x 0.6) + tap(1), in index order, byte for byte ("
                       + std::to_string (bad) + " samples differ)");
 
@@ -508,6 +513,22 @@ void pingPong()
     }
     // Catches: a far side that is not exactly silent; the pan law's ends; a mono-style read of side 0 on a stereo call.
     ok (bad == 0, "left = sqrt2 x line(t - D/2), right = sqrt2 x line(t - D), byte for byte (" + std::to_string (bad) + " differ)");
+
+    // Mirrored: the 1/2 head HARD RIGHT, so its side 0 is silent and only side 1 sounds. Catches a read geometry
+    // worked out only for a head whose side 0 sounds (the right line would read a stale or zero place).
+    delay::TapeDelay mirror;
+    test::run (mirror.prepare (sr, 512, 2));
+    mirror.setParams (knobs (300.0f, 0.4f, 4000.0f, 0.0f, 1.0f, layout ({ { 0.5f, 1.0f, 1.0f }, { 1.0f, 1.0f, -1.0f } })));
+    Planes outM = in;
+    test::run (renderBlocks (mirror, outM, 512));
+    int badM = 0;
+    for (int t = L; t < N - D / 2; ++t)
+    {
+        badM += same (get (outM[1], t), 0.0f + scaled (get (wetD[0], t + D / 2), kSqrt2f)) ? 0 : 1;   // right: D/2 only
+        badM += same (get (outM[0], t), 0.0f + scaled (get (wetD[0], t), kSqrt2f)) ? 0 : 1;           // left: D only
+    }
+    ok (badM == 0, "mirrored, 1/2 hard right and 1 hard left: right = sqrt2 x line(t - D/2), left = sqrt2 x line(t - D) ("
+                       + std::to_string (badM) + " differ)");
 }
 
 //==============================================================================
@@ -844,16 +865,21 @@ void bend()
     d.setParams (knobs (300.0f, 0.0f, 4000.0f, 0.0f, 1.0f, layout ({ { 0.5f, 1.0f, 0.0f } })));
     OneByOne s { d };
     Plane wet ((std::size_t) N, 0.0f);
-    double worst = 0.0;
+    double worst = 0.0, motorMid = 0.0;
     for (int t = 0; t < N; ++t)
     {
         if (t == t0)
             d.setHead (0, { 0.25f, 1.0f, 0.0f });
+        if (t == t0 + 5000)
+            d.setTimeMs (200.0f);   // the motor glides 14400 -> 9600 under the gliding head
         test::run (s.step (get (x, t), get (x, t)));
         cell (wet, t) = (float) ((double) s.l - (double) get (x, t));
+        if (t == t0 + 20000 - 1)
+            motorMid = d.headSamples();
 
         // The read, outside: the class's own position and motor after this sample, the design's distance, and a
-        // linear read of the outside line. Catches the product taken after rounding the position to float.
+        // linear read of the outside line. Catches the product taken after rounding the position to float, and a
+        // head placed at a fraction of the TARGET time instead of the glided one (TIME moves mid-window).
         if (t >= t0 - 100 && t < t0 + 20000)
         {
             const float hd = readDistance (d.headPosition (0), d.headSamples(), sr);
@@ -864,7 +890,8 @@ void bend()
             worst = std::max (worst, std::fabs (((double) s.l - (double) get (x, t)) - want));
         }
     }
-    ok (worst <= 1.0e-6, "while it glides the head reads the outside line at (float)(position x time), to 1e-6 (worst "
+    ok (motorMid > 9600.5 && motorMid < 14399.5, "the motor was still gliding at the window's end (the head rode a moving time)");
+    ok (worst <= 1.0e-6, "while it and TIME glide the head reads the outside line at (float)(position x glided time), to 1e-6 (worst "
                              + std::to_string (worst) + ")");
 
     const auto halfPeriod = [&] (int from, int to)
@@ -1697,6 +1724,8 @@ void underOneSample()
 void shownHeads()
 {
     group ("shownHeadMs: the target x TIME before the stage runs, the glided read after each call, 0 off the array");
+    // Catches: a picture that shows the target while the head glides, one that misses TIME before the first call,
+    // a tap without the motor's floor, an index off the array that reads anything but 0.
     delay::TapeDelay d;
     const float third = 1.0f / 3.0f;
     ok (same (d.shownHeadMs (0), 350.0f), "constructed: the default head at 1 x 350 ms");
@@ -1722,7 +1751,11 @@ void shownHeads()
         all = all && same (d.shownHeadMs (k), glided (k));
     ok (all, "after a call: every head's (float)(floored distance / sr x 1000), bit for bit");
 
+    // Catches a running stage that publishes a head's target from the setter (the picture would jump to where the
+    // head is SENT, then back to where it reads after the next call).
+    const float shownBefore = d.shownHeadMs (0);
     d.setHead (0, { 0.8f, 1.0f, 0.0f });
+    ok (same (d.shownHeadMs (0), shownBefore), "a running stage: setHead moves no tap until the next call");
     test::run (renderBlocks (d, io, 256));
     ok (same (d.shownHeadMs (0), glided (0)) && d.shownHeadMs (0) < 0.8f * 400.0f,
         "while it glides: where it reads, not where it is sent");
@@ -1828,6 +1861,407 @@ void poisonRestart()
 }
 
 //==============================================================================
+// 21 · WAKING AFTER A RESTART — a head sent between the pause and the first carried call stands on its target
+//==============================================================================
+void wakeSnap()
+{
+    group ("waking: after prepare or reset, a pause, then a head turned on at 1/2 — it stands on 1/2, the sound as with no pause");
+    constexpr double sr = 48000.0;
+    const int k = kHeads - 1;                                      // off at 1 in the layout below
+    const Heads lay = kHeads > 1 ? defaultHeads() : Heads {};
+    const Planes noise = burst (6000, 6000, 101u, 0.4f, false);
+
+    // restart 0: a fresh prepare; 1: a reset after a run. TIME, the head and OFFSET 0 put every read on a whole sample,
+    // so the clocks a pause moves on cannot move a bit.
+    const auto run = [&] (int restart, bool pause, double& afterOne)
+    {
+        delay::TapeDelay d;
+        test::run (d.prepare (sr, 512, 2));
+        d.setParams (knobs (300.0f, 0.5f, 3000.0f, 0.0f, 1.0f, lay));
+        if (restart == 1)
+        {
+            Planes past = burst (3000, 3000, 102u, 0.4f, false);
+            test::run (renderBlocks (d, past, 256));
+            d.reset();
+        }
+        if (pause)
+            test::run (d.process (nullptr, 0, 300));
+        d.setHead (k, { 0.5f, 1.0f, 0.0f });
+        Planes io = noise;
+        float* p[2] = { io[0].data(), io[1].data() };
+        test::run (d.process (p, 2, 1));
+        afterOne = d.headPosition (k);
+        for (int i = 1; i < 6000; i += 512)
+        {
+            float* q[2] = { io[0].data() + i, io[1].data() + i };
+            test::run (d.process (q, 2, std::min (512, 6000 - i)));
+        }
+        return io;
+    };
+    for (int restart = 0; restart < 2; ++restart)
+    {
+        double withPause = 0.0, without = 0.0;
+        const Planes a = run (restart, true, withPause), b = run (restart, false, without);
+        const std::string what = restart == 0 ? "prepare" : "reset";
+        // Catches a wake that aims the gains but leaves the head where the pause left it: it would glide from 1 to 1/2
+        // at full level from the first sample.
+        ok (same (withPause, (double) 0.5f), what + " -> pause -> head on at 1/2 -> one stereo sample: on 1/2 exactly");
+        ok (samePlanes (a, b), what + " -> pause -> head on: the same bytes as with no pause");
+    }
+}
+
+//==============================================================================
+// 22 · THE FAST PATH IS DECIDED PER CALL — its own re-slicing case, from the default layout
+//==============================================================================
+void plainPathReslicing()
+{
+    group ("the default layout's fast path, per call: level, pan, position and a second head sent at absolute samples — slicings agree");
+    constexpr double sr = 48000.0;
+    constexpr int N = 40000;
+    struct Send { int at; int head; Head h; };
+    const Send sends[] = {
+        { 3000,  0, { 1.0f, 0.7f, 0.0f } },    // a level: a ramp that starts from exactly 1
+        { 7000,  0, { 1.0f, 1.0f, 0.0f } },    // back to the default (plain again once landed)
+        { 11000, 0, { 1.0f, 1.0f, 0.3f } },    // a pan
+        { 15000, 0, { 1.0f, 1.0f, 0.0f } },
+        { 19000, 1, { 0.5f, 0.8f, -0.4f } },   // a second head turned on
+        { 24000, 1, { 0.5f, 0.0f, -0.4f } },
+        { 30000, 0, { 0.6f, 1.0f, 0.0f } },    // a position: the 1x head leaves the loop's tap
+    };
+    constexpr int nSends = (int) (sizeof (sends) / sizeof (sends[0]));
+    Rng r (111u);
+    Planes in (2, Plane ((std::size_t) N, 0.0f));
+    for (int i = 0; i < N; ++i)
+    {
+        const float tone = 0.3f * (float) std::sin (0.0613 * (double) i);
+        cell (in[0], i) = tone + 0.1f * r.signedUnit();
+        cell (in[1], i) = -tone + 0.1f * r.signedUnit();
+    }
+    // slice 0: one call from each send to the next (every call 4000 samples or more)
+    const auto render = [&] (int slice)
+    {
+        delay::TapeDelay d;
+        test::run (d.prepare (sr, 4096, 2));
+        d.setParams (knobs (250.0f, 0.5f, 3000.0f, 4.0f, 0.8f));
+        Planes io = in;
+        int pos = 0, next = 0;
+        while (pos < N)
+        {
+            while (next < nSends && sends[next].at == pos)
+            {
+                d.setHead (sends[next].head, sends[next].h);
+                ++next;
+            }
+            int end = slice > 0 ? std::min (pos + slice, N) : N;
+            if (next < nSends)
+                end = std::min (end, sends[next].at);
+            float* p[2] = { io[0].data() + pos, io[1].data() + pos };
+            test::run (d.process (p, 2, end - pos));
+            pos = end;
+        }
+        return io;
+    };
+    const Planes whole = render (0);
+    // Catches a fast path chosen from the gains alone: a call that starts at a gain of exactly 1 with a ramp, a glide
+    // or a second head on its way would play the loop's tap for the whole call.
+    ok (samePlanes (render (1), whole) && samePlanes (render (64), whole),
+        "slicings 1 and 64 against one call per gap (4000+ samples): the same bytes");
+}
+
+//==============================================================================
+// 23 · THE ORDER OF THE SUM — three heads sounding at once
+//==============================================================================
+void orderedSum()
+{
+    group ("three heads sounding at once (1/3, 2/3, 1 at 0.3, 0.6, 0.9): scaled, flushed, summed in index order — byte for byte");
+    if (! haveHeads (3, "the ordered sum"))
+        return;
+
+    constexpr double sr = 48000.0;
+    constexpr int D = 14400, L = 12000, N = 3 * D;   // the burst outlasts twice the heads' spacing: all three overlap
+    const float pos[3] = { 1.0f / 3.0f, 2.0f / 3.0f, 1.0f };
+    const float lvl[3] = { 0.3f, 0.6f, 0.9f };
+    const Planes in = burst (N, L, 121u, 0.6f, false);
+
+    frz::TapeDelay then;
+    test::run (then.prepare (sr, 512, 2));
+    then.setParams (frozenKnobs (300.0f, 0.5f, 2500.0f, 0.0f, 1.0f));
+    Planes wetD = in;
+    test::run (renderBlocks (then, wetD, 512));
+
+    delay::TapeDelay now;
+    test::run (now.prepare (sr, 512, 2));
+    now.setParams (knobs (300.0f, 0.5f, 2500.0f, 0.0f, 1.0f,
+                          layout ({ { pos[0], lvl[0], 0.0f }, { pos[1], lvl[1], 0.0f }, { pos[2], lvl[2], 0.0f } })));
+    Planes out = in;
+    test::run (renderBlocks (now, out, 512));
+
+    int dist[3];
+    for (int k = 0; k < 3; ++k)
+        dist[k] = (int) readDistance ((double) pos[k], (double) D, sr);
+    int bad = 0, allThree = 0, orderShows = 0;
+    for (int ch = 0; ch < 2; ++ch)
+        for (int t = L; t < N - (D - dist[0]); ++t)
+        {
+            float c[3];
+            bool every = true;
+            for (int k = 0; k < 3; ++k)
+            {
+                c[k] = scaled (get (wetD[(std::size_t) ch], t + D - dist[k]), lvl[k]);
+                every = every && ! same (c[k], 0.0f);
+            }
+            const float forward = (c[0] + c[1]) + c[2], backward = (c[2] + c[1]) + c[0];
+            bad += same (get (out[(std::size_t) ch], t), 0.0f + forward) ? 0 : 1;
+            allThree += every ? 1 : 0;
+            orderShows += same (forward, backward) ? 0 : 1;
+        }
+    ok (allThree > 4000 && orderShows > 100, "the fixture: " + std::to_string (allThree) + " samples with three copies at once, "
+                                                 + std::to_string (orderShows) + " where the order of the sum changes the bits");
+    // Catches a sum taken in any other order than the heads' index order.
+    ok (bad == 0, "each sample is ((c0 + c1) + c2) of the scaled, flushed copies, byte for byte (" + std::to_string (bad) + " differ)");
+}
+
+//==============================================================================
+// 24 · THE EXACT GUARD — a level one float away is a new level
+//==============================================================================
+void exactGuard()
+{
+    group ("the setter's guard is exact: a level one float above the one that landed lands on that float");
+    constexpr double sr = 48000.0;
+    const int len = rampLength (sr);
+    delay::TapeDelay d;
+    test::run (d.prepare (sr, 64, 2));
+    d.setParams (knobs (300.0f, 0.3f, 4000.0f, 0.0f, 1.0f, layout ({ { 1.0f, 0.5f, 0.0f } })));
+    OneByOne s { d };
+    for (int i = 0; i < 4; ++i)
+        test::run (s.step (0.0f, 0.0f));
+    const bool landed = same (d.headGain (0, 0), 0.5f) && same (d.headGain (0, 1), 0.5f);
+    bool exact = true;
+    for (float next : { std::nextafter (0.5f, 1.0f), 0.5f, std::nextafter (0.5f, 0.0f) })
+    {
+        d.setHead (0, { 1.0f, next, 0.0f });
+        for (int m = 0; m < len; ++m)
+            test::run (s.step (0.0f, 0.0f));
+        exact = exact && same (d.headGain (0, 0), next) && same (d.headGain (0, 1), next);
+    }
+    // Catches a guard within a float epsilon: the one-ulp request would be taken for the level it already holds.
+    ok (landed && exact, "0.5 lands; then 0.5 + 1 ulp, 0.5 and 0.5 - 1 ulp each land on exactly that float, both sides");
+}
+
+//==============================================================================
+// 25 · A RETARGET MID-RAMP STARTS FROM WHERE THE GAIN STANDS
+//==============================================================================
+void retargetFromWhereItStands()
+{
+    group ("a retarget mid-ramp starts from where the gain stands: 0 -> 1, then 0.2 at sample 300 — no jump, landing N later");
+    constexpr double sr = 48000.0;
+    const int len = rampLength (sr);
+    delay::TapeDelay d;
+    test::run (d.prepare (sr, 64, 2));
+    d.setParams (knobs (300.0f, 0.3f, 4000.0f, 0.0f, 1.0f, Heads {}));
+    OneByOne s { d };
+    test::run (s.step (0.0f, 0.0f));
+    d.setHead (0, { 1.0f, 1.0f, 0.0f });
+    double worstStep = 0.0;
+    float last = d.headGain (0, 0);
+    for (int m = 1; m <= 300; ++m)
+    {
+        test::run (s.step (0.0f, 0.0f));
+        worstStep = std::max (worstStep, std::fabs ((double) d.headGain (0, 0) - (double) last));
+        last = d.headGain (0, 0);
+    }
+    const bool midway = last > 0.25f && last < 0.35f;
+    d.setHead (0, { 1.0f, 0.2f, 0.0f });
+    int landedAt = -1;
+    for (int m = 1; m <= 2 * len; ++m)
+    {
+        test::run (s.step (0.0f, 0.0f));
+        const float g = d.headGain (0, 0);
+        worstStep = std::max (worstStep, std::fabs ((double) g - (double) last));
+        last = g;
+        if (landedAt < 0 && same (g, 0.2f))
+            landedAt = m;
+    }
+    // Catches a ramp restarted from the old TARGET (the gain would jump from ~0.31 to 1 and ramp down from there).
+    ok (midway && worstStep <= 1.0 / (double) len + 1.0e-6,
+        "no step between consecutive gains larger than one full-range ramp step 1/N (worst " + std::to_string (worstStep) + ")");
+    ok (landedAt == len, "...and it lands on 0.2 exactly N samples after the second send (" + std::to_string (landedAt) + ")");
+}
+
+//==============================================================================
+// 26 · SIDE 1 — the right side's own ramps, glides and mono hold
+//==============================================================================
+void sideOne()
+{
+    group ("side 1: a hard-right head ramps, glides as a sounding head, and a mono call leaves its balance gain in place");
+    constexpr double sr = 48000.0;
+    const int len = rampLength (sr);
+    {
+        // Catches an at-rest test that looks only at side 0's ramp: side 1's ramp would never be stepped.
+        delay::TapeDelay d;
+        test::run (d.prepare (sr, 64, 2));
+        d.setParams (knobs (300.0f, 0.3f, 4000.0f, 0.0f, 1.0f, layout ({ { 1.0f, 0.5f, 1.0f } })));
+        OneByOne s { d };
+        for (int i = 0; i < 4; ++i)
+            test::run (s.step (0.0f, 0.0f));
+        const float from = panGains (0.5f, 1.0f)[1], to = panGains (0.9f, 1.0f)[1];
+        const bool start = same (d.headGain (0, 0), 0.0f) && same (d.headGain (0, 1), from);
+        d.setHead (0, { 1.0f, 0.9f, 1.0f });
+        int landedAt = -1;
+        bool moving = true;
+        for (int m = 1; m <= len + 10; ++m)
+        {
+            test::run (s.step (0.0f, 0.0f));
+            const float g = d.headGain (0, 1);
+            if (landedAt < 0 && same (g, to))
+                landedAt = m;
+            if (landedAt < 0)
+                moving = moving && g > from && g < to;
+        }
+        ok (start && moving && landedAt == len, "a hard-right head's level change ramps on side 1 and lands at N ("
+                                                    + std::to_string (landedAt) + ")");
+    }
+    {
+        // Catches a silent test that takes "either side at 0" for silence: a hard-right head would snap, not glide.
+        delay::TapeDelay d;
+        test::run (d.prepare (sr, 64, 2));
+        d.setParams (knobs (300.0f, 0.3f, 4000.0f, 0.0f, 1.0f, layout ({ { 0.5f, 1.0f, 1.0f } })));
+        OneByOne s { d };
+        for (int i = 0; i < 4; ++i)
+            test::run (s.step (0.0f, 0.0f));
+        d.setHead (0, { 0.25f, 1.0f, 1.0f });
+        test::run (s.step (0.0f, 0.0f));
+        const double p = d.headPosition (0);
+        ok (p < 0.5 && p > 0.49, "a sounding hard-right head sent from 1/2 to 1/4 takes one glide step, not a snap");
+    }
+    {
+        // A mono first call snaps side 0 to the level and side 1 to its BALANCE gain; the stereo call that follows
+        // ramps side 0 only and plays side 1 at that balance from its first sample. Catches side 1 aimed at the level
+        // in a mono call (it would hold the level and never be sent back). Oracle: the frozen class's right wet.
+        constexpr int D = 14400, L = 2000, N = 2 * D;
+        const auto g = panGains (0.6f, 0.5f);
+        delay::TapeDelay now;
+        frz::TapeDelay then;
+        test::run (now.prepare (sr, 512, 2));
+        test::run (then.prepare (sr, 512, 2));
+        now.setParams (knobs (300.0f, 0.4f, 4000.0f, 0.0f, 1.0f, layout ({ { 1.0f, 0.6f, 0.5f } })));
+        then.setParams (frozenKnobs (300.0f, 0.4f, 4000.0f, 0.0f, 1.0f));
+        Planes monoA = burst (200, 200, 131u, 0.3f, false), monoB = monoA;
+        float* ma[2] = { monoA[0].data(), nullptr };
+        float* mb[2] = { monoB[0].data(), nullptr };
+        test::run (now.process (ma, 1, 200));
+        test::run (then.process (mb, 1, 200));
+        const bool held = same (now.headGain (0, 0), 0.6f) && same (now.headGain (0, 1), g[1]);
+        Planes a = burst (N, L, 132u, 0.5f, false), b = a;
+        test::run (renderBlocks (now, a, 512));
+        test::run (renderBlocks (then, b, 512));
+        int bad = 0;
+        for (int t = L; t < N; ++t)
+            bad += same (get (a[1], t), 0.0f + scaled (get (b[1], t), g[1])) ? 0 : 1;
+        ok (held, "after a mono first call: side 0 at the level, side 1 at its balance gain, exactly");
+        ok (bad == 0 && same (now.headGain (0, 1), g[1]),
+            "the stereo call after it plays the right line at that balance gain, byte for byte (" + std::to_string (bad) + " differ)");
+    }
+}
+
+//==============================================================================
+// 27 · THE RAMP IS THE PINNED DOUBLE FORMULA
+//==============================================================================
+void rampFormula()
+{
+    group ("the ramp is the pinned double formula: (float)(from + [(to - from) x (m x (1/N))]), the product rounded on its own");
+    constexpr double sr = 48000.0;
+    const int len = rampLength (sr);
+    const double step = 1.0 / (double) len;
+    const auto pinned = [&] (float from, float to, int m)
+    {
+        volatile double prod = ((double) to - (double) from) * ((double) m * step);
+        const double y = prod + (double) from;
+        return (float) y;
+    };
+    // The first pair was found by a search: at m = 560 of 960 a FUSED multiply-add lands one float away from the
+    // pinned formula. The others spread the ramp over directions and sizes.
+    const float pairs[][2] = { { 0x1.e66104p-1f, 0x1.0ef32p-5f }, { 0.2f, 0.9f }, { 0.9f, 0.2f }, { 0.123f, 0.987f },
+                               { 1.0f, 0.333f }, { 0.0517f, 0.0518f }, { 0.7f, 0.0f } };
+    {
+        const double x = 560.0 * step, f = (double) pairs[0][0], dd = (double) pairs[0][1] - (double) pairs[0][0];
+        ok (! same (pinned (pairs[0][0], pairs[0][1], 560), (float) std::fma (dd, x, f)),
+            "the fixture: at m = 560 the pinned and the fused formula land on different floats");
+    }
+    int bad = 0, checked = 0;
+    for (const auto& pr : pairs)
+    {
+        delay::TapeDelay d;
+        test::run (d.prepare (sr, 64, 2));
+        d.setParams (knobs (300.0f, 0.3f, 4000.0f, 0.0f, 1.0f, layout ({ { 1.0f, pr[0], 0.0f } })));
+        OneByOne s { d };
+        test::run (s.step (0.0f, 0.0f));
+        bad += same (d.headGain (0, 0), pr[0]) ? 0 : 1;
+        d.setHead (0, { 1.0f, pr[1], 0.0f });
+        for (int m = 1; m <= len; ++m)
+        {
+            test::run (s.step (0.0f, 0.0f));
+            const float want = m < len ? pinned (pr[0], pr[1], m) : pr[1];
+            bad += same (d.headGain (0, 0), want) && same (d.headGain (0, 1), want) ? 0 : 1;
+            ++checked;
+        }
+    }
+    // Catches a ramp in float, a ramp whose multiply-add is fused (where the row contracts), another step law.
+    ok (bad == 0, "every intermediate gain of " + std::to_string (checked) + " is the pinned formula's float, both sides ("
+                      + std::to_string (bad) + " differ)");
+}
+
+//==============================================================================
+// 28 · THE FAST PATH NEEDS UNITY ON EVERY SIDE — gL exactly 1 at a small pan, gR not
+//==============================================================================
+void plainBothSides()
+{
+    group ("the fast path needs unity on every side the call reads: a level at pan -0.001 where gL is exactly 1 and gR is not");
+    constexpr double sr = 48000.0;
+    constexpr int D = 14400, L = 2000, N = 2 * D + 500;
+    const float pan = -0.001f;
+    const double ratio = (1.0 - (double) pan) / std::sqrt (1.0 + (double) pan * (double) pan);
+    float level = 0.0f;
+    bool found = false;
+    float c = (float) (1.0 / ratio);
+    for (int i = 0; i < 64; ++i)
+        c = std::nextafter (c, 0.0f);
+    for (int i = 0; i < 128 && ! found; ++i, c = std::nextafter (c, 2.0f))
+    {
+        const auto g = panGains (c, pan);
+        if (same (g[0], 1.0f) && ! same (g[1], 1.0f) && c < 1.0f)
+        {
+            level = c;
+            found = true;
+        }
+    }
+    const auto g = panGains (level, pan);
+    ok (found, "found: level " + std::to_string (level) + " at pan -0.001 gives gL == 1.0f exactly, gR " + std::to_string (g[1]));
+
+    const Planes in = burst (N, L, 141u, 0.7f, false);
+    frz::TapeDelay then;
+    test::run (then.prepare (sr, 512, 2));
+    then.setParams (frozenKnobs (300.0f, 0.5f, 3000.0f, 0.0f, 1.0f));
+    Planes wetD = in;
+    test::run (renderBlocks (then, wetD, 512));
+
+    delay::TapeDelay now;
+    test::run (now.prepare (sr, 512, 2));
+    now.setParams (knobs (300.0f, 0.5f, 3000.0f, 0.0f, 1.0f, layout ({ { 1.0f, level, pan } })));
+    Planes out = in;
+    test::run (renderBlocks (now, out, 512));
+    int bad = 0;
+    for (int t = L; t < N; ++t)
+    {
+        bad += same (get (out[0], t), get (wetD[0], t)) ? 0 : 1;                       // left: the tap at unity
+        bad += same (get (out[1], t), 0.0f + scaled (get (wetD[1], t), g[1])) ? 0 : 1;   // right: gR x the tap
+    }
+    // Catches a fast path that reads side 0 only: a stereo call would play the right line at unity too.
+    ok (same (now.headGain (0, 0), 1.0f) && same (now.headGain (0, 1), g[1]) && bad == 0,
+        "the left plays the loop's tap, the right gR x the tap, byte for byte (" + std::to_string (bad) + " differ)");
+}
+
+//==============================================================================
 // 20 · NO ALLOCATION
 //==============================================================================
 void noAllocation()
@@ -1841,7 +2275,14 @@ void noAllocation()
     for (int k = 0; k < kHeads; ++k)
         moving[(std::size_t) k] = { 0.2f + 0.2f * (float) k, 0.9f - 0.1f * (float) k, 0.3f * (float) k - 0.4f };
 
+    delay::TapeDelay plainStage;   // the default layout: every call at rest takes the loop's-tap fast path
+    test::run (plainStage.prepare (96000.0, 1024, 2));
+    plainStage.setParams (knobs (700.0f, 0.6f, 3000.0f, -20.0f, 0.7f));
+
     const long long before = felitronics::test::alloc::count.load();
+    test::run (plainStage.process (lr, 2, 1024));
+    test::run (plainStage.process (lr, 2, 1024));
+    test::run (plainStage.process (lr, 1, 1024));
     d.setHead (0, { 0.7f, 0.8f, -0.2f });
     d.setHeads (moving);
     d.setParams (knobs (700.0f, 0.6f, 3000.0f, -20.0f, 0.7f, moving));
@@ -1857,8 +2298,9 @@ void noAllocation()
     d.reset();
     test::run (d.process (lr, 2, 1024));
     const long long delta = felitronics::test::alloc::count.load() - before;
-    ok (delta == 0, "no allocation: setHead, setHeads, setParams with heads, process (stereo, mono, pause, stand-by), reset ("
-                        + std::to_string (delta) + ")");
+    // Catches an allocation on any of these paths — the default layout's fast path included.
+    ok (delta == 0, "no allocation: the default layout's fast path (stereo, mono), setHead, setHeads, setParams with heads, "
+                    "process (stereo, mono, pause, stand-by), reset (" + std::to_string (delta) + ")");
 }
 } // namespace
 
@@ -1888,6 +2330,14 @@ int main()
     validation();
     underOneSample();
     shownHeads();
+    wakeSnap();
+    plainPathReslicing();
+    orderedSum();
+    exactGuard();
+    retargetFromWhereItStands();
+    sideOne();
+    rampFormula();
+    plainBothSides();
     noAllocation();
     return felitronics::test::report();
 }
