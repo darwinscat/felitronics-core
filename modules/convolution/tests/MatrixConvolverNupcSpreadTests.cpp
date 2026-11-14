@@ -45,6 +45,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
+#include <limits>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -827,6 +828,14 @@ long long thresholdEdge (const char* be)
             test::ok (spreads (len, nb, e.cap, C::kSpreadFromMacs) == spread, tag + ": the oracle puts it on the side the class must");
             C mc;
             test::run (mc.prepare (kHead, e.cap, xfade, 2));
+            // maxSwapSamples (nb) at the cap's edge: this cap can spread an nb-bank operator (its stage holds exactly the
+            // threshold's partitions), one partition shorter cannot.
+            test::ok (mc.maxSwapSamples (nb) == xfade + kB, tag + ": maxSwapSamples at the edge cap adds the hop (" + std::to_string (mc.maxSwapSamples (nb)) + ")");
+            {
+                C shorter;
+                test::run (shorter.prepare (kHead, e.cap - kB, xfade, 2));
+                test::ok (shorter.maxSwapSamples (nb) == xfade, tag + ": one partition of cap shorter, the fade alone (" + std::to_string (shorter.maxSwapSamples (nb)) + ")");
+            }
             const Op a = makeOp (e.topo, len, 77), b = makeOp (e.topo, len, 78);
             test::run (load (mc, a));
             const Signal x = noise (9LL * kB, 79);   // warm 3 hops, steady 2, then room for a swap of a fade and a hop
@@ -986,11 +995,16 @@ long long randomEvents (const char* be, Cover& cv)
         int bad = 0, printed = 0;
         double worst = 0.0, minPeak = 1e300;
         long long samples = 0, swaps = 0;
+        int monoCases = 0;
         const int cases = shipping ? geo.cases : (geo.cases + 2) / 3;
         for (int ci = 0; ci < cases; ++ci)
         {
             Gen g { { 0xF00DULL * (unsigned long long) gi + (unsigned long long) ci * 7919ULL + 17ULL } };
-            const int nch = g.u (4) == 0 ? 1 : 2;
+            // The width from the case index, not the generator: its first draw from consecutive seeds alternates, and
+            // four of the six geometries never ran mono that way (found in review). One case in four is mono.
+            (void) g.u (4);
+            const int nch = ci % 4 == 3 ? 1 : 2;
+            if (nch == 1) ++monoCases;
             const int L = Ls[g.u (8)];
             const int nOps = 2 + (int) g.u (3);
             std::vector<Op> ops;
@@ -1037,10 +1051,18 @@ long long randomEvents (const char* be, Cover& cv)
             worst = std::max (worst, n.rel()); minPeak = std::min (minPeak, n.peak);
             samples += total; swaps += (long long) t1.swaps.size();
         }
+        test::ok (cases < 4 || monoCases > 0, std::string (be) + " " + geo.what + ": mono runs too (" + std::to_string (monoCases) + " of "
+                  + std::to_string (cases) + ")");
         test::ok (bad == 0, std::string (be) + " " + geo.what + ": " + std::to_string (cases) + " random scenarios null (worst "
                   + num (worst) + " of peak), busy exact, bitwise at 777 and 4096 (" + std::to_string (bad) + " bad)");
         std::printf ("    %s %-52s %3d scenarios, %4lld swaps, %8lld samples: worst error %.3g of peak (tol %.0e), peaks >= %.3g\n",
                      be, geo.what, cases, swaps, samples, worst, kTol, minPeak);
+    }
+    // Saturation: prepare() takes any positive crossfade, and one near INT_MAX plus a hop does not fit an int.
+    {
+        C huge;
+        test::run (huge.prepare (kHead, kB + 65 * kB, std::numeric_limits<int>::max(), 2));
+        test::ok (huge.maxSwapSamples() == std::numeric_limits<int>::max(), std::string (be) + " maxSwapSamples saturates at INT_MAX for a crossfade of INT_MAX");
     }
     return allocs;
 }
