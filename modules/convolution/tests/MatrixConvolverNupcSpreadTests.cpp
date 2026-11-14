@@ -23,10 +23,15 @@
 //   6. RESTARTS against the same reference: clearAudioState() while priming starts the fade on the next sample;
 //      reset() while priming or fading makes the published operator live at once; an operator published and
 //      adopted by reset() before any process() plays correctly and spreads (no burst afterwards).
-//   7. BELOW THE THRESHOLD the shipping class IS the frozen one: bitwise through swaps, the same transforms and
-//      multiply-adds in every call.
+//   7. BELOW THE THRESHOLD the shipping class IS the frozen one: bitwise through swaps, clears, resets and an
+//      adoption, the same transforms and multiply-adds in every call.
 //   8. maxSwapSamples() bounds every swap above, and a warm spread swap takes exactly crossfade + B.
 //   9. process() allocates nothing, in any of it.
+//  10. SEEDED RANDOM EVENTS on six geometries (heads 64 to 2048, a B_max stage of 2 to 12 partitions, a partial last
+//      one, a single-stage schedule): publications, clears, resets and adoptions at random samples, aimed at the
+//      edges — a pickup B-1, B or B+1 samples after the history restarted, a clear on the publish sample, at the
+//      fade's start and just before it, a publication on the sample after a fade ends. Each scenario nulls against
+//      the frozen references, is busy exactly as documented, and is bitwise the same at random 1..777 and at 4096.
 
 #include <felitronics_test.h>
 #include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
@@ -240,7 +245,8 @@ Trace drive (C& c, int nch, const std::vector<Op>& ops, const std::vector<Event>
 struct Refs { std::vector<std::array<std::vector<float>, 2>> y; bool ok = true; };
 
 template <class Fft>
-Refs references (int nch, int cap, int L, const std::vector<Op>& ops, const std::vector<Event>& evs, const Signal& s)
+Refs references (int nch, int cap, int L, const std::vector<Op>& ops, const std::vector<Event>& evs, const Signal& s,
+                 int head = kHead)
 {
     using F = convolution::frozen::MatrixConvolverNupc<Fft>;
     Refs r;
@@ -248,7 +254,7 @@ Refs references (int nch, int cap, int L, const std::vector<Op>& ops, const std:
     for (std::size_t k = 0; k < ops.size(); ++k)
     {
         F f;
-        r.ok = f.prepare (kHead, cap, L, nch) && load (f, ops[k]) && r.ok;
+        r.ok = f.prepare (head, cap, L, nch) && load (f, ops[k]) && r.ok;
         for (auto& v : r.y[k]) v.assign ((std::size_t) s.n, 0.0f);
         std::size_t e = 0;
         for (long long pos = 0; pos < s.n; )
@@ -740,8 +746,11 @@ long long belowThreshold (const char* be)
               std::string (be) + " 2 s operators are under the threshold (P = " + std::to_string (P) + ": " + std::to_string ((P - 1) * 4)
               + " < " + std::to_string (C::kSpreadFromMacs) + ") at a cap that can spread");
     const std::vector<Op> ops { makeOp (Topo::Full, len, 91), makeOp (Topo::Full, len, 92), makeOp (Topo::MS, len, 93) };
-    const std::vector<Event> evs { { 0, Ev::Publish, 0 }, { 3000, Ev::Publish, 1 }, { 5737, Ev::Publish, 2 }, { 9056, Ev::Publish, 0 } };
-    constexpr long long total = 14000;
+    // A clear mid-fade, a reset mid-fade, an adoption by reset() before any process(), a clear on a publish sample.
+    const std::vector<Event> evs { { 0, Ev::Publish, 0 },    { 3000, Ev::Publish, 1 }, { 3500, Ev::Clear, -1 },
+                                   { 5737, Ev::Publish, 2 }, { 6200, Ev::Reset, -1 },  { 8000, Ev::PublishReset, 1 },
+                                   { 9056, Ev::Publish, 0 }, { 12000, Ev::Publish, 2 }, { 12000, Ev::Clear, -1 } };
+    constexpr long long total = 16000;
     const Signal s = noise (total, 0x99ULL);
     C c; F f;
     bool fine = c.prepare (kHead, kBigCap, L, 2) && f.prepare (kHead, kBigCap, L, 2);
@@ -755,8 +764,12 @@ long long belowThreshold (const char* be)
     {
         for (; e < evs.size() && evs[e].pos == pos; ++e)
         {
-            fine = load (c, ops[(std::size_t) evs[e].op]) && load (f, ops[(std::size_t) evs[e].op]) && fine;
+            const Event& ev = evs[e];
+            if (ev.kind == Ev::Clear) { c.clearAudioState(); f.clearAudioState(); continue; }
+            if (ev.kind == Ev::Reset) { c.reset(); f.reset(); pickup = -1; continue; }
+            fine = load (c, ops[(std::size_t) ev.op]) && load (f, ops[(std::size_t) ev.op]) && fine;
             pickup = pos;
+            if (ev.kind == Ev::PublishReset) { c.reset(); f.reset(); pickup = -1; }
         }
         long long stop = total;
         if (e < evs.size()) stop = std::min (stop, evs[e].pos);
@@ -780,7 +793,7 @@ long long belowThreshold (const char* be)
     long long differ = 0;
     for (std::size_t ch = 0; ch < 2; ++ch)
         for (std::size_t i = 0; i < (std::size_t) total; ++i) if (! core::sameBits (yc[ch][i], yf[ch][i])) ++differ;
-    test::ok (fine && differ == 0, std::string (be) + " under the threshold: bitwise the frozen class through four swaps (" + std::to_string (differ) + " samples differ)");
+    test::ok (fine && differ == 0, std::string (be) + " under the threshold: bitwise the frozen class through six publications, two clears, a reset and an adoption (" + std::to_string (differ) + " samples differ)");
     test::ok (callsDiffer == 0, std::string (be) + " ...the same forward / inverse / multiply-add counts at every size in every call ("
               + std::to_string (callsDiffer) + " of " + std::to_string (calls) + " differ)");
     test::ok (busyDiffer == 0 && busyMax <= c.maxSwapSamples() && c.maxSwapSamples() == L + kB,
@@ -855,6 +868,183 @@ long long thresholdEdge (const char* be)
     return allocs;
 }
 
+//==============================================================================
+// 10. Seeded random events, MatrixConvolverNupc<Fft, 1>, against the same references and the same timeline.
+
+struct Gen
+{
+    Lcg r;
+    unsigned u (unsigned m) { return r.next() % m; }
+};
+
+// How often the scenarios hit the edges they are aimed at (gated below, so a generator that drifted cannot pass).
+struct Cover
+{
+    int coldEdge[3] {};   // a spread operator picked up B-1, B, B+1 samples after the history restarted
+    int clearOnPublish = 0, clearAtStart = 0, clearBeforeStart = 0, publishAfterFade = 0;
+    int resetPriming = 0, resetFading = 0, adoptions = 0, scenarios = 0;
+};
+
+long long randomGap (Gen& g)
+{
+    switch (g.u (8))
+    {
+        case 0:  return 0;
+        case 1:  return 1;
+        case 2:  return kB - 1;
+        case 3:  return kB;
+        case 4:  return kB + 1;
+        case 5:  return (long long) g.u (64);
+        default: return (long long) g.u (2 * kB);
+    }
+}
+
+// Events placed by the documented timeline (the rule null() checks): a publication only once the last swap has
+// ended — its fade starting one hop after the pickup for a spread operator over a warm history, else at once, and
+// at once from a clear made while it was being prepared.
+std::vector<Event> randomScenario (Gen& g, const std::vector<Op>& ops, int nch, int cap, int L, long long& total, Cover& cv)
+{
+    std::vector<Event> evs { { 0, Ev::Publish, 0 } };
+    long long pos = L, lastClear = 0, ts = 0, end = 0, pickup = 0;
+    bool busy = false;
+    int live = 0;
+    auto publish = [&] (long long p)
+    {
+        int op = (int) g.u ((unsigned) ops.size());
+        if (op == live) op = (op + 1) % (int) ops.size();
+        const Op& o = ops[(std::size_t) op];
+        const bool sp = spreads (o.len, nch == 1 ? 1 : banksOf (o.topo), cap, 1);
+        const long long since = p - lastClear;
+        if (sp && since >= kB - 1 && since <= kB + 1) ++cv.coldEdge[since - (kB - 1)];
+        ts = p + ((sp && since >= kB) ? kB : 0); end = ts + L; pickup = p; busy = true; live = op;
+        evs.push_back ({ p, Ev::Publish, op });
+    };
+    const int nEv = 3 + (int) g.u (6);
+    for (int i = 0; i < nEv; ++i)
+    {
+        if (busy)
+        {
+            const unsigned k = g.u (10);
+            if (k < 5)   // a clear (k < 3) or a reset inside the swap
+            {
+                long long p = pos + 1 + (long long) g.u ((unsigned) std::max<long long> (end - pos - 1, 1));
+                const unsigned w = g.u (4);
+                if (k < 3 && w == 0 && pos == pickup)     { p = pickup; ++cv.clearOnPublish; }   // state 1: not picked up yet
+                else if (w == 1 && ts > pos)              { p = ts; if (k < 3) ++cv.clearAtStart; }
+                else if (k < 3 && w == 2 && ts - 1 > pos) { p = ts - 1; ++cv.clearBeforeStart; }
+                evs.push_back ({ p, k < 3 ? Ev::Clear : Ev::Reset, -1 });
+                if (k >= 3 && p < end) { if (p < ts) ++cv.resetPriming; else ++cv.resetFading; }
+                if (k >= 3 || p >= end) busy = false;
+                else if (p < ts) { ts = p; end = p + L; }
+                lastClear = p; pos = p;
+                continue;
+            }
+            pos = end; busy = false;                                   // wait it out
+            if (g.u (3) == 0) { publish (pos); ++cv.publishAfterFade; continue; }   // on the sample after the fade
+        }
+        const unsigned k = g.u (12);
+        const long long p = pos + randomGap (g);
+        if (k < 2) { evs.push_back ({ p, k == 0 ? Ev::Clear : Ev::Reset, -1 }); lastClear = p; pos = p; }
+        else if (k == 2)
+        {
+            const int op = (int) g.u ((unsigned) ops.size());
+            evs.push_back ({ p, Ev::PublishReset, op }); lastClear = p; live = op; pos = p; ++cv.adoptions;
+        }
+        else if (k == 3)   // the cold edge: a clear, then a publication B-1, B or B+1 samples on
+        {
+            evs.push_back ({ p, Ev::Clear, -1 }); lastClear = p;
+            pos = p + kB - 1 + (long long) g.u (3);
+            publish (pos);
+        }
+        else { publish (p); pos = p; }
+    }
+    total = (busy ? std::max (pos, end) : pos) + kB + 300 + (long long) g.u (700);   // past the last swap's first boundary
+    ++cv.scenarios;
+    return evs;
+}
+
+template <class Fft>
+long long randomEvents (const char* be, Cover& cv)
+{
+    using C = convolution::MatrixConvolverNupc<Fft, 1>;
+    struct Geo { int head, cap, cases; const char* what; };
+    // The time-domain head dominates the cost at heads 1024 and 2048 (a tap per sample per bank): fewer cases there.
+    // The events, the timeline and every decision the engine takes are the backend's business only in arithmetic, and
+    // the scalar FFT is several times slower than pffft: when it is not the backend products ship, it runs the first
+    // third of the scenarios.
+    const Geo geos[] { { 128, 7 * kB, 40, "head 128, cap 7B (C = 6)" },         { 128, 3 * kB, 40, "head 128, cap 3B (C = 2)" },
+                       { 128, 4 * kB + 5, 40, "head 128, cap 4B+5 (C = 4, a partial last partition)" },
+                       { 64, 13 * kB, 30, "head 64, cap 13B (C = 12)" },        { 1024, 3 * kB - 7, 5, "head 1024, cap 3B-7 (C = 2)" },
+                       { 2048, 5 * kB, 3, "head 2048, cap 5B (a single stage, C = 4)" } };
+    const bool shipping = std::is_same_v<Fft, convolution::CabConvFft>;
+    static constexpr int Ls[] { 1, 2, 37, 300, kB - 1, kB, kB + 1, 2500 };
+    long long allocs = 0;
+    int gi = 0;
+    for (const Geo& geo : geos)
+    {
+        ++gi;
+        int bad = 0, printed = 0;
+        double worst = 0.0, minPeak = 1e300;
+        long long samples = 0, swaps = 0;
+        const int cases = shipping ? geo.cases : (geo.cases + 2) / 3;
+        for (int ci = 0; ci < cases; ++ci)
+        {
+            Gen g { { 0xF00DULL * (unsigned long long) gi + (unsigned long long) ci * 7919ULL + 17ULL } };
+            const int nch = g.u (4) == 0 ? 1 : 2;
+            const int L = Ls[g.u (8)];
+            const int nOps = 2 + (int) g.u (3);
+            std::vector<Op> ops;
+            for (int k = 0; k < nOps; ++k)
+            {
+                Topo tp = Topo::Mono;
+                if (nch == 2) { const unsigned t = g.u (3); tp = t == 0 ? Topo::LR : (t == 1 ? Topo::MS : Topo::Full); }
+                static constexpr int fr[] { 100, 3000, 4096, 4097, 6145, 0, 0, 0 };
+                int len = fr[g.u (8)];
+                if (len == 0) len = kB + 1 + (int) g.u ((unsigned) (geo.cap + 600 - kB - 1));
+                if (k == 0) len = geo.cap;   // the first operator is the cap's length: every partition, loud
+                ops.push_back (makeOp (tp, len, 1000ULL * (unsigned long long) gi + 10ULL * (unsigned long long) ci + (unsigned long long) k));
+            }
+            long long total = 0;
+            const std::vector<Event> evs = randomScenario (g, ops, nch, geo.cap, L, total, cv);
+            const Signal s = noise (total, 0x51ULL + (unsigned long long) total + (unsigned long long) ci);
+            C c1, c2, c3;
+            const bool prepared = c1.prepare (geo.head, geo.cap, L, nch) && c2.prepare (geo.head, geo.cap, L, nch)
+                               && c3.prepare (geo.head, geo.cap, L, nch);
+            if (! prepared) { ++bad; continue; }
+            const Trace t1 = drive (c1, nch, ops, evs, s, Blocks { 1, 1, false, 1 });   // busy exact to the sample
+            const Trace t2 = drive (c2, nch, ops, evs, s, Blocks { 0, 777, false, 99 + (unsigned long long) ci });
+            const Trace t3 = drive (c3, nch, ops, evs, s, Blocks { 4096, 1, false, 1 });
+            allocs += t1.allocs + t2.allocs + t3.allocs;
+            const Refs refs = references<Fft> (nch, geo.cap, L, ops, evs, s, geo.head);
+            const Null n = null (t1, refs, ops, evs, nch, geo.cap, L, 1, Start::Documented);
+            bool busyOk = n.busy.size() == t1.swaps.size();
+            for (std::size_t i = 0; busyOk && i < n.busy.size(); ++i)
+                busyOk = t1.swaps[i].busy >= 0 && t1.swaps[i].busy == n.busy[i] && t1.swaps[i].busy <= c1.maxSwapSamples();
+            long long differ = 0;
+            for (std::size_t ch = 0; ch < (std::size_t) nch; ++ch)
+                for (std::size_t i = 0; i < (std::size_t) total; ++i)
+                    differ += (core::sameBits (t2.y[ch][i], t1.y[ch][i]) ? 0 : 1) + (core::sameBits (t3.y[ch][i], t1.y[ch][i]) ? 0 : 1);
+            const bool good = t1.accepted && t2.accepted && t3.accepted && refs.ok && n.valid && n.finite && n.peak >= kPeakFloor
+                           && n.rel() <= kTol && busyOk && differ == 0;
+            if (! good)
+            {
+                ++bad;
+                if (printed++ < 3)
+                    std::printf ("    BAD %s %s case %d: nch %d L %d, accepted %d/%d/%d, refs %d, valid %d, finite %d, peak %.3g, error %.3g, busy %d, %lld differ\n",
+                                 be, geo.what, ci, nch, L, t1.accepted, t2.accepted, t3.accepted, refs.ok, n.valid, n.finite, n.peak, n.rel(),
+                                 busyOk, differ);
+            }
+            worst = std::max (worst, n.rel()); minPeak = std::min (minPeak, n.peak);
+            samples += total; swaps += (long long) t1.swaps.size();
+        }
+        test::ok (bad == 0, std::string (be) + " " + geo.what + ": " + std::to_string (cases) + " random scenarios null (worst "
+                  + num (worst) + " of peak), busy exact, bitwise at 777 and 4096 (" + std::to_string (bad) + " bad)");
+        std::printf ("    %s %-52s %3d scenarios, %4lld swaps, %8lld samples: worst error %.3g of peak (tol %.0e), peaks >= %.3g\n",
+                     be, geo.what, cases, swaps, samples, worst, kTol, minPeak);
+    }
+    return allocs;
+}
+
 template <class Fft>
 void suite (const char* backend)
 {
@@ -882,8 +1072,20 @@ void suite (const char* backend)
     test::group ("the threshold's edge — one partition either side, Full and LRDiag (" + be + ")");
     const long long a8 = thresholdEdge<Fft> (backend);
 
+    test::group ("seeded random events — six geometries, aimed at the edges (" + be + ")");
+    Cover cv;
+    const long long a10 = randomEvents<Fft> (backend, cv);
+    test::ok (cv.coldEdge[0] > 0 && cv.coldEdge[1] > 0 && cv.coldEdge[2] > 0 && cv.clearOnPublish > 0 && cv.clearAtStart > 0
+              && cv.clearBeforeStart > 0 && cv.publishAfterFade > 0 && cv.resetPriming > 0 && cv.resetFading > 0 && cv.adoptions > 0,
+              be + " the random scenarios hit every edge they aim at");
+    std::printf ("    %s %d scenarios: pickups at B-1 / B / B+1 after a restart %d / %d / %d; clears on the publish sample %d, at the fade's "
+                 "start %d, just before %d; publications right after a fade %d; resets priming %d, fading %d; adoptions %d\n",
+                 backend, cv.scenarios, cv.coldEdge[0], cv.coldEdge[1], cv.coldEdge[2], cv.clearOnPublish, cv.clearAtStart, cv.clearBeforeStart,
+                 cv.publishAfterFade, cv.resetPriming, cv.resetFading, cv.adoptions);
+
     test::group ("process() allocates nothing (" + be + ")");
     test::okNoAlloc (a8 == 0, be + " threshold-edge runs (" + std::to_string (a8) + ")");
+    test::okNoAlloc (a10 == 0, be + " random-event runs (" + std::to_string (a10) + ")");
     test::okNoAlloc (a2 == 0, be + " frozen burst run (" + std::to_string (a2) + ")");
     test::okNoAlloc (a3 == 0, be + " spread bound runs (" + std::to_string (a3) + ")");
     test::okNoAlloc (a4 == 0, be + " null runs (" + std::to_string (a4) + ")");
