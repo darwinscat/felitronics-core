@@ -53,3 +53,7 @@ Measured with `fcore_convburst`: worst `process()` call, 20 s Full IR under a 20
 
 A swap of such an IR keeps the convolver busy 93 ms (the 50 ms fade and the one-hop preparation); the 2 s IR is under
 the threshold, swaps in 50.7 ms as before, and its worst call is 19 % of a 64-sample block on the M5, 34 % on the i9.
+
+The threshold's edge for Full at 48 kHz (same tool and conditions, Intel i9-13900H, block 64, worst call in a swap):
+133120 taps (P = 64, 252 MACs a hop: the old path, busy 50.7 ms) read 48 % of the budget unpinned and 97 % on an
+E-core; 135168 taps (P = 65, 256: spread, busy 93.3 ms) read 8 % and 17 %.
