@@ -63,6 +63,12 @@ if(FELITRONICS_BUILD_TESTS)
     target_compile_features(felitronics_matrixconvolvernupc_memory_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_matrixconvolvernupc_memory_tests COMMAND felitronics_matrixconvolvernupc_memory_tests)
 
+    add_executable(felitronics_matrixconvolvernupc_spread_tests tests/MatrixConvolverNupcSpreadTests.cpp)
+    target_link_libraries(felitronics_matrixconvolvernupc_spread_tests PRIVATE felitronics::convolution)
+    target_include_directories(felitronics_matrixconvolvernupc_spread_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_matrixconvolvernupc_spread_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_matrixconvolvernupc_spread_tests COMMAND felitronics_matrixconvolvernupc_spread_tests)
+
     add_executable(felitronics_convolution_cabconvolver_tests tests/CabConvolverTests.cpp)
     target_link_libraries(felitronics_convolution_cabconvolver_tests PRIVATE felitronics::convolution)
     target_include_directories(felitronics_convolution_cabconvolver_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
@@ -98,5 +104,13 @@ if(FELITRONICS_BUILD_TESTS)
         find_package(Threads REQUIRED)
         target_link_libraries(felitronics_convolution_restart_race_tests PRIVATE Threads::Threads)
         add_test(NAME felitronics_convolution_restart_race_tests COMMAND felitronics_convolution_restart_race_tests)
+
+        # A loader publishing growing, shrinking and topology-changing operators beside the audio thread, through
+        # the spread B_max stage — the ThreadSanitizer job's other convolver suite.
+        add_executable(felitronics_convolution_spread_race_tests tests/ConvolutionSpreadRaceTests.cpp)
+        target_link_libraries(felitronics_convolution_spread_race_tests PRIVATE felitronics::convolution Threads::Threads)
+        target_include_directories(felitronics_convolution_spread_race_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+        target_compile_features(felitronics_convolution_spread_race_tests PRIVATE cxx_std_20)
+        add_test(NAME felitronics_convolution_spread_race_tests COMMAND felitronics_convolution_spread_race_tests)
     endif()
 endif()

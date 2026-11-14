@@ -230,14 +230,14 @@ jobs:
           -DFELITRONICS_ENABLE_TSAN=ON
           -DFELITRONICS_WITH_PFFFT=ON
       - name: Build the threaded suites
-        run: cmake --build build-tsan -j "$(nproc)" --target felitronics_convolution_restart_race_tests felitronics_core_rtstreams_tests
+        run: cmake --build build-tsan -j "$(nproc)" --target felitronics_convolution_restart_race_tests felitronics_convolution_spread_race_tests felitronics_core_rtstreams_tests
       - name: Test
         env:
           TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
         run: |
-          found=$(ctest --test-dir build-tsan -N -R 'restart_race|rtstreams' | sed -n 's/^Total Tests: *//p')
-          [ "${found:-0}" -ge 2 ] || { echo "expected at least 2 threaded suites, found ${found:-0}"; exit 1; }
-          ctest --test-dir build-tsan --output-on-failure -R 'restart_race|rtstreams'
+          found=$(ctest --test-dir build-tsan -N -R 'restart_race|spread_race|rtstreams' | sed -n 's/^Total Tests: *//p')
+          [ "${found:-0}" -ge 3 ] || { echo "expected at least 3 threaded suites, found ${found:-0}"; exit 1; }
+          ctest --test-dir build-tsan --output-on-failure -R 'restart_race|spread_race|rtstreams'
 
   # Dedicated gcc-14 job. The matrix above has no "compiler" dimension — each OS row takes whatever its
   # image ships — so the newest GCC is simply not built anywhere: ubuntu-latest defaults to g++-13. That is
