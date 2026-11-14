@@ -15,10 +15,11 @@ Two races are gone:
   samples.
 
 **The gate.** `RtGate` is one atomic word per stream: the mode in the low 31 bits and a BUSY bit the audio thread
-holds while it is inside a block it was admitted to. The word changes only by read-modify-write. A controller call
-takes the mode down and learns, in the same operation, whether a block is open. If one is open, it refuses and
-changes nothing but the stop; if none is, it mutates, and raises the mode again if the call starts something
-(`tryPublish`, `trySetMode`, `tryStart`; `tryRefill`, `tryReserve` and `tryHarvest` leave it down).
+holds while it is inside a block it was admitted to. The word changes only by read-modify-write. A `try…()` call
+that needs the stream to itself takes the mode down and learns, in the same operation, whether a block is open. If
+one is open, it refuses and changes nothing but the stop; if none is, it mutates, and raises the mode again if the
+call starts something (`tryPublish`, `trySetMode`, `tryStart`; `tryRefill`, `tryReserve` and `tryHarvest` leave it
+down). `stop()` and `trySetMode(0)` only take the mode down, and never refuse.
 
 - There is no counter and no wait. A stopped device holds no block, so every call lands at once.
 - A refused call lands on a retry once the block closes. The block's scope is all the retry waits for, and nothing
