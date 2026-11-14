@@ -203,6 +203,57 @@ int main()
         test::ok (peak < 1.0e-9, "silence in after the drain: silence out (" + std::to_string (peak) + ")");
     }
 
+    // A LONG SHOT HANDED OVER OUT OF THE PATH LANDS BEFORE THE SILENCE STOPS. At 96 kHz a 4.5 s shot is long enough
+    // for the convolver to spread its last stage, and a spread swap starts its fade one 2048-sample hop after the
+    // pickup. The cabinet used to feed only the 50 ms crossfade's worth of silence for a handover it was resting
+    // through; the swap was then still in flight when it came back, and its first blocks played the rest of the
+    // fade. The oracle is a cabinet that only ever held the new shot, drained the same way.
+    test::group ("a long shot handed over out of the path lands before the silence stops");
+    {
+        constexpr double fs = 96000.0;
+        // A shot that keeps its length: `shot` decays under the -80 dBFS trim within a fifth of a second, and a
+        // trimmed shot is too short to spread. This one ends 4.5 s on at about -40 dB.
+        std::vector<float> b ((size_t) std::llround (4.5 * fs));
+        for (size_t i = 0; i < b.size(); ++i)
+        {
+            const double t = (double) i / fs;
+            b[i] = (float) (std::exp (-t) * (0.5 * std::cos (2.0 * core::kPi * 97.0 * t) + 0.3 * std::sin (2.0 * core::kPi * 1300.0 * t)));
+        }
+        const auto a = shot (fs, 0.08);
+        auto landedImpulse = [&] (bool swapWhileResting)
+        {
+            CabinetIr cab;
+            cab.prepare (fs, bs, 2);
+            (void) cab.load ((swapWhileResting ? a : b).data(), (int) (swapWhileResting ? a : b).size(), fs);
+            long long phase = 0;
+            (void) play (cab, 400, fs, phase);                     // in the path long enough to warm every stage
+            const int drain = (int) std::ceil ((CabinetIr::maxSeconds + 1.0) * fs / bs);
+            (void) play (cab, drain, fs, phase, false);             // out of the path, drained to silence
+            if (swapWhileResting) (void) cab.load (b.data(), (int) b.size(), fs);   // handed over while resting
+            (void) play (cab, 200, fs, phase, false);               // the resting cabinet lands it, then stops
+            std::vector<float> out;
+            std::vector<float> l (bs, 0.0f), r (bs, 0.0f);
+            for (int k = 0; k < 40; ++k)                            // back in the path: an impulse, then silence
+            {
+                std::fill (l.begin(), l.end(), 0.0f); std::fill (r.begin(), r.end(), 0.0f);
+                if (k == 0) l[0] = r[0] = 1.0f;
+                float* io[] { l.data(), r.data() };
+                cab.process (io, 2, bs, true);
+                out.insert (out.end(), l.begin(), l.end());
+            }
+            return out;
+        };
+        const auto got = landedImpulse (true), want = landedImpulse (false);
+        double err = 0.0, ref = 0.0;
+        for (size_t i = 0; i < want.size(); ++i)
+        {
+            err = std::max (err, (double) std::abs (got[i] - want[i]));
+            ref = std::max (ref, (double) std::abs (want[i]));
+        }
+        test::ok (ref > 1.0e-3 && err < 1.0e-5 * ref, "the returning cabinet plays the new shot alone (" + std::to_string (err) + " of a "
+                                                   + std::to_string (ref) + " peak)");
+    }
+
     test::group ("a shot it does not take changes nothing");
     {
         test::ok (! CabinetIr::takes (0, 48000.0) && ! CabinetIr::takes (100, 4000.0) && ! CabinetIr::takes (100, 1.0e6)

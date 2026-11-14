@@ -92,6 +92,7 @@ modules/measurement/include/felitronics/measurement/Sweep.h  [cos*2 exp*2 log*2 
 tools/eqviz/eqviz.cpp  [abs*5 arg*1 cos*1 log*8 log10*1 pow*26 sin*1 sqrt*10]  retain-local  a developer visualiser; it draws curves and nobody diffs its output
 tools/fftbench.cpp  [exp*6]  retain-local  benchmark input generation
 tools/dehumbench.cpp  [exp*1 sin*2]  retain-local  benchmark input generation: a 24-harmonic hum and a decaying note
+tools/convburst.cpp  [pow*1]  retain-local  benchmark input generation: the decay of the IR it times
 
 
 # --- carrier-only files: no direct std:: call, but they reach libm through core::gainToDb /

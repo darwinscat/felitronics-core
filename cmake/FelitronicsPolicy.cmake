@@ -90,6 +90,22 @@ if(FELITRONICS_ENABLE_SANITIZERS)
     endif()
 endif()
 
+# ThreadSanitizer, for the suites that run REAL threads (a loader publishing beside an audio thread). A separate
+# option because TSan cannot share a binary with ASan. -fno-builtin: Apple clang's TSan does not see a write that
+# reaches memory through an inlined builtin (measured: std::fill at -O1 was invisible), so the builtins go.
+option(FELITRONICS_ENABLE_TSAN "Build the self-tests with ThreadSanitizer (Clang/GCC; not with FELITRONICS_ENABLE_SANITIZERS)" OFF)
+if(FELITRONICS_ENABLE_TSAN)
+    if(FELITRONICS_ENABLE_SANITIZERS)
+        message(FATAL_ERROR "FELITRONICS_ENABLE_TSAN cannot be combined with FELITRONICS_ENABLE_SANITIZERS (ASan).")
+    endif()
+    if(NOT (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU"))
+        message(FATAL_ERROR "FELITRONICS_ENABLE_TSAN requires Clang or GCC.")
+    endif()
+    message(STATUS "felitronics-core: ThreadSanitizer enabled")
+    add_compile_options(-g -O1 -fno-omit-frame-pointer -fno-builtin -fsanitize=thread)
+    add_link_options(-fsanitize=thread)
+endif()
+
 # The header-hygiene gate's warning set (Clang/GCC). One list, used by core's hygiene TU and by any
 # satellite's, so "clean under the gate" means the same thing in every tree.
 set(FELITRONICS_HYGIENE_WARNINGS

@@ -53,6 +53,8 @@
 //                     request (see kStlBigPad). This is the quantity a `*Bytes()` budget states.
 //   alloc::rawBytes   requested bytes exactly as they reached the allocator, no correction.
 //   alloc::alignedCount   the over-aligned calls alone — the subset a two-form counter cannot see.
+//   alloc::frees      every non-null pointer any replaced `delete` releases, as a count of blocks. A delta of
+//                     it sees a buffer KEPT that should have been freed, which no request count can.
 //
 // Both totals are kept because the tree's suites mean both: a law-11d budget check (`prepareBytes() ==
 // what prepare() asked for`) is a CONTAINER question, while a cap expressed in raw allocator traffic is
@@ -139,6 +141,11 @@ namespace felitronics::test::alloc
     // own so a claim about them can be made directly, and so the question "does this path touch the
     // over-aligned allocator at all?" has an answer that is measured rather than reasoned about.
     inline std::atomic<long long> alignedCount { 0 };
+
+    // RELEASES: every non-null pointer handed to any replaced `delete`, counted as a block — not bytes (an
+    // unsized delete does not say how many). A request counter cannot see a buffer that is KEPT when it should
+    // have been freed (a re-prepare that holds an old channel's history, say); a delta of this one can.
+    inline std::atomic<long long> frees { 0 };
 
     // FAULT INJECTION, for the suites that ask what an entry point does when the heap says no. Set it and
     // the NEXT allocation fails: an exception from the throwing forms where exceptions exist, a null
@@ -337,8 +344,15 @@ namespace felitronics::test::alloc
         return p;
     }
 
+    inline void plainFree (void* p) noexcept
+    {
+        if (p != nullptr) frees.fetch_add (1, std::memory_order_relaxed);
+        std::free (p);
+    }
+
     inline void alignedFree (void* p) noexcept
     {
+        if (p != nullptr) frees.fetch_add (1, std::memory_order_relaxed);
        #if defined(_MSC_VER)
         _aligned_free (p);   // memory from _aligned_malloc; std::free on it corrupts the heap
        #else
@@ -381,12 +395,12 @@ void* operator new[]    (std::size_t s, const std::nothrow_t&) noexcept         
 void* operator new      (std::size_t s, std::align_val_t a, const std::nothrow_t&) noexcept { return felitronics::test::alloc::release (s, (std::size_t) a, true); }
 void* operator new[]    (std::size_t s, std::align_val_t a, const std::nothrow_t&) noexcept { return felitronics::test::alloc::release (s, (std::size_t) a, true); }
 
-void  operator delete   (void* p)                                        noexcept { std::free (p); }
-void  operator delete[] (void* p)                                        noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t)                           noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t)                           noexcept { std::free (p); }
-void  operator delete   (void* p, const std::nothrow_t&)                 noexcept { std::free (p); }
-void  operator delete[] (void* p, const std::nothrow_t&)                 noexcept { std::free (p); }
+void  operator delete   (void* p)                                        noexcept { felitronics::test::alloc::plainFree (p); }
+void  operator delete[] (void* p)                                        noexcept { felitronics::test::alloc::plainFree (p); }
+void  operator delete   (void* p, std::size_t)                           noexcept { felitronics::test::alloc::plainFree (p); }
+void  operator delete[] (void* p, std::size_t)                           noexcept { felitronics::test::alloc::plainFree (p); }
+void  operator delete   (void* p, const std::nothrow_t&)                 noexcept { felitronics::test::alloc::plainFree (p); }
+void  operator delete[] (void* p, const std::nothrow_t&)                 noexcept { felitronics::test::alloc::plainFree (p); }
 void  operator delete   (void* p, std::align_val_t)                      noexcept { felitronics::test::alloc::alignedFree (p); }
 void  operator delete[] (void* p, std::align_val_t)                      noexcept { felitronics::test::alloc::alignedFree (p); }
 void  operator delete   (void* p, std::size_t, std::align_val_t)         noexcept { felitronics::test::alloc::alignedFree (p); }

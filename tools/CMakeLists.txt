@@ -16,6 +16,16 @@ if(FELITRONICS_WITH_PFFFT)
     target_compile_definitions(fcore_fftbench PRIVATE FELITRONICS_WITH_PFFFT)
 endif()
 
+# convburst — the WORST process() call of MatrixConvolverNupc (a Full IR under a 20 s cap, out of a swap and through
+# one), against the block's budget. Build Release; the pffft rows appear only with -DFELITRONICS_WITH_PFFFT=ON.
+add_executable(fcore_convburst convburst.cpp)
+target_link_libraries(fcore_convburst PRIVATE felitronics::convolution)
+target_compile_features(fcore_convburst PRIVATE cxx_std_20)
+if(FELITRONICS_WITH_PFFFT)
+    target_link_libraries(fcore_convburst PRIVATE felitronics::fftpffft)
+    target_compile_definitions(fcore_convburst PRIVATE FELITRONICS_WITH_PFFFT)
+endif()
+
 # Optional JUCE/vDSP FFT reference column — FetchContent's JUCE INTO THE BENCH ONLY (never the core/product).
 option(FELITRONICS_BENCH_JUCE "Fetch JUCE and add a JUCE-FFT reference column to fcore_fftbench" OFF)
 if(FELITRONICS_BENCH_JUCE)
