@@ -3,7 +3,7 @@
 
 // MatrixConvolverNupc with REAL threads, through the spread B_max stage: a loader publishes operators of random
 // length and topology — growing a slot's banks, shrinking, switching topology — while the audio thread processes
-// random blocks and now and then clears its history. The hazards are the ones a single thread cannot reach: the
+// random blocks and now and then clears its history or resets. The hazards are the ones a single thread cannot reach: the
 // loader growing (reallocating) the INACTIVE slot's spectra while the audio thread reads the live one; a spread
 // operator's preparation reading the incoming slot across many calls; the fade's end releasing a slot the loader
 // may regrow at once. The arithmetic is checked elsewhere; here every call must be accepted, every sample finite,
@@ -37,7 +37,7 @@ struct Lcg
 
 using Spread = convolution::MatrixConvolverNupc<core::fft::DefaultRealFft, 1>;
 
-struct Outcome { long published = 0, refused = 0, calls = 0, rejectedCalls = 0, clears = 0; bool finite = true; };
+struct Outcome { long published = 0, refused = 0, calls = 0, rejectedCalls = 0, clears = 0, resets = 0; bool finite = true; };
 
 Outcome run (int nch, int publications, unsigned long long seed)
 {
@@ -81,7 +81,9 @@ Outcome run (int nch, int publications, unsigned long long seed)
         if (! mc.process (in, out, nch, n)) ++o.rejectedCalls;
         ++o.calls;
         for (int c = 0; c < nch; ++c) for (int i = 0; i < n; ++i) if (! std::isfinite (y[c][(std::size_t) i])) o.finite = false;
-        if (r.next() % 97u == 0u) { mc.clearAudioState(); ++o.clears; }   // the audio thread's own restart
+        const unsigned roll = r.next() % 97u;
+        if (roll == 0u) { mc.clearAudioState(); ++o.clears; }   // the audio thread's own restarts: a clear keeps a
+        if (roll == 1u) { mc.reset(); ++o.resets; }             // swap running; a reset adopts one (and reads its banks)
     }
     loader.join();
     return o;
@@ -95,7 +97,7 @@ int main()
     {
         const Outcome o = run (nch, 400, 0x5eedULL + (unsigned long long) nch);
         const std::string tag = std::to_string (nch) + " ch: ";
-        std::printf ("      %s%ld published, %ld refused while busy, %ld calls, %ld clears\n", tag.c_str(), o.published, o.refused, o.calls, o.clears);
+        std::printf ("      %s%ld published, %ld refused while busy, %ld calls, %ld clears, %ld resets\n", tag.c_str(), o.published, o.refused, o.calls, o.clears, o.resets);
         test::ok (o.published == 400, tag + "every publication got through (" + std::to_string (o.published) + ")");
         test::ok (o.rejectedCalls == 0, tag + "every process() call accepted (" + std::to_string (o.rejectedCalls) + " refused)");
         test::ok (o.finite, tag + "every sample finite");
