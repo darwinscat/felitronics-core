@@ -19,7 +19,7 @@
 //                                   mode too when the clip ended, in one release RMW
 //   controller     try…():          takes the mode down and learns, in that same RMW, whether a block is
 //                                   open. Open: refuse and mutate nothing. Closed: mutate, then raise the
-//                                   mode (release).
+//                                   mode (release) if the call starts something.
 //
 // So no sample the controller writes is in use by an admitted block, no store a block makes at its close
 // lands after a re-arm, and a block admitted after the re-arm sees the whole new content. There is no
@@ -30,8 +30,8 @@
 // THREADS. ONE controller thread calls every member that is not a Block's, tryReserve() included. ONE
 // audio thread opens Blocks. isPlaying(), isRecording(), mode(), recorded() and `loop` may be read from
 // any thread. A device's lifecycle callbacks (JUCE's audioDeviceAboutToStart / audioDeviceStopped) are not
-// the controller: JUCE runs them on the thread that adds or removes the callback, or on the device's own
-// thread when the device restarts itself, so a call made there can overlap the controller's. Size the
+// the controller: JUCE runs them on the thread that adds or removes the callback, or wherever the backend
+// restarts the device, and documents no thread, so a call made there can overlap the controller's. Size the
 // streams from the controller.
 //
 // THE AUDIO THREAD'S RULES.
@@ -46,7 +46,8 @@
 //     pattern).
 //
 // FAILURE IS VISIBLE, NEVER A RACE. A Block that never closes (a thread killed inside a callback) keeps
-// BUSY set: every later try is refused and every later Block is empty. Silence, not torn audio.
+// BUSY set: every later try that needs the stream to itself is refused (stop() and trySetMode(0) still take
+// the mode down) and every later Block is empty. Silence, not torn audio.
 //==============================================================================
 
 #include <atomic>

@@ -121,9 +121,9 @@ if(FELITRONICS_BUILD_TESTS)
         add_test(NAME felitronics_core_wasm_sse_tests COMMAND felitronics_core_wasm_sse_tests)
     endif()
 
-    # RT swap-discipline types, deterministically: every interleaving of a controller call and an audio block at
-    # the gate's atomic operations, on ONE thread (the gate runs on a hooked atomic). No threads, so it runs in
-    # every tier, the single-threaded wasm-audio one included.
+    # RT swap-discipline types, deterministically: a whole controller call at every gate operation of an audio
+    # block (and a block at every operation of a publish, a refill and a start), on ONE thread through a hooked
+    # atomic. No threads, so it runs in every tier, the single-threaded wasm-audio one included.
     add_executable(felitronics_core_rtstreams_interleave_tests tests/RtStreamsInterleaveTests.cpp)
     target_link_libraries(felitronics_core_rtstreams_interleave_tests PRIVATE felitronics::core)
     target_include_directories(felitronics_core_rtstreams_interleave_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)

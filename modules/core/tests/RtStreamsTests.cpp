@@ -4,8 +4,9 @@
 // RtStreams under REAL threads: an audio thread opening Blocks against a controller publishing, switching,
 // starting and harvesting. This is the suite ThreadSanitizer gates (the CI tsan job runs it with nothing
 // suppressed): every sample, position and length behind the gate is PLAIN memory, so a missing
-// happens-before edge in the gate is a data race TSan reports. The protocol's logic at every interleaving is
-// the interleaving suite's job (RtStreamsInterleaveTests.cpp); here the checks are what a listener would hear.
+// happens-before edge in the gate is a data race TSan reports. The protocol's logic, a whole call at each of
+// the other side's gate operations, is the interleaving suite's job (RtStreamsInterleaveTests.cpp); here the
+// checks are what a listener would hear, and the real threads interleave as finely as they like.
 //
 // THE TEST'S OWN COORDINATION IS RELAXED. The hold flags, counters and stop flag below are relaxed atomics,
 // which create no happens-before edge, so they cannot supply one the gate is missing. Every content check
@@ -226,10 +227,11 @@ void rec()
 
     long refusedStart = 0, refusedHarvest = 0, bad = 0, notRising = 0, shortTakes = 0, timeouts = 0;
     long forcedRounds = 0, forcedRefusals = 0;
+    std::size_t cap = 4096;
     float lastOfPrevious = 0.0f;
     std::vector<float> take;
     for (long k = 1; k <= 600; ++k) {
-        if (k % 50 == 0) while (! r.tryReserve (4096)) ++refusedStart;      // resize under a live pusher
+        if (k % 50 == 0) while (! r.tryReserve (cap)) ++refusedStart;       // resize with the pusher alive (stream down)
         while (! r.tryStart()) ++refusedStart;
         if (! waitFor ([&] { return r.recorded() >= 64; })) ++timeouts;
         if (k % 2 == 0) {                                                    // restart at once, no harvest
@@ -237,14 +239,20 @@ void rec()
             while (! r.tryStart()) ++refusedStart;
             if (! waitFor ([&] { return r.recorded() >= 64; })) ++timeouts;
         }
-        if (k % 5 == 0) {                                                    // forced: harvest/start while a block is held
+        if (k % 5 == 0) {                                                    // forced: harvest/start/reserve while a block is held
             ++forcedRounds;
             hold.request.store (k, rlx);
             if (! waitFor ([&] { return hold.holding.load (rlx) == k; })) ++timeouts;
             std::vector<float> probe;
-            const bool h = r.tryHarvest (probe), s = r.tryStart();
-            if (! h && ! s) ++forcedRefusals;
+            const bool h = r.tryHarvest (probe), s = r.tryStart(), v = r.tryReserve (cap == 4096 ? 8192 : 4096);
+            if (! h && ! s && ! v) ++forcedRefusals;
             hold.release.store (k, rlx);
+            if (k % 25 == 0) {                                               // the reserve right after the held block closes:
+                cap = cap == 4096 ? 8192 : 4096;                             // it frees the storage that block wrote, GROWING it
+                while (! r.tryReserve (cap)) ++refusedStart;
+                while (! r.tryStart()) ++refusedStart;                       // the reserve discarded the take: record a new one
+                if (! waitFor ([&] { return r.recorded() >= 64; })) ++timeouts;
+            }
         }
         r.stop();
         while (! r.tryHarvest (take)) ++refusedHarvest;
@@ -265,7 +273,7 @@ void rec()
     ok (bad == 0, "every block's pushes are whole and in order (" + std::to_string (bad) + ")");
     ok (notRising == 0, "no take holds a sample of an earlier block than its own start (" + std::to_string (notRising) + ")");
     ok (shortTakes == 0, "every take kept what was recorded into it");
-    ok (forcedRefusals == forcedRounds && forcedRounds == 120, "harvest and start were both refused while a block was held ("
+    ok (forcedRefusals == forcedRounds && forcedRounds == 120, "harvest, start and reserve were all refused while a block was held ("
                                                                + std::to_string (forcedRefusals) + "/" + std::to_string (forcedRounds) + ")");
     std::printf ("    rec: %ld start / %ld harvest unforced refusals\n", refusedStart, refusedHarvest);
 }
