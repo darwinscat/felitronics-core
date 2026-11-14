@@ -1198,7 +1198,11 @@ Planes renderTimeline (const Timeline& tl, int slice, bool heldEveryBlock, Censu
             // Calls that must move NOTHING, of every width: zero-length (accepted) and refused ones. A width
             // aimed, a ramp stepped or a head snapped by any of them would show in the bytes.
             const bool zeroes = d.process (p, 1, 0, ! feed) && d.process (nullptr, 0, 0, ! feed) && d.process (p, 2, 0, feed);
-            const bool refused = ! d.process (p, 3, 64, feed) && ! d.process (p, 1, -1, feed) && ! d.process (nullptr, 1, 64, feed);
+            // The refused width reaches process() as a run-time number, as a host's would: a literal 3 lets gcc clone
+            // process() for three channels and warn that the clone's channel loops overrun (-Waggressive-loop-
+            // optimizations) — a clone the refusal at its top never lets run.
+            volatile int tooWide = 3;
+            const bool refused = ! d.process (p, tooWide, 64, feed) && ! d.process (p, 1, -1, feed) && ! d.process (nullptr, 1, 64, feed);
             c.noOpsAsSaid = c.noOpsAsSaid && zeroes && refused;
             c.noOpCalls += 6;
         }
@@ -1869,7 +1873,8 @@ void wakeSnap()
     constexpr double sr = 48000.0;
     const int k = kHeads - 1;                                      // off at 1 in the layout below
     const Heads lay = kHeads > 1 ? defaultHeads() : Heads {};
-    const Planes noise = burst (6000, 6000, 101u, 0.4f, false);
+    constexpr int N = 18000, L = 6000;   // the head at 1/2 of 300 ms plays its first echo at 7200: N runs well past it
+    const Planes noise = burst (N, L, 101u, 0.4f, false);
 
     // restart 0: a fresh prepare; 1: a reset after a run. TIME, the head and OFFSET 0 put every read on a whole sample,
     // so the clocks a pause moves on cannot move a bit.
@@ -1891,10 +1896,10 @@ void wakeSnap()
         float* p[2] = { io[0].data(), io[1].data() };
         test::run (d.process (p, 2, 1));
         afterOne = d.headPosition (k);
-        for (int i = 1; i < 6000; i += 512)
+        for (int i = 1; i < N; i += 512)
         {
             float* q[2] = { io[0].data() + i, io[1].data() + i };
-            test::run (d.process (q, 2, std::min (512, 6000 - i)));
+            test::run (d.process (q, 2, std::min (512, N - i)));
         }
         return io;
     };
@@ -1906,7 +1911,10 @@ void wakeSnap()
         // Catches a wake that aims the gains but leaves the head where the pause left it: it would glide from 1 to 1/2
         // at full level from the first sample.
         ok (same (withPause, (double) 0.5f), what + " -> pause -> head on at 1/2 -> one stereo sample: on 1/2 exactly");
-        ok (samePlanes (a, b), what + " -> pause -> head on: the same bytes as with no pause");
+        bool heard = false;   // past the burst the dry is silent: what sounds is the heads' wet
+        for (int i = L; i < N; ++i)
+            heard = heard || std::fabs (get (a[0], i)) > 1.0e-3f;
+        ok (heard && samePlanes (a, b), what + " -> pause -> head on: the same bytes as with no pause, echoes included");
     }
 }
 

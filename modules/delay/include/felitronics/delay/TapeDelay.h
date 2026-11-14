@@ -715,10 +715,10 @@ public:
     double headSamples() const noexcept { return currentDelay; }
     double offsetHeadSamples (int ch) const noexcept { return currentOff[ch < 0 ? 0 : (ch > 1 ? 1 : ch)]; }
 
-    /** Playback head `k`'s glided position (a fraction of TIME) and its side gain `side` (0 or 1) as the last
-        sample heard them — the tests' witnesses for the glide and the ramps landing. Between a restart and the first
-        call that carries a channel the gains are not yet aimed, and these read what was last heard. An index off the
-        array reads 0. */
+    /** Playback head `k`'s position (a fraction of TIME) and its side gain `side` (0 or 1) as the controls stand
+        now — the tests' witnesses for the glide and the ramps landing. Between a restart and the first call that
+        carries a channel the gains are not aimed yet: after prepare() they read 0, after reset() what they were;
+        a pause in that window puts the positions on their targets. An index off the array reads 0. */
     double headPosition (int k) const noexcept { return k >= 0 && k < kMaxHeads ? headPos_[k] : 0.0; }
     float headGain (int k, int side) const noexcept
     {

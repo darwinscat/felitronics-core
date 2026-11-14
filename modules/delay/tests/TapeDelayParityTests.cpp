@@ -158,8 +158,10 @@ float knobValue (Rng& r, float lo, float hi, bool logScale, float last, Census& 
 
 /** One input plane's worth of signal, of a kind drawn per call. Kind 5 puts a NaN and an infinity in it — which
     the record head REFUSES at its door, so it is input hygiene, not a restart; kind 6 puts a run of finite
-    ±FLT_MAX in it, which overflows the loop filter and makes the stage restart its line at the end of the call
-    (POISON in the contract). The census counts each kind per ACCEPTED call, not per plane drawn. */
+    ±FLT_MAX in it, which overflows the loop filter and USUALLY makes the stage restart its line at the end of the
+    call (POISON in the contract) — not always: a door still opening scales the run, and a run can land where it
+    does not overflow. The census counts each kind
+    per ACCEPTED call, not per plane drawn; the restart itself is proven by TapeDelayHeadsTests' poisonRestart. */
 void fillInput (Rng& r, std::vector<float>& x, int kind)
 {
     const float amp = r.chance (20) ? 1.0f : 0.05f + 0.9f * r.unit();
@@ -451,7 +453,8 @@ void sessions (int count, int ops)
         "the census: refused calls, refused prepares and mono preparations all reached");
     ok (n.nonFiniteInput >= 50 && n.overflowInput >= 50 && n.subnormalInput >= 50 && n.standByCalls >= 200
             && n.feedFlips >= 100 && n.resets >= 100,
-        "the census: non-finite input (refused at the door), finite overflow (the line restarts), subnormal input, "
+        "the census: non-finite input (refused at the door), finite-overflow input (mostly restarting the line), "
+        "subnormal input, "
         "stand-by, feed flips and resets all reached");
     ok (n.setParams >= 200 && n.singleSetters >= 200 && n.absurdKnobs >= 200 && n.reSends >= 100 && n.ulpNudges >= 100,
         "the census: whole and single knob sets, absurd values, re-sends and one-ulp nudges all reached");
