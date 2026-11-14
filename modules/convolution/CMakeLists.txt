@@ -55,6 +55,14 @@ if(FELITRONICS_BUILD_TESTS)
     target_compile_features(felitronics_matrixconvolvernupc_stress_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_matrixconvolvernupc_stress_tests COMMAND felitronics_matrixconvolvernupc_stress_tests)
 
+    # The bank spectra follow the loaded IR: bit-exact against a frozen copy of the class from before, growth
+    # against a direct convolution, the bytes against the schedule's rule, and the table before and after.
+    add_executable(felitronics_matrixconvolvernupc_memory_tests tests/MatrixConvolverNupcMemoryTests.cpp)
+    target_link_libraries(felitronics_matrixconvolvernupc_memory_tests PRIVATE felitronics::convolution)
+    target_include_directories(felitronics_matrixconvolvernupc_memory_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_matrixconvolvernupc_memory_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_matrixconvolvernupc_memory_tests COMMAND felitronics_matrixconvolvernupc_memory_tests)
+
     add_executable(felitronics_convolution_cabconvolver_tests tests/CabConvolverTests.cpp)
     target_link_libraries(felitronics_convolution_cabconvolver_tests PRIVATE felitronics::convolution)
     target_include_directories(felitronics_convolution_cabconvolver_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)

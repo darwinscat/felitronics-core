@@ -43,11 +43,27 @@ namespace felitronics::convolution
 //   • ONE shared scratch set sized to the largest stage — stages fire SEQUENTIALLY in the per-sample advance
 //     loop (no concurrency), so a max-sized acc/ifft/input scratch is reused across them.
 //
-// COST NOTE. EVERY stage runs every sample and FFTs on its boundary REGARDLESS of the live IR length — this
-// keeps every stage's FDL warm so a swap to a LONGER IR finds real history (the MatrixConvolver invariant). So
-// CPU is set by maxIrSamples, not the current IR: a short-IR operator pays full price (unlike NonUniformConvolver,
-// which skips inactive stages). A future "optimize short IRs" pass must NOT simply gate stages off — that would
-// cold-start the FDL and break warm swaps.
+// COST NOTE. Two parts, and only one of them follows maxIrSamples.
+//   • FIXED BY THE SCHEDULE, regardless of the live IR: every stage takes its input sample, the head dot runs
+//     over P0 taps, and each stage FFTs its input and inverse-FFTs each output on its own boundary. This keeps
+//     every stage's FDL warm so a swap to a LONGER IR finds real history (the MatrixConvolver invariant).
+//     maxIrSamples sets how many STAGES there are, and the count stops growing at the B_max stage: with a
+//     128-sample head, five stages for any cap above 2048 samples, whatever the cap. A larger cap only adds
+//     partitions to the last stage.
+//   • FOLLOWS THE LOADED IR: the spectral MACs, the bulk of the work for a long IR, loop over each bank's
+//     `activeParts` — the partitions the current IR reaches — never over the stage's full count (macBankStage /
+//     macViewStage). A short IR in a long cap pays for its own length plus the fixed part above.
+// A future "optimize short IRs" pass must NOT simply gate stages off — that would cold-start the FDL and break
+// warm swaps.
+//
+// MEMORY NOTE. The same split. The shared FDL is sized to maxIrSamples at prepare(), because it is ONE history
+// that both slots read: a new operator answers the last maxIrSamples of input at once, which is what keeps a
+// swap click-free and bit-exact. The bank spectra follow the LOADED IR: stageOperator() grows each bank, per
+// stage, to the partitions the IR reaches, and allocates only the banks the topology reads (mono 1, LRDiag and
+// MSDiag 2, Full 4). They GROW ONLY: a shorter IR reuses the storage a longer one left, so each slot holds its
+// own high-water mark until the next prepare(), which releases it. With the default schedule a sample of cap
+// costs channels × 4 B × ~2 in FDL (~16 B stereo); a sample of loaded IR costs 4 B × ~2 per bank in each slot
+// that holds it.
 //
 // RT-safe: prepare()/setOperator() allocate (message thread); process() is alloc/lock/throw-free, zero latency.
 template <core::fft::RealFftBackend Fft = core::fft::DefaultRealFft>
@@ -107,22 +123,31 @@ public:
             for (int ch = 0; ch < channels_; ++ch)
             {
                 h.frame[ch].assign ((std::size_t) N, 0.0f);
+                // Released first, so a re-prepare to a SMALLER cap (a lower host rate) gives the memory back;
+                // assign() alone keeps the old capacity.
+                core::fft::AlignedVector<float>().swap (h.fdl[ch]);
                 h.fdl[ch].assign   ((std::size_t) C * (std::size_t) specF, 0.0f);
             }
             h.phase = 0; h.fdlPos = 0;
         }
+        for (int st = numStages_; st < kMaxStages; ++st)               // a stage the new schedule dropped
+            for (int ch = 0; ch < 2; ++ch) core::fft::AlignedVector<float>().swap (hist_[(std::size_t) st].fdl[ch]);
 
+        // The head taps of every bank a slot can hold (a few hundred bytes each): a slot nothing was staged
+        // into still runs its head dot. The bank SPECTRA start empty and are grown by stageOperator() to the IR
+        // it is handed — see the MEMORY NOTE above.
         const int nb = mono_ ? 1 : kMaxBanks;
         for (int k = 0; k < 2; ++k)
         {
             Slot& sl = slot_[k];
             sl.topo = Topology::LRDiag; sl.numBanks = 0;
-            for (int b = 0; b < nb; ++b)
+            for (int b = 0; b < kMaxBanks; ++b)
             {
-                sl.banks[b].h0.assign ((std::size_t) P0_, 0.0f);
-                for (int st = 0; st < numStages_; ++st)
+                if (b < nb) sl.banks[b].h0.assign ((std::size_t) P0_, 0.0f);
+                else        std::vector<float>().swap (sl.banks[b].h0);
+                for (int st = 0; st < kMaxStages; ++st)
                 {
-                    sl.banks[b].irSpec[(std::size_t) st].assign ((std::size_t) spec_[st].C * (std::size_t) spec_[st].specF, 0.0f);
+                    core::fft::AlignedVector<float>().swap (sl.banks[b].irSpec[(std::size_t) st]);   // released
                     sl.banks[b].activeParts[st] = 0;
                 }
             }
@@ -204,18 +229,27 @@ public:
 
     // Build the operator into the inactive slot WITHOUT publishing (the surround ST-only path stages every
     // instance then publishes back-to-back). All topologies (mono / LRDiag / MSDiag / Full) are supported.
+    //
+    // ALLOCATES when the IR reaches further than this slot's banks have held before (the MEMORY NOTE above),
+    // and only then. That is safe on THIS slot alone: with state_ == 0 — checked first — the audio thread reads
+    // nothing of the inactive slot. Every read of `slot_[1 - cur_]` in process() is under state 1 (priming the
+    // tails) or state 2 (the fade), both of which refuse here, and the fade's end stores `cur_` before the
+    // release store of 0 that this acquire pairs with. Exhaustion throws out of here (law 11d) with the slot
+    // still holding what it held: every bank grows before any is rebuilt or relabelled.
     bool stageOperator (Topology topo, const float* const* banks, int numBanks, int len)
     {
         if (! prepared_ || banks == nullptr || state_.load (std::memory_order_acquire) != 0) return false;
         const Topology t = mono_ ? Topology::LRDiag : topo;
         const int nb = mono_ ? 1 : numBanksFor (t);
         if (numBanks < nb) return false;
-        const int stg = 1 - cur_;
-        Slot& sl = slot_[stg];
-        sl.topo = t; sl.numBanks = nb;
         // A null bank pointer is only rejected when it would be dereferenced (len > 0); (nullptr, len<=0) is the
         // documented "clear to silence" case buildBankSlice handles without a deref — matching MatrixConvolver.
-        for (int b = 0; b < nb; ++b) { if (banks[b] == nullptr && len > 0) return false; buildBankSlice (sl.banks[b], banks[b], len); }
+        for (int b = 0; b < nb; ++b) if (banks[b] == nullptr && len > 0) return false;
+        const int stg = 1 - cur_;
+        Slot& sl = slot_[stg];
+        for (int b = 0; b < nb; ++b) growBank (sl.banks[b], len);
+        sl.topo = t; sl.numBanks = nb;
+        for (int b = 0; b < nb; ++b) buildBankSlice (sl.banks[b], banks[b], len);
         return true;
     }
 
@@ -317,23 +351,46 @@ private:
         return (cum < (long long) maxIr) ? -1 : n;
     }
 
-    // Build one bank's head + per-stage partition spectra from a time-domain IR slice. Message thread.
+    // How many of stage `st`'s partitions a `len`-tap IR reaches: those whose first tap lies inside the IR,
+    // never more than the stage holds (an IR past maxIrSamples convolves only its first maxIrSamples).
+    int partsFor (int st, int len) const noexcept
+    {
+        const long long rem = (long long) len - spec_[st].offset;
+        if (rem <= 0) return 0;
+        return (int) std::min<long long> ((rem + spec_[st].B - 1) / spec_[st].B, spec_[st].C);
+    }
+
+    // Grow one bank's spectra so a `len`-tap IR fits, stage by stage. Never shrinks. Message thread, the inactive
+    // slot only (stageOperator). reserve() first: it allocates exactly what is asked, where a growing resize()
+    // alone may take up to twice that.
+    void growBank (Bank& bank, int len)
+    {
+        for (int st = 0; st < numStages_; ++st)
+        {
+            const std::size_t need = (std::size_t) partsFor (st, len) * (std::size_t) spec_[st].specF;
+            core::fft::AlignedVector<float>& v = bank.irSpec[(std::size_t) st];
+            if (v.size() >= need) continue;
+            v.reserve (need);
+            v.resize (need, 0.0f);
+        }
+    }
+
+    // Build one bank's head + per-stage partition spectra from a time-domain IR slice. Message thread; the
+    // bank was grown for `len` first (growBank), so every partition written here has its storage.
     void buildBankSlice (Bank& bank, const float* ir, int len) noexcept
     {
         if (len < 0) len = 0;
         for (int i = 0; i < P0_; ++i) bank.h0[(std::size_t) i] = (i < len) ? ir[i] : 0.0f;
         for (int st = 0; st < numStages_; ++st)
         {
-            const int B = spec_[st].B, C = spec_[st].C, offset = spec_[st].offset, specF = spec_[st].specF, N = spec_[st].N;
-            int parts = 0;
-            for (int j = 0; j < C; ++j)
+            const int B = spec_[st].B, offset = spec_[st].offset, specF = spec_[st].specF, N = spec_[st].N;
+            const int parts = partsFor (st, len);
+            for (int j = 0; j < parts; ++j)
             {
                 const int base = offset + j * B;
-                if (base >= len) break;                                          // this + later partitions all-zero
                 std::fill (buildBuf_.begin(), buildBuf_.begin() + N, 0.0f);
                 for (int i = 0; i < B; ++i) { const int src = base + i; buildBuf_[(std::size_t) i] = (src < len) ? ir[src] : 0.0f; }
                 hist_[(std::size_t) st].buildFft.forward (buildBuf_.data(), &bank.irSpec[(std::size_t) st][(std::size_t) j * (std::size_t) specF]);
-                parts = j + 1;
             }
             bank.activeParts[st] = parts;
         }
