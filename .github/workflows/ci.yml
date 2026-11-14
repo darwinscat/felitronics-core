@@ -205,6 +205,40 @@ jobs:
           SEL=(); if [ "$SCOPE_MODE" = selected ]; then SEL=(-R "$SCOPE_REGEX" --no-tests=error); fi
           ctest --test-dir build-san -j "$JOBS" --output-on-failure -E spectrum_pane_perf "${SEL[@]}"
 
+  # ThreadSanitizer over the suites that run REAL threads: a loader publishing operators beside an audio thread
+  # that processes and restarts. ASan cannot see a data race and these suites cannot share its binary, so this is
+  # its own job. Only the threaded targets are built, which keeps it to a few minutes on a hosted runner.
+  tsan:
+    name: ubuntu-clang-tsan
+    needs: scope
+    if: needs.scope.outputs.mode != 'none'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Address space for TSan
+        # TSan's shadow map needs the default ASLR entropy; hosted images raise it and TSan then dies at start
+        # with "unexpected memory mapping". 28 bits is the long-standing default.
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+      - name: Configure (ThreadSanitizer)
+        run: >
+          cmake -S . -B build-tsan
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_CXX_COMPILER=clang++
+          -DCMAKE_C_COMPILER=clang
+          -DFELITRONICS_BUILD_TESTS=ON
+          -DFELITRONICS_ENABLE_TSAN=ON
+          -DFELITRONICS_WITH_PFFFT=ON
+      - name: Build the threaded suites
+        run: cmake --build build-tsan -j "$(nproc)" --target felitronics_convolution_restart_race_tests felitronics_core_rtstreams_tests
+      - name: Test
+        env:
+          TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+        run: |
+          found=$(ctest --test-dir build-tsan -N -R 'restart_race|rtstreams' | sed -n 's/^Total Tests: *//p')
+          [ "${found:-0}" -ge 2 ] || { echo "expected at least 2 threaded suites, found ${found:-0}"; exit 1; }
+          ctest --test-dir build-tsan --output-on-failure -R 'restart_race|rtstreams'
+
   # Dedicated gcc-14 job. The matrix above has no "compiler" dimension — each OS row takes whatever its
   # image ships — so the newest GCC is simply not built anywhere: ubuntu-latest defaults to g++-13. That is
   # not a theoretical gap. `felitronics_saturation_theory_tests` was RED on gcc 14.2 / Debian 13 on UNTOUCHED
