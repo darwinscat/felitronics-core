@@ -680,8 +680,10 @@ int main()
     // was undefined for it.
     //
     // THE SATURATION IS TESTED THROUGH `maxIrSamplesFor` AND NOT THROUGH `prepare`, ON PURPOSE: a budget of
-    // kMaxIrSamples is a 1.34 GB partition schedule (measured with /usr/bin/time -l), and this suite also
-    // runs on the wasm tier, whose heap default is 2 GB. The expected values here come from outside the
+    // kMaxIrSamples is a 0.27 GB history at prepare() and 0.81 GB once a stereo IR that long sits in both slots
+    // (counted with the allocation counter; before the bank spectra followed the loaded IR it was 1.34 GB at
+    // prepare(), measured with /usr/bin/time -l), and this suite also runs on the wasm tier, whose heap default
+    // is 2 GB. The expected values here come from outside the
     // function — 4 s at 48 kHz is 192000 by multiplication, and the ceiling is the backend's own published
     // constant — so this is not the budget being asked to confirm itself.
     test::group ("P69 — prepare refuses a maxIrSeconds that is not a non-negative number, and saturates the rest");

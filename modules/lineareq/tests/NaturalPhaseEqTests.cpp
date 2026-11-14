@@ -305,5 +305,45 @@ int main()
             }
     }
 
+    // --- setBands() allocates nothing once prepare() has run ---
+    // The convolver grows its banks to the IR it is handed; this EQ reserves every bank either slot can hold in
+    // prepare(), so a band set that asks for a new topology (MSDiag, then LRDiag, then Full) finds its storage
+    // there. Without that reserve the first setBands() of each topology in each slot allocated.
+    test::group ("NaturalPhaseEq setBands() allocates nothing after prepare (MSDiag, LRDiag, Full; 1, 2 and 4 channels)");
+    {
+        auto bell = [] (eq::BandParams& b, eq::Lane l, double f, double g)
+        {
+            b.on = true; b.type = eq::FilterType::Bell; b.lane (eq::Lane::Stereo).on = false;
+            b.lane (l).on = true; b.lane (l).freq = f; b.lane (l).Q = 1.0; b.lane (l).gainDb = g;
+        };
+        eq::BandParams ms[1], lr[1], full[2];
+        bell (ms[0], eq::Lane::Mid, 1000.0, 6.0);
+        bell (lr[0], eq::Lane::Left, 800.0, -4.0);
+        bell (full[0], eq::Lane::Left, 800.0, -4.0); bell (full[1], eq::Lane::Mid, 3000.0, 5.0);
+        struct Set { const eq::BandParams* b; int n; };
+        const Set sets[] { { ms, 1 }, { lr, 1 }, { full, 2 }, { lr, 1 }, { full, 2 }, { ms, 1 } };
+        for (int nch : { 1, 2, 4 })
+        {
+            NPE e; e.prepare (sr, 512, nch, Q, 0.5f);
+            std::vector<std::vector<float>> buf ((std::size_t) nch, std::vector<float> (512, 0.0f));
+            std::vector<float*> io; for (auto& c : buf) io.push_back (c.data());
+            long long seen = 0; int accepted = 0;
+            for (const Set& s : sets)
+            {
+                const long long c0 = alloc::count.load();
+                const bool ok = e.setBands (s.b, s.n);
+                seen += alloc::count.load() - c0;
+                accepted += ok ? 1 : 0;
+                for (int k = 0; k < 400 && e.isBusy(); ++k) felitronics::test::run (e.process (io.data(), nch, 512));
+            }
+            test::ok (accepted == 6, "every band set accepted (" + std::to_string (accepted) + " of 6) [" + std::to_string (nch) + " ch]");
+            // test::ok, not okNoAlloc: that one is informational off libc++ because the STL allocates inside some
+            // process()-reachable paths there. setBands() reaches none of them — the count is 0 on libstdc++ and
+            // the MSVC STL too — and without the reserve this read 10/30/40 everywhere, which okNoAlloc hid.
+            test::ok (seen == 0, "setBands() allocated nothing across three topologies (" + std::to_string (seen) + ") ["
+                                 + std::to_string (nch) + " ch]");
+        }
+    }
+
     return test::report();
 }

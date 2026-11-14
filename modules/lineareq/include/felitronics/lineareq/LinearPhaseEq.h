@@ -86,10 +86,15 @@ public:
             for (int c = 0; c < channels_; ++c)
             {
                 chConv_.push_back (std::make_unique<Conv>());
-                if (! chConv_.back()->prepare (part, N_ + 1, warmXfade, 1)) return false;
+                if (! chConv_.back()->prepare (part, N_ + 1, warmXfade, 1)
+                    || ! chConv_.back()->reserve (Conv::Topology::LRDiag, N_ + 1)) return false;   // every bank, now
             }
         }
-        else if (! conv_.prepare (part, N_ + 1, warmXfade, channels_ == 1 ? 1 : 2)) return false;
+        // The convolver grows its banks to the IR it is handed; this EQ's IR is always N_ + 1 taps and any band
+        // set may need the Full matrix, so every bank either slot can hold is grown HERE — setBands() then
+        // allocates nothing, as it never has.
+        else if (! conv_.prepare (part, N_ + 1, warmXfade, channels_ == 1 ? 1 : 2)
+                 || ! conv_.reserve (Conv::Topology::Full, N_ + 1)) return false;
         prepared_ = true;                                      // fully built — setBands()/buildFir() may now run
         return true;
     }
@@ -136,7 +141,7 @@ public:
             return conv_.setIr (fir_[0].data(), N_ + 1);
         }
 
-        using Topo = Conv::Topology;
+        using Topo = typename Conv::Topology;
         const eq::MatrixBasis basis = eq::detectBasis (bands, numBands);
         Topo topo = Topo::MSDiag;
         int  numBanks = 2;
