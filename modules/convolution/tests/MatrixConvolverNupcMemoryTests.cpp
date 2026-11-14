@@ -571,6 +571,26 @@ void checkMemory (const char* backend)
         test::ok (ok2 && swapDown == 4 * growthO (schSmall, 0, small), be + " ...and its first swap the smaller banks (" + std::to_string (swapDown) + " B)");
     }
 
+    // A mono re-prepare releases the right channel. A request count cannot see a buffer KEPT, so this reads the
+    // releases: re-preparing a stereo instance mono frees at least the right channel's FDL and frame in every
+    // stage and its head ring (2 * stages + 1 blocks) more than re-preparing a mono instance mono does.
+    {
+        C fromStereo;
+        test::run (fromStereo.prepare (P0, cap, xfade, 2));
+        long long f0 = alloc::frees.load();
+        test::run (fromStereo.prepare (P0, cap, xfade, 1));
+        const long long stereoToMono = alloc::frees.load() - f0;
+        C fromMono;
+        test::run (fromMono.prepare (P0, cap, xfade, 1));
+        f0 = alloc::frees.load();
+        test::run (fromMono.prepare (P0, cap, xfade, 1));
+        const long long monoToMono = alloc::frees.load() - f0;
+        const long long want = 2LL * (long long) sch.size() + 1;
+        test::ok (stereoToMono - monoToMono >= want, be + " a mono re-prepare releases the right channel's history ("
+                                                     + std::to_string (stereoToMono - monoToMono) + " more blocks freed, at least "
+                                                     + std::to_string (want) + ")");
+    }
+
     // reserve(): both slots' banks for a topology, now — and then no swap up to that length allocates, whatever
     // its topology. This is what lineareq's EQs call in their prepare().
     {
