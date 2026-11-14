@@ -1,17 +1,18 @@
-### core — `RtStreams` closes its two races: the audio thread holds a busy bit, the controller's calls refuse instead of writing under it
+### core — `RtStreams`: the audio thread holds a busy bit, and the controller's calls refuse instead of racing
 
 **BREAKING (API).** `AuditionStream`, `ConvStream` and `RecStream` changed shape on purpose: an audio callback
 written for the old types no longer compiles, rather than compiling and losing publishes.
 
-Two races are gone (#273):
+Two races are gone:
 
-- **A publish under a playing block.** `AuditionStream::publish` (and `ConvStream::refill`) could overwrite the
+- **A publish under a playing block (#273).** `AuditionStream::publish` (and `ConvStream::refill`) could overwrite the
   samples a callback block, already past its flag check, was still reading. The block could also store its old
   position and its end-of-clip flag after the new clip was armed, so the new clip started midway or never played.
-  ThreadSanitizer reported it; the CI job carried a suppression for it, now removed.
-- **A recorder rewind.** A push whose `recording` check came before `stop()` could land after the next `start()`:
-  either at `buf[0]` of the new take, unordered with the previous harvest's read, or by storing the OLD length + 1
-  over the rewind, so the new take began with the old take's samples. CI's TSan job caught it intermittently.
+  ThreadSanitizer reported it, and the CI job carried a suppression for it, now removed.
+- **A recorder rewind** (CI's TSan job found it while #273 was open). A push whose `recording` check came before
+  `stop()` could land after the next `start()`: either at `buf[0]` of the new take, unordered with the previous
+  harvest's read, or by storing the OLD length + 1 over the rewind, so the new take began with the old take's
+  samples.
 
 **The gate.** `RtGate` is one atomic word per stream: the mode in the low 31 bits and a BUSY bit the audio thread
 holds while it is inside a block it was admitted to. The word changes only by read-modify-write. A controller call
@@ -37,7 +38,9 @@ changes nothing; if none is, it mutates and raises the mode again.
     audio thread reads.
   - **A route switch cannot be taken down by the old clip's end.** Live monitoring used to switch off silently when
     a clip block ended it just after the switch.
-  - **`RecStream::tryReserve` discards the take.** The old `reserve` kept a length past a shrunk buffer.
+  - **Every `tryReserve` stops the stream and empties it,** and resets its length BEFORE it allocates: a reserve
+    whose allocation throws leaves an empty stream, never a length over freed storage. The old
+    `RecStream::reserve` kept a length past a shrunk buffer.
 - **Capacities are clamped to `INT_MAX`**, never asserted. A false from a try therefore always means "a block was
   open".
 
@@ -45,9 +48,14 @@ changes nothing; if none is, it mutates and raises the mode again.
 
 **Proof.**
 
-- `felitronics_core_rtstreams_interleave_tests` runs one controller call at every atomic operation of an audio
-  block, and one block at every operation of a controller call, on one thread through a hooked atomic. It runs in
-  every tier, wasm included.
+- `felitronics_core_rtstreams_interleave_tests` runs one whole controller call at every atomic operation of an
+  audio block, and one whole block at every operation of a publish, a refill and a start, on one thread through a
+  hooked atomic. Where exceptions exist it also tests a reserve whose allocation fails. It runs in every tier,
+  wasm included.
 - `felitronics_core_rtstreams_tests` forces contention with real threads: the audio thread holds a block open, the
-  controller must be refused, then must land. The CI TSan job runs it with nothing suppressed.
-- Every protocol mutant turns at least one of the two suites red (see the PR).
+  controller must be refused, then must land. It reserves under a live reader, and it forces the ABA case where the
+  admitting CAS succeeds on a re-armed word. The CI TSan job runs it with nothing suppressed.
+- Each of 28 mutants of the protocol turns at least one suite red. Among them: a skipped wait in every try, a close
+  that publishes before its stores, an arm before the copy, every relaxed order (TSan's model kills those; on x86
+  the hardware cannot tell them apart), a reset after the allocation. Two weakenings the protocol does not rely on
+  pass, as they should: a relaxed load before the admitting CAS, and an acquire-only admitting CAS.
