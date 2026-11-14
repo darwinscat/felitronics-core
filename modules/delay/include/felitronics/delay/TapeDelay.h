@@ -442,7 +442,8 @@ public:
             refreshTail();
     }
 
-    /** 0 = fully dry, 1 = the repeats added at unity. Dry never moves. */
+    /** 0 = fully dry, 1 = the heads' repeats added at their own levels (the default head's at unity). Dry never
+        moves. */
     void setMix (float newMix) noexcept
     {
         if (std::isfinite (newMix))
@@ -546,6 +547,12 @@ public:
             envIn_.store (pk, std::memory_order_relaxed);
         }
 
+        // Where each sounding head reads, refilled every sample for the heads that sound (a silent head's entries
+        // are never read): set once per call, not zeroed per sample.
+        int   h0[kMaxHeads] {}, h1[kMaxHeads] {};
+        float hf[kMaxHeads] {};
+        bool  hLoop[kMaxHeads] {};
+
         for (int i = 0; i < numSamples; ++i)
         {
             // The motor: one exponential glide shared by both channels, so the comb never splits while it
@@ -559,9 +566,6 @@ public:
             // like the motor, and reads with the loop tap's own arithmetic below.
             if (! atRest)
                 stepHeads();
-            int   h0[kMaxHeads] {}, h1[kMaxHeads] {};
-            float hf[kMaxHeads] {};
-            bool  hLoop[kMaxHeads] {};
             for (int k = 0; k < kMaxHeads && ! plain; ++k)
             {
                 hLoop[k] = headPos_[k] >= 1.0;   // the glide never overshoots its target, and no target is past 1
@@ -685,8 +689,9 @@ public:
 
     /** HOW LONG THE LINE GOES ON SOUNDING after the last note went in, in seconds — what a plugin tells a
         host that renders offline. A recirculating line loses `repeats` of itself every time round; the
-        echoes are discrete, and the n-th leaves at n·t carrying g^(n-1), so the first under a thousandth is
-        `1 + ln(0.001)/ln(g)` of them. At zero it is one echo; at one it never decays and the answer is a
+        echoes are discrete, and the n-th pass leaves at n·t carrying A·g^(n-1) — A the heads' summed first-echo
+        level (refreshTail), 1 for the default layout — so the first under a thousandth is
+        `1 + ln(0.001/A)/ln(g)` of them, at least one. At zero it is one echo; at one it never decays and the answer is a
         million seconds — the caller caps it. Deliberately the LONG estimate: the darkening and the
         saturator bleed the loop further. Correct from construction on, before any knob is touched. */
     float tailSeconds()   const noexcept { return tailSec_.load (std::memory_order_relaxed); }
@@ -710,8 +715,10 @@ public:
     double headSamples() const noexcept { return currentDelay; }
     double offsetHeadSamples (int ch) const noexcept { return currentOff[ch < 0 ? 0 : (ch > 1 ? 1 : ch)]; }
 
-    /** Playback head `k`'s glided position (a fraction of TIME) and its side gain `side` (0 or 1) as the next
-        sample hears it — the tests' witnesses for the glide and the ramps landing. An index off the array reads 0. */
+    /** Playback head `k`'s glided position (a fraction of TIME) and its side gain `side` (0 or 1) as the last
+        sample heard them — the tests' witnesses for the glide and the ramps landing. Between a restart and the first
+        call that carries a channel the gains are not yet aimed, and these read what was last heard. An index off the
+        array reads 0. */
     double headPosition (int k) const noexcept { return k >= 0 && k < kMaxHeads ? headPos_[k] : 0.0; }
     float headGain (int k, int side) const noexcept
     {
@@ -943,11 +950,17 @@ private:
         {
             headsMono_ = mono;
             for (int k = 0; k < kMaxHeads; ++k)
+            {
+                // No head has been heard since the restart, so each is SILENT up to here and stands on its target
+                // — a position sent after a pause primed the motor would otherwise be glided to from where the
+                // pause left it, at full level from the first sample.
+                headPos_[k] = (double) headWant_[k].position;
                 for (int s = 0; s < 2; ++s)
                 {
                     headGain_[k][s] = headGainFrom_[k][s] = headGainTo_[k][s] = gainTarget (k, s);
                     headGainLeft_[k][s] = 0;
                 }
+            }
             gainsPrimed_ = true;
             return;
         }
