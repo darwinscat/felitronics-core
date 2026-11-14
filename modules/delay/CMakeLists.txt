@@ -20,4 +20,12 @@ if(FELITRONICS_BUILD_TESTS)
     target_include_directories(felitronics_delay_parity_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
     target_compile_features(felitronics_delay_parity_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_delay_parity_tests COMMAND felitronics_delay_parity_tests)
+
+    # The playback heads: placement, the figure, the pan law, the ramps and glides, re-slicing at event samples, law 8,
+    # the tail, the setter's bounds, against oracles computed outside the class (the frozen one-head class among them).
+    add_executable(felitronics_delay_heads_tests tests/TapeDelayHeadsTests.cpp)
+    target_link_libraries(felitronics_delay_heads_tests PRIVATE felitronics::delay)
+    target_include_directories(felitronics_delay_heads_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_delay_heads_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_delay_heads_tests COMMAND felitronics_delay_heads_tests)
 endif()
