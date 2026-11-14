@@ -58,7 +58,9 @@ changes nothing but the stop; if none is, it mutates, and raises the mode again 
 - `felitronics_core_rtstreams_tests` forces contention with real threads: the audio thread holds a block open, the
   controller must be refused, then must land. It reserves under a live reader, and it forces the ABA case where the
   admitting CAS succeeds on a re-armed word. The CI TSan job runs it with nothing suppressed.
-- Each of 27 mutants of the protocol turns at least one suite red. Among them: a skipped wait in every try, a close
-  that publishes before its stores, an arm before the copy, every relaxed order (TSan's model kills those; on x86
-  the hardware cannot tell them apart), a reset after the allocation. Two weakenings the protocol does not rely on
-  pass, as they should: a relaxed load before the admitting CAS, and an acquire-only admitting CAS.
+- Each of 31 mutants of the protocol turns at least one suite red. Among them: a skipped wait in every try, a close
+  that publishes before its stores, an arm before the copy or the rewind, every relaxed order (TSan's model kills
+  those; on x86 the hardware cannot tell them apart), a reset after the allocation. Four weakenings pass, as they
+  should, because nothing relies on what they remove: a relaxed load before the admitting CAS, an acquire-only
+  admitting CAS, and two changes to `AuditionStream::tryReserve`'s reset (moved after the allocation, or dropped):
+  only a publish arms that stream, and it resets both itself.
