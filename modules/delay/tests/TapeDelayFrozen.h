@@ -3,8 +3,8 @@
 
 // FROZEN TapeDelay — a verbatim copy of the class as it stood at 489f4e4 (v0.65.0), BEFORE it read the line with
 // more than one head. Only the namespace differs (felitronics::delay::frozen). It is the reference "today's sound"
-// is measured against: the shipping class at its default head layout must reproduce it to the bit through any
-// sequence of calls (TapeDelayParityTests.cpp). Never edit the arithmetic below; a test that needs a different
+// is measured against: the shipping class at its default head layout must reproduce its sound to the bit through
+// any sequence of calls (TapeDelayParityTests.cpp, which also names the two taps that depart on purpose). Never edit the arithmetic below; a test that needs a different
 // stage needs a different reference.
 
 #pragma once

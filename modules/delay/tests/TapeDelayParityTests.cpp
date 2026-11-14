@@ -10,9 +10,12 @@
 //     one-ulp nudges included), process calls of every width the contract names (stereo, a narrower mono call,
 //     the pause nch == 0, refused widths and extents), stand-by flips, resets and poison, sent to both classes
 //     alike — and, to the shipping class alone, head calls that must not change the sound (the default re-sent,
-//     silent heads moved anywhere, fields that are not numbers, indices off the array). After EVERY call the verdict, the audio and every public tap must agree bit for bit. The script is
-//     counted as it runs, and the counts are gated, so a generator that never reaches a case fails here rather
-//     than passing blind.
+//     silent heads moved anywhere, fields that are not numbers, indices off the array). After EVERY call the
+//     verdict, the audio and every public tap must agree bit for bit — but two, which depart on purpose: the tail
+//     is held to a fresh stage's for the same targets (the frozen tail could go stale), and the picture's time and
+//     offset are not compared from a reset to the next call (the shipping reset shows the targets at once). The
+//     script is counted as it runs, and the counts are gated, so a generator that never reaches a case fails here
+//     rather than passing blind.
 #include <felitronics_test.h>
 
 #include "TapeDelayFrozen.h"
@@ -192,14 +195,30 @@ void fillInput (Rng& r, std::vector<float>& x, int kind)
     }
 }
 
+/** The tail a FRESH stage reports for these targets: the formula of the knobs as they stand, worked out once. The
+    shipping class departs from the frozen one here on purpose — the frozen tail could go stale (a REPEATS of 0 kept
+    as its ~1e-38 neighbour; an OFFSET moved by one-ulp steps without a refresh) — so the shipping tail is held to
+    this instead. Every guarded knob is first sent far from its target, so the target always lands. */
+float freshTail (const delay::TapeDelayParams& t)
+{
+    delay::TapeDelay f;
+    f.setTimeMs (t.timeMs < 3000.0f ? 6000.0f : 2.0f);
+    f.setRepeats (t.repeats < 0.5f ? 1.0f : 0.0f);
+    f.setOffsetMs (t.offsetMs < 0.0f ? 30.0f : -30.0f);
+    f.setParams (t);
+    return f.tailSeconds();
+}
+
 /** Every public tap of the two, bit for bit. The subnormal witness walks both whole lines, so it is asked only
     when `deep` (every 16th call and at the end of a session) — asked after every call it was the suite's cost. */
 template <class Now>
-bool sameTaps (const Now& a, const frz::TapeDelay& b, bool deep)
+bool sameTaps (const Now& a, const frz::TapeDelay& b, bool deep, bool pictureComparable)
 {
     return a.isPrepared() == b.isPrepared() && a.maxChannels() == b.maxChannels() && a.maxBlock() == b.maxBlock()
-        && sameBits (a.tailSeconds(), b.tailSeconds()) && sameBits (a.shownTimeMs(), b.shownTimeMs())
-        && sameBits (a.shownOffsetMs(), b.shownOffsetMs()) && sameBits (a.inputPeak(), b.inputPeak())
+        && sameBits (a.tailSeconds(), freshTail (a.targets()))
+        && (! pictureComparable || (sameBits (a.shownTimeMs(), b.shownTimeMs())
+                                    && sameBits (a.shownOffsetMs(), b.shownOffsetMs())))
+        && sameBits (a.inputPeak(), b.inputPeak())
         && sameBits (a.headSamples(), b.headSamples()) && sameBits (a.offsetHeadSamples (0), b.offsetHeadSamples (0))
         && sameBits (a.offsetHeadSamples (1), b.offsetHeadSamples (1))
         && (! deep || a.anySubnormalState() == b.anySubnormalState());
@@ -270,6 +289,7 @@ int session (std::uint64_t seed, int ops, Census& n)
     Now a;
     frz::TapeDelay b;
     Sent sent;
+    bool picture = true;   // false from a reset until the next call that moves time
 
     static constexpr double kRates[] = { 1000.0, 8000.0, 22050.0, 44100.0, 48000.0, 88200.0, 96000.0, 192000.0 };
     int maxCh = 0;
@@ -338,6 +358,7 @@ int session (std::uint64_t seed, int ops, Census& n)
         {
             a.reset(); b.reset();
             if (r.chance (30)) { a.reset(); b.reset(); }
+            picture = false;   // the shipping reset shows the targets at once, the frozen one at the next call
             ++n.resets;
         }
         else if (pick < 38)   // the shipping class only: head calls that must leave today's sound as it is
@@ -387,6 +408,7 @@ int session (std::uint64_t seed, int ops, Census& n)
             if (! va) ++n.refusedCalls;
             else if (len > 0)
             {
+                picture = true;   // both have published where their heads stand
                 n.samples += len;
                 if (nch == 0) ++n.pauses;
                 else if (nch < maxCh) ++n.narrower;
@@ -400,12 +422,12 @@ int session (std::uint64_t seed, int ops, Census& n)
             else if (len == 0) ++n.zeroLength;
         }
 
-        if (! (verdictsAgree && audioAgrees && sameTaps (a, b, op % 16 == 15 || op + 1 == ops)))
+        if (! (verdictsAgree && audioAgrees && sameTaps (a, b, op % 16 == 15 || op + 1 == ops, picture)))
         {
             if (n.mismatches < 5)
                 std::printf ("      [call %d, pick %d: verdicts %s, audio %s, tail %s, time %s, offset %s, head %s, peak %s]\n",
                              op, pick, verdictsAgree ? "agree" : "DIFFER", audioAgrees ? "agrees" : "DIFFERS",
-                             sameBits (a.tailSeconds(), b.tailSeconds()) ? "=" : "DIFFERS",
+                             sameBits (a.tailSeconds(), freshTail (a.targets())) ? "=" : "DIFFERS",
                              sameBits (a.shownTimeMs(), b.shownTimeMs()) ? "=" : "DIFFERS",
                              sameBits (a.shownOffsetMs(), b.shownOffsetMs()) ? "=" : "DIFFERS",
                              sameBits (a.headSamples(), b.headSamples()) ? "=" : "DIFFERS",

@@ -65,7 +65,9 @@ same number.
   loop filter are dropped once, and its offset head snaps to its target on return. `nch == 0` is a pause:
   the shared motor glides on as through silence.
 - `reset()` is a stream restart: lines cleared, write clocks re-anchored at zero, heads re-snapped — what
-  follows does not depend on what came before.
+  follows does not depend on what came before; the picture's taps show the targets from the reset on.
+- `tailSeconds()` is the formula of the knobs as they stand: a REPEATS of exactly 0 always lands, and every
+  stored OFFSET refreshes it.
 - `feed` fades, it does not switch: what enters the record head ramps linearly to nothing, or back, over
   `kFeedRampSeconds` (5 ms), so a flip on a loud note leaves no tick in the repeats. The recirculation is
   never ramped, and a held `feed` is bit-identical to the old switch. A pause moves the ramp as silence would;
