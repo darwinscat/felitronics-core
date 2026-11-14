@@ -22,11 +22,13 @@ says. A swap refused for a null bank is now refused before it touches the inacti
 and rebuild the banks ahead of the null one first, so publishing after such a refusal now publishes what was staged
 before it.
 
-New, `reserve (topology, len)`: grows both slots' banks now, so that no later swap up to that length allocates. It has
-`prepare()`'s thread contract. `CabConvolver` (the amps, OrbitCab) gets the new behaviour with no change of its own.
+New, `reserve (topology, len)`: grows both slots' banks now, so that no later swap of that topology (or one that reads
+fewer banks) up to that length allocates. It has `prepare()`'s thread contract. `CabConvolver` (the amps, OrbitCab) gets the new behaviour with no change of its own.
 lineareq's EQs call `reserve()` from their `prepare()` for every bank either slot can hold: their IR is always the
 cap's length and any band set may need the Full matrix, and their `setBands()` promises to allocate nothing (it is
-`noexcept`). Their memory and their allocations are exactly what they were.
+`noexcept`). A fresh EQ's `prepare()` requests what it did, to the byte and the call, and `setBands()` nothing. A
+re-prepare, which used to reuse the convolver's storage, now requests its history and banks again: `prepare()`
+releases what the previous run held, for every caller.
 
 The class's COST NOTE claimed that CPU is set by the cap, and that was overstated. The input writes, the head and each
 stage's FFTs follow the schedule: with a 128-sample head that is five stages for any cap above 2048 samples. The

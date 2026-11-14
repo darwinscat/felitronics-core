@@ -337,8 +337,11 @@ int main()
                 for (int k = 0; k < 400 && e.isBusy(); ++k) felitronics::test::run (e.process (io.data(), nch, 512));
             }
             test::ok (accepted == 6, "every band set accepted (" + std::to_string (accepted) + " of 6) [" + std::to_string (nch) + " ch]");
-            test::okNoAlloc (seen == 0, "setBands() allocated nothing across three topologies (" + std::to_string (seen) + ") ["
-                                        + std::to_string (nch) + " ch]");
+            // test::ok, not okNoAlloc: that one is informational off libc++ because the STL allocates inside some
+            // process()-reachable paths there. setBands() reaches none of them — the count is 0 on libstdc++ and
+            // the MSVC STL too — and without the reserve this read 10/30/40 everywhere, which okNoAlloc hid.
+            test::ok (seen == 0, "setBands() allocated nothing across three topologies (" + std::to_string (seen) + ") ["
+                                 + std::to_string (nch) + " ch]");
         }
     }
 
