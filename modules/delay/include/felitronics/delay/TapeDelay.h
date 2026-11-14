@@ -38,6 +38,16 @@ namespace felitronics::delay
 // milliseconds — the whole comb shifts as one, a constant width, not a progressive drift. The offset line
 // glides like the time does, so turning it bends too. Dry is untouched: unity always, the wet ADDED.
 //
+// UP TO kMaxHeads PLAYBACK HEADS on the one tape, each at a POSITION that is a fraction of TIME in (0, 1], with
+// a LEVEL and a PAN. TIME stays the one motor: a head stands at position x the motor's glided time, so turning
+// TIME moves every head with it, and a head moved on its own glides under TIME's law and bends that repeat. The
+// LOOP does not read a head: REPEATS feeds back from 1x TIME, so the heads' figure repeats once per TIME and
+// decays with REPEATS — heads at 1/3, 2/3 and 1 play a triplet, and the third echo can be the loudest. PAN is
+// a BALANCE on the head's own lines, at constant power with the centre at unity on both sides (+3 dB on its
+// side at hard pan); on dual mono — one guitar on both lines, as the amps feed it — heads panned apart are a
+// ping-pong. A mono call aims every head at its level, pan aside. The default layout, one head at 1x, level
+// 1, centre, is the one-head stage to the bit (TapeDelayParityTests, against a frozen copy).
+//
 // CONTRACT (DSP-ARCHITECTURE.md §2).
 //   · prepare(sampleRate, maxBlock, maxChannels) allocates every line; process()/reset() never allocate,
 //     lock or throw. maxChannels is 1 or 2 and the rate 1 kHz … 768 kHz — anything else is REFUSED, and a
@@ -60,28 +70,60 @@ namespace felitronics::delay
 //   · Law 8: the loop filter's state and the offset glide are flushed to zero below 1e-15 PER SAMPLE
 //     (core::flushDenormal), so no path reaches the subnormal band — the line is written only through the
 //     loop filter, and a glide whose target is zero would otherwise park a few subnormals short of it. Per
-//     sample, so the flush cannot depend on how the caller slices the stream. Both heads glide in double and
-//     LAND: once an update no longer moves a head, it is put on its target (LAW8-AUDIT.md, item 6) — the
-//     app's float heads parked up to 1/(2·coeff) ulps short, 2.3 ms at 6 s.
+//     sample, so the flush cannot depend on how the caller slices the stream. The motor and the offset heads
+//     glide in double and LAND: once an update no longer moves a head, it is put on its target (LAW8-AUDIT.md,
+//     item 6) — the app's float heads parked up to 1/(2·coeff) ulps short, 2.3 ms at 6 s. The playback heads'
+//     positions glide the same way (their floor is the smallest normal float, so no glide heads for zero),
+//     every contribution a head scales on its way into the offset line is flushed like the loop filter, and a
+//     gain's ramp value is floored at the smallest normal float (a ramp restarted again and again from where the
+//     last one stood shrinks geometrically, and nothing else would stop it).
+//   · THE HEADS' CONTROLS ARE SAMPLE-CLOCKED like the motor: a position glides once per sample, LEVEL and PAN
+//     reach the head as two side gains, each on a counted kHeadRampSeconds ramp that lands on its target, and a
+//     pause steps all of them as silence would. A head that is silent stands on its target, so turning one on
+//     plays it where it was sent instead of sweeping it in. The gains are aimed at the call's width: a mono call
+//     ramps side 0 to the head's level, a stereo call back to its balance — at the edge, not as a switch. After
+//     prepare() or reset() the positions snap with the motor, and the gains — with the positions again, since no
+//     head has been heard until then — on the first call that carries a channel (a pause has no width to aim
+//     them for).
 //   · POISON: a non-finite INPUT sample is not recorded (the dry keeps it — it is not this stage's to
 //     change); a non-finite loop state at the end of a call restarts the line from silence. Knob values are
-//     bounded before they reach any arithmetic: a non-finite one is ignored, a finite one is clamped.
+//     bounded before they reach any arithmetic: a non-finite one is ignored, a finite one is clamped. A head's
+//     three fields are bounded each on its own, and a head index off the array is ignored.
 //   · THREADS: prepare, reset, the setters and process belong to ONE thread (the audio thread, or whichever
-//     owns the stage). tailSeconds, shownTimeMs, shownOffsetMs and inputPeak are relaxed atomics that any
-//     other thread may read.
+//     owns the stage). tailSeconds, shownTimeMs, shownOffsetMs, shownHeadMs and inputPeak are relaxed atomics
+//     that any other thread may read.
 //   · Math: core::det (exp2, log2, pow) for the coefficients and the tail, and a det-built tanh per sample in
-//     the loop — ~5 ns a call, measured against the system tanh's ~2: one call per sample per channel.
+//     the loop — ~5 ns a call, measured against the system tanh's ~2: one call per sample per channel. The pan
+//     law is rational (one correctly rounded sqrt, in the setter), so it needs no det call.
 //==============================================================================
 
-/** The knobs, in the units the stage takes. `TapeDelay::setParams` applies them in this order, through
-    the same guarded setters a caller may use one by one. */
+/** How many playback heads one tape carries. Every per-head state is an array this long, so a tape with more
+    heads is this number and nothing else. At namespace scope: the knob struct below is declared before the class. */
+inline constexpr int kMaxHeads = 4;
+
+/** One playback head. A default-constructed head is OFF (level 0). */
+struct TapeDelayHead
+{
+    float position = 1.0f;   ///< a fraction of TIME, (0, 1]: 1 is the full delay, 1/3 a third of it
+    float level    = 0.0f;   ///< linear, 0 … 1; 0 is off
+    float pan      = 0.0f;   ///< the balance on the head's own lines, -1 left … +1 right, constant power
+};
+
+using TapeDelayHeads = std::array<TapeDelayHead, kMaxHeads>;
+
+/** The knobs, in the units the stage takes — the WHOLE state: `TapeDelay::setParams` applies every field, the
+    heads included, in this order, through the same guarded setters a caller may use one by one. A struct built
+    without heads carries the default layout, so a caller that sets the heads with `setHead` and then hands over a
+    fresh struct every block hands the default layout back every block: use one door or the other. */
 struct TapeDelayParams
 {
-    float timeMs   = 350.0f;   ///< the head's destination, ms (1 … 6100); free, or from `timeMsFor()`
+    float timeMs   = 350.0f;   ///< the delay's destination, ms (1 … 6100); free, or from `timeMsFor()`
     float repeats  = 0.35f;    ///< feedback 0..1 — the dark filter and the saturator keep even 1 bounded
     float darkHz   = 4000.0f;  ///< the loop low-pass corner, Hz (`darkHzForPercent()` maps the DARK knob)
     float offsetMs = 0.0f;     ///< signed: positive holds the RIGHT repeats back, negative the left (±31)
-    float mix      = 0.25f;    ///< 0 = dry only, 1 = the repeats added at unity; dry never moves
+    float mix      = 0.25f;    ///< 0 = dry only, 1 = the heads' repeats added at their own levels; dry never moves
+    /// the playback heads; the default is ONE head at 1x TIME, level 1, centre — the one-head stage to the bit
+    TapeDelayHeads heads { { TapeDelayHead { 1.0f, 1.0f, 0.0f } } };
 };
 
 namespace detail
@@ -99,6 +141,12 @@ namespace detail
     }
 
     inline float clampf (float lo, float hi, float v) noexcept { return v < lo ? lo : (hi < v ? hi : v); }
+
+    /** EXACTLY equal, for the heads' guards (both values finite and bounded by then). nearlyEqual's absolute
+        branch would take a request for exactly 0 for its 1e-38 neighbour and keep the neighbour, and a level
+        that never reaches 0 never turns its head off. Spelt without == (-Wfloat-equal); ±0 are one value. */
+    inline bool sameValue (float a, float b) noexcept { return ! (a < b) && ! (b < a); }
+    inline bool sameValue (double a, double b) noexcept { return ! (a < b) && ! (b < a); }
 
     inline constexpr double kLog2E = 1.4426950408889634074;
 
@@ -150,7 +198,26 @@ public:
         Counted in samples at the prepared rate (240 at 48 kHz, 5 at 1 kHz). */
     static constexpr double kFeedRampSeconds = 0.005;
 
-    TapeDelay() noexcept { refreshTail(); }
+    static constexpr int kMaxHeads = delay::kMaxHeads;
+
+    /** A head's position floor: the smallest normal float, so a position never heads for zero (a glide toward
+        zero would park subnormals short of it). Any position under one sample of delay plays at one sample —
+        the motor's own floor — which at 48 kHz is 20.8 µs. */
+    static constexpr float kMinHeadPosition = std::numeric_limits<float>::min();
+
+    /** How long a head's LEVEL or PAN takes to arrive: each of its two side gains travels a counted linear ramp of
+        this length and lands on its target exactly (960 samples at 48 kHz). Linear in GAIN: a jump from hard left
+        to hard right dips the head's power by up to 3 dB mid-ramp; a hand on the knob moves far less a ramp. */
+    static constexpr double kHeadRampSeconds = 0.02;
+
+    TapeDelay() noexcept
+    {
+        setHeads (TapeDelayParams {}.heads);
+        for (int k = 0; k < kMaxHeads; ++k)
+            headPos_[k] = (double) headWant_[k].position;
+        publishHeadTargets();
+        refreshTail();
+    }
 
     /** Allocates every line for `maxChannels` (1 or 2) at `sampleRate` (1 kHz … 768 kHz). `maxBlock` (>= 1) is
         recorded, not a limit: the stage has no block-sized scratch. A refused prepare DISARMS the instance. */
@@ -201,6 +268,23 @@ public:
         feedLen_  = std::max (1, (int) (kFeedRampSeconds * sampleRate + 0.5));
         feedStep_ = 1.0f / (float) feedLen_;
 
+        // The heads, seeded like the motor: on their targets, the gains aimed on the first call that carries
+        // a channel.
+        headRampLen_  = std::max (1, (int) (kHeadRampSeconds * sampleRate + 0.5));
+        headRampStep_ = 1.0 / (double) headRampLen_;
+        for (int k = 0; k < kMaxHeads; ++k)
+        {
+            headPos_[k] = (double) headWant_[k].position;
+            for (int s = 0; s < 2; ++s)
+            {
+                headGain_[k][s] = headGainFrom_[k][s] = headGainTo_[k][s] = 0.0f;
+                headGainLeft_[k][s] = 0;
+            }
+        }
+        gainsPrimed_ = false;
+        headsMono_   = false;
+        publishHeadTargets();
+
         prepared_ = true;
         return true;
     }
@@ -230,9 +314,10 @@ public:
         offPos   = 0;   // depend on how long the stream ran before it
         primed  = false;
         cleared = true;
+        gainsPrimed_ = false;   // the heads snap with the motor, their gains on the next call that carries a channel
     }
 
-    /** All five knobs, in the order the app sets them. */
+    /** The whole state: the five knobs in the order the app sets them, then the heads. */
     void setParams (const TapeDelayParams& p) noexcept
     {
         setTimeMs (p.timeMs);
@@ -240,6 +325,56 @@ public:
         setDarkHz (p.darkHz);
         setOffsetMs (p.offsetMs);
         setMix (p.mix);
+        setHeads (p.heads);
+    }
+
+    /** Head `k` (0 … kMaxHeads-1; any other index is ignored). Each field is bounded on its own — a non-finite one
+        leaves that field as it was, a finite one is clamped: POSITION to [kMinHeadPosition, 1], LEVEL to [0, 1]
+        (under 1e-15 it is 0: off), PAN to [-1, 1]. Re-sending what the head already holds changes nothing; a new
+        position glides there under TIME's law, a new level or pan ramps there over kHeadRampSeconds. */
+    void setHead (int k, const TapeDelayHead& h) noexcept
+    {
+        if (k < 0 || k >= kMaxHeads)
+            return;
+
+        TapeDelayHead want = headWant_[k];
+        if (std::isfinite (h.position))
+            want.position = detail::clampf (kMinHeadPosition, 1.0f, h.position);
+        if (std::isfinite (h.level))
+        {
+            want.level = detail::clampf (0.0f, 1.0f, h.level);
+            core::flushDenormal (want.level);   // a level of 1e-38 is a head that never turns off
+        }
+        if (std::isfinite (h.pan))
+            want.pan = detail::clampf (-1.0f, 1.0f, h.pan);
+
+        const bool moved = ! detail::sameValue (want.position, headWant_[k].position);
+        const bool aimed = ! detail::sameValue (want.level, headWant_[k].level)
+                        || ! detail::sameValue (want.pan, headWant_[k].pan);
+        headWant_[k] = want;
+
+        if (aimed)
+        {
+            aimHead (k);
+
+            // The tail follows what the heads add up to — and only that: a silent head's pan, or the default
+            // re-sent, moves no estimate.
+            const double peak = headPeakGain();
+            if (! detail::sameValue (peak, headPeak_))
+            {
+                headPeak_ = peak;
+                refreshTail();
+            }
+        }
+        if ((moved || aimed) && ! primed)
+            publishHeadTargets();   // a running stage publishes where its heads stand, after each call
+    }
+
+    /** Every head at once — `setHead` for each, in index order. */
+    void setHeads (const TapeDelayHeads& heads) noexcept
+    {
+        for (int k = 0; k < kMaxHeads; ++k)
+            setHead (k, heads[(std::size_t) k]);
     }
 
     /** The head's destination, in milliseconds — free, or `timeMsFor()`. The line glides there; big moves
@@ -258,6 +393,8 @@ public:
         }
 
         shownTimeMs_.store (timeMs, std::memory_order_relaxed);   // process() overwrites with the glide
+        if (! primed)
+            publishHeadTargets();   // the heads stand at a fraction of TIME, so the picture's heads move with it
     }
 
     /** Feedback, 0..1. The dark filter and the saturator live inside the loop, so even 1 is a long
@@ -306,7 +443,8 @@ public:
             refreshTail();
     }
 
-    /** 0 = fully dry, 1 = the repeats added at unity. Dry never moves. */
+    /** 0 = fully dry, 1 = the heads' repeats added at their own levels (the default head's at unity). Dry never
+        moves. */
     void setMix (float newMix) noexcept
     {
         if (std::isfinite (newMix))
@@ -343,9 +481,24 @@ public:
             currentOff[1] = offsetMs > 0.0f ?  offsetMs * 0.001f * (float) sampleRate : 0.0f;
             offPrimed_[0] = offPrimed_[1] = true;
             feedPos_ = feed ? feedLen_ : 0;   // ...and the door stands where this call wants it: no fade-in
+            for (int k = 0; k < kMaxHeads; ++k)
+                headPos_[k] = (double) headWant_[k].position;   // the playback heads snap with the motor
             primed  = true;
         }
         cleared = false;
+
+        // The heads' gains are aimed at the width of a call that carries a channel; a pause has none.
+        if (nch > 0)
+            aimWidth (nch == 1);
+
+        // AT REST: every head on its target and every ramp landed. The setters run between calls and nothing
+        // inside one moves a target, so heads at rest stay at rest to the call's end, and stepHeads() would be
+        // an exact no-op on every sample of it (a snap onto the target a head stands on, a glide of zero that
+        // lands where it is, ramps that are done) — skipped. And when the one head sounding is a 1x head at a
+        // gain of exactly 1 on every side the call reads — the default layout — the heads play the loop's own
+        // tap, which is what the general sum would make of it.
+        const bool atRest = headsAtRest();
+        const bool plain  = atRest && plainLoopHead (nch);
 
         const float tgtOff[2] = {
             offsetMs < 0.0f ? -offsetMs * 0.001f * (float) sampleRate : 0.0f,
@@ -368,7 +521,11 @@ public:
             // Law 11c — a pause is silence for the shared motor: it glides on as it would through n samples
             // of digital silence. Every channel stopped above, so there is no line to read or write.
             for (int i = 0; i < numSamples; ++i)
+            {
                 glide (currentDelay, tgtDelay, glideCoeff);
+                if (! atRest)
+                    stepHeads();   // ...and so do the heads' positions and gains
+            }
 
             feedPos_ = feedAfter (numSamples, feed);   // the door travels on, as through silence
             writePos = (int) (((long long) writePos + numSamples) % lineN_);
@@ -397,6 +554,33 @@ public:
             // travels.
             glide (currentDelay, tgtDelay, glideCoeff);
             const float dly = detail::clampf (1.0f, (float) (lineN - 4), (float) currentDelay);
+
+            // The playback heads: one step of their controls, then where each sounding head reads — once per
+            // sample, shared by the channels like the motor. A head at 1x reads where the loop does, so it is
+            // the loop's own tap; any other stands at position x the motor's glided time, floored at one sample
+            // like the motor, and reads with the loop tap's own arithmetic below.
+            if (! atRest)
+                stepHeads();
+            // Per sample, as locals: measured faster with four heads than one set per call, and no slower on the
+            // default path.
+            int   h0[kMaxHeads] {}, h1[kMaxHeads] {};
+            float hf[kMaxHeads] {};
+            bool  hLoop[kMaxHeads] {};
+            for (int k = 0; k < kMaxHeads && ! plain; ++k)
+            {
+                hLoop[k] = headPos_[k] >= 1.0;   // the glide never overshoots its target, and no target is past 1
+                if (hLoop[k] || ! (headGain_[k][0] > 0.0f || headGain_[k][1] > 0.0f))
+                    continue;
+
+                const float hd = detail::clampf (1.0f, (float) (lineN - 4), (float) (headPos_[k] * currentDelay));
+                float hpos = (float) writePos - hd;
+                if (hpos < 0.0f)
+                    hpos += (float) lineN;
+                const int hwhole = (int) hpos;   // A HAIR SHORT OF THE END, as for the loop tap below
+                hf[k] = hpos - (float) hwhole;
+                h0[k] = hwhole == lineN ? 0 : hwhole;
+                h1[k] = h0[k] + 1 == lineN ? 0 : h0[k] + 1;
+            }
 
             // The door: one sample of travel toward `feed`, shared by both channels like the motor.
             if (feedPos_ != feedTo)
@@ -427,6 +611,33 @@ public:
                 const float tap = ln[i0] * (1.0f - f)
                                 + ln[i1] * f;
 
+                // What the heads play on this channel, read before the record head writes: each sounding head's
+                // tap on this side, in index order. A contribution at a gain of exactly 1 is the tap itself — the
+                // default head is the one-head stage's `tap`, bit for bit — and any other is scaled, then flushed
+                // (law 8: a landed ramp still scales, and a tiny product would reach the offset line's band). The
+                // sum starts from the first contribution; with none, the heads play +0 and the loop runs on. A
+                // mono call reads side 0, which aimWidth has aimed at each head's level.
+                float heard = plain ? tap : 0.0f;
+                bool  sounding = false;
+                for (int k = 0; k < kMaxHeads && ! plain; ++k)
+                {
+                    const float g = headGain_[k][ch];
+                    if (! (g > 0.0f))
+                        continue;
+
+                    const float ht = hLoop[k] ? tap
+                                              : ln[h0[k]] * (1.0f - hf[k])
+                                              + ln[h1[k]] * hf[k];
+                    float c = ht;
+                    if (! (g >= 1.0f && g <= 1.0f))
+                    {
+                        c = ht * g;
+                        core::flushDenormal (c);
+                    }
+                    heard = sounding ? heard + c : c;
+                    sounding = true;
+                }
+
                 // The record head: input plus the recirculation, darkened and pressed — the first echo
                 // already wears one pass, the n-th wears n. A sample that is not a number is not recorded;
                 // the dry keeps it, it is not ours. The input comes through the door — the plain sample when
@@ -443,7 +654,7 @@ public:
                 // write position: it is a short line, and the long line's clock would walk past its end.
                 glide (currentOff[ch], tgtOff[ch], offGlideCoeff);
                 core::flushDenormal (currentOff[ch]);   // law 8: a glide to zero parks subnormals short of it
-                ol[offPos] = tap;
+                ol[offPos] = heard;
 
                 float opos = (float) offPos - detail::clampf (0.0f, (float) (offN - 4), (float) currentOff[ch]);
                 if (opos < 0.0f)
@@ -478,8 +689,9 @@ public:
 
     /** HOW LONG THE LINE GOES ON SOUNDING after the last note went in, in seconds — what a plugin tells a
         host that renders offline. A recirculating line loses `repeats` of itself every time round; the
-        echoes are discrete, and the n-th leaves at n·t carrying g^(n-1), so the first under a thousandth is
-        `1 + ln(0.001)/ln(g)` of them. At zero it is one echo; at one it never decays and the answer is a
+        echoes are discrete, and the n-th pass leaves at n·t carrying A·g^(n-1) — A the heads' summed first-echo
+        level (refreshTail), 1 for the default layout — so the first under a thousandth is
+        `1 + ln(0.001/A)/ln(g)` of them, at least one. At zero it is one echo; at one it never decays and the answer is a
         million seconds — the caller caps it. Deliberately the LONG estimate: the darkening and the
         saturator bleed the loop further. Correct from construction on, before any knob is touched. */
     float tailSeconds()   const noexcept { return tailSec_.load (std::memory_order_relaxed); }
@@ -490,12 +702,32 @@ public:
     float shownOffsetMs() const noexcept { return shownOffsetMs_.load (std::memory_order_relaxed); }
     float inputPeak()     const noexcept { return envIn_.load (std::memory_order_relaxed); }
 
+    /** Where playback head `k` stands, in ms of delay before OFFSET — its glided position times the glided time,
+        floored at one sample, as it reads; its target while the stage does not run. For the picture: each tap is
+        its own atomic, not one snapshot of all four. An index off the array reads 0. */
+    float shownHeadMs (int k) const noexcept
+    {
+        return k >= 0 && k < kMaxHeads ? shownHeadMs_[k].load (std::memory_order_relaxed) : 0.0f;
+    }
+
     /** Where the heads stand, in samples — the motor's delay and channel `ch`'s offset (0 or 1). The tests read
         them to see a glide LAND on its target, bit for bit. */
     double headSamples() const noexcept { return currentDelay; }
     double offsetHeadSamples (int ch) const noexcept { return currentOff[ch < 0 ? 0 : (ch > 1 ? 1 : ch)]; }
 
-    /** True when any recursive state sits in the subnormal band — the law-8 witness for the tests. */
+    /** Playback head `k`'s position (a fraction of TIME) and its side gain `side` (0 or 1) as the controls stand
+        now — the tests' witnesses for the glide and the ramps landing. Between a restart and the first call that
+        carries a channel the gains are not aimed yet: after prepare() they read 0, after reset() what they were;
+        a pause in that window puts the positions on their targets. An index off the array reads 0. */
+    double headPosition (int k) const noexcept { return k >= 0 && k < kMaxHeads ? headPos_[k] : 0.0; }
+    float headGain (int k, int side) const noexcept
+    {
+        return k >= 0 && k < kMaxHeads && side >= 0 && side < 2 ? headGain_[k][side] : 0.0f;
+    }
+
+    /** True when any state sits in the subnormal band — the law-8 witness for the tests: the lines and the offset
+        lines, the loop filters, the motor and the offset glides, and per playback head its position, its gains as
+        heard, both ends of each ramp and its balance targets. */
     bool anySubnormalState() const noexcept
     {
         const auto sub = [] (auto v) { return std::fpclassify (v) == FP_SUBNORMAL; };
@@ -506,7 +738,15 @@ public:
             for (float v : line[ch])
                 if (sub (v))
                     return true;
+            for (float v : offLine[ch])
+                if (sub (v))
+                    return true;
         }
+        for (int k = 0; k < kMaxHeads; ++k)
+            for (int s = 0; s < 2; ++s)
+                if (sub (headPos_[k]) || sub (headGain_[k][s]) || sub (headGainFrom_[k][s]) || sub (headGainTo_[k][s])
+                    || sub (headGainWant_[k][s]))
+                    return true;
         return sub (currentDelay);
     }
 
@@ -537,7 +777,8 @@ private:
 
     void updateCoeffs() noexcept
     {
-        // The motor's inertia: ~150 ms to the new time — enough travel to hear the bend.
+        // The motor's inertia: a 150 ms time constant (37 % of the distance still to go after it; the landing
+        // comes much later, by glide()'s rule) — enough travel to hear the bend.
         glideCoeff    = 1.0 - detail::detExp (-1.0 / (0.15 * sampleRate));
         offGlideCoeff = 1.0 - detail::detExp (-1.0 / (0.03 * sampleRate));
         lpfCoeff      = 1.0f - (float) detail::detExp (-kTwoPi * (double) darkHz / sampleRate);
@@ -562,6 +803,173 @@ private:
         shownTimeMs_.store ((float) (currentDelay / sampleRate * 1000.0), std::memory_order_relaxed);
         shownOffsetMs_.store ((float) ((currentOff[1] - currentOff[0]) / sampleRate * 1000.0),
                               std::memory_order_relaxed);
+
+        // ...and each playback head where it reads: the same product and floor as the read itself.
+        const float hi = (float) (lineN_ - 4);
+        for (int k = 0; k < kMaxHeads; ++k)
+        {
+            const float hd = detail::clampf (1.0f, hi, (float) (headPos_[k] * currentDelay));
+            shownHeadMs_[k].store ((float) ((double) hd / sampleRate * 1000.0), std::memory_order_relaxed);
+        }
+    }
+
+    /** Before the stage runs, the picture shows where the heads are SENT: position x TIME. */
+    void publishHeadTargets() noexcept
+    {
+        for (int k = 0; k < kMaxHeads; ++k)
+            shownHeadMs_[k].store ((float) ((double) headWant_[k].position * (double) timeMs), std::memory_order_relaxed);
+    }
+
+    /** One sample of every playback head's controls — the audio loop and a pause both run THIS, so a pause moves
+        them exactly as silence would. A head silent coming into the sample stands on its target; a sounding one
+        glides there under TIME's law and lands. Then each side gain takes one step of its ramp. Until the first
+        call that carries a channel aims the gains (after prepare or reset), there is nothing to hear: the heads
+        stand on their targets and the ramps wait. */
+    void stepHeads() noexcept
+    {
+        for (int k = 0; k < kMaxHeads; ++k)
+        {
+            const double want = (double) headWant_[k].position;
+            if (! gainsPrimed_ || ! (headGain_[k][0] > 0.0f || headGain_[k][1] > 0.0f))
+                headPos_[k] = want;
+            else
+                glide (headPos_[k], want, glideCoeff);
+
+            if (! gainsPrimed_)
+                continue;
+            for (int s = 0; s < 2; ++s)
+            {
+                if (headGainLeft_[k][s] == 0)
+                    continue;   // landed: the gain IS its target, no arithmetic
+                const int left = --headGainLeft_[k][s];
+                const double from = (double) headGainFrom_[k][s], to = (double) headGainTo_[k][s];
+                float g = left == 0 ? headGainTo_[k][s]
+                                    : (float) core::det::mulAdd (to - from,
+                                                                 (double) (headRampLen_ - left) * headRampStep_,
+                                                                 from);
+
+                // Law 8. One ramp never steps under target/N, and every target is zero or normal (a level of
+                // 1e-15 one float short of hard pan is ~4e-23). But a ramp restarted from where the last one
+                // stood — a level sent up and back down before every sample — shrinks the gain geometrically, and
+                // only this floor stops it at the edge of the subnormal band. Not the house 1e-15: the pan law
+                // makes gains that small on purpose, and a ramp must land on the law's bits. (A gain that small
+                // plays nothing either way — every scaled contribution is flushed at 1e-15.)
+                if (std::fabs (g) < std::numeric_limits<float>::min())
+                    g = 0.0f;
+                headGain_[k][s] = g;
+            }
+        }
+    }
+
+    /** Every head standing on its target and every ramp landed — see AT REST in process(). */
+    bool headsAtRest() const noexcept
+    {
+        for (int k = 0; k < kMaxHeads; ++k)
+            if (! detail::sameValue (headPos_[k], (double) headWant_[k].position)
+                || headGainLeft_[k][0] != 0 || headGainLeft_[k][1] != 0)
+                return false;
+        return true;
+    }
+
+    /** Exactly one head sounds on the sides a call of `nch` channels reads (side 0 alone in a mono call), it reads
+        where the loop does (position 1), and it plays them at a gain of exactly 1; every other head is silent on
+        them. Then the heads' sum is the loop's tap, unscaled. */
+    bool plainLoopHead (int nch) const noexcept
+    {
+        int unity = 0;
+        for (int k = 0; k < kMaxHeads; ++k)
+        {
+            bool silent = true, one = headPos_[k] >= 1.0;
+            for (int s = 0; s < nch && s < 2; ++s)
+            {
+                const float g = headGain_[k][s];
+                silent = silent && ! (g > 0.0f);
+                one    = one && g >= 1.0f && g <= 1.0f;
+            }
+            if (one)
+                ++unity;
+            else if (! silent)
+                return false;
+        }
+        return unity == 1;
+    }
+
+    /** A, the tail's first-echo level: the sum over the heads of level x the louder side gain — at least the
+        level, so it covers a mono call too. Exactly 1 for the default layout. */
+    double headPeakGain() const noexcept
+    {
+        double a = 0.0;
+        for (int k = 0; k < kMaxHeads; ++k)
+            a += (double) std::max (headGainWant_[k][0], headGainWant_[k][1]);
+        return a;
+    }
+
+    /** Side `s`'s destination for head `k` at the width the gains are aimed for: in a mono call side 0 plays
+        the head's level, pan aside; otherwise each side its balance. */
+    float gainTarget (int k, int s) const noexcept
+    {
+        return s == 0 && headsMono_ ? headWant_[k].level : headGainWant_[k][s];
+    }
+
+    /** Send side `s` of head `k` on a fresh ramp from where it stands — unless it is already headed there. */
+    void retarget (int k, int s) noexcept
+    {
+        const float to = gainTarget (k, s);
+        if (detail::sameValue (to, headGainTo_[k][s]))
+            return;   // a re-send must not restart the ramp: that would hang the sound on the caller's blocks
+        headGainFrom_[k][s] = headGain_[k][s];
+        headGainTo_[k][s]   = to;
+        headGainLeft_[k][s] = headRampLen_;
+    }
+
+    /** A head's level or pan moved: its two balance gains, from the rational constant-power law
+        gL = (1 - p)/sqrt(1 + p²), gR = (1 + p)/sqrt(1 + p²) — gL² + gR² = 2 for every p, exactly (1, 1) at the
+        centre and (√2, 0) at the left end, mirror-exact, every operation correctly rounded (p·p is exact in
+        double), so the same bits on every row with no det call. It is a rotation by atan(p) rather than p·45°,
+        at most 4.1° from the sine law. Then the ramps, if the gains are aimed. */
+    void aimHead (int k) noexcept
+    {
+        const double p = (double) headWant_[k].pan, lv = (double) headWant_[k].level;
+        const double r = std::sqrt (1.0 + p * p);
+        headGainWant_[k][0] = (float) (lv * ((1.0 - p) / r));
+        headGainWant_[k][1] = (float) (lv * ((1.0 + p) / r));
+
+        if (gainsPrimed_)
+        {
+            retarget (k, 0);
+            retarget (k, 1);
+        }
+    }
+
+    /** The call carries a channel: the gains are aimed for its width. The first such call after prepare() or
+        reset() puts every gain ON its target (the stage is waking, like the motor); after that a change of width
+        sends side 0 to its new target on a ramp — the mono level or the balance — so the edge has no step. */
+    void aimWidth (bool mono) noexcept
+    {
+        if (! gainsPrimed_)
+        {
+            headsMono_ = mono;
+            for (int k = 0; k < kMaxHeads; ++k)
+            {
+                // No head has been heard since the restart, so each is SILENT up to here and stands on its target
+                // — a position sent after a pause primed the motor would otherwise be glided to from where the
+                // pause left it, at full level from the first sample.
+                headPos_[k] = (double) headWant_[k].position;
+                for (int s = 0; s < 2; ++s)
+                {
+                    headGain_[k][s] = headGainFrom_[k][s] = headGainTo_[k][s] = gainTarget (k, s);
+                    headGainLeft_[k][s] = 0;
+                }
+            }
+            gainsPrimed_ = true;
+            return;
+        }
+
+        if (mono == headsMono_)
+            return;
+        headsMono_ = mono;
+        for (int k = 0; k < kMaxHeads; ++k)
+            retarget (k, 0);
     }
 
     // The saturator, fixed by taste: gentle at echo level, a press at full recirculation.
@@ -571,16 +979,24 @@ private:
 
     /** Worked out where the numbers it depends on are set, rather than where it is asked: the asker may be
         any thread and these are the audio thread's. Every setter checks first, so an untouched knob costs no
-        logarithm. log2 for ln: the ratio is the same in any base. */
+        logarithm. log2 for ln: the ratio is the same in any base.
+        THE HEADS. No head plays past 1x TIME, so the last echo of each pass is no later than the one head's; but
+        heads stacked on one place add, and hard pan is +3 dB on its side. So the first echo starts at A, the sum
+        over heads of level × the louder side gain, and the count is the passes until A·g^(n-1) falls under a
+        thousandth: 1 + log2(0.001/A)/log2(g), at least one. The default layout's A is exactly 1, and 0.001/1 is
+        0.001: the one-head stage's estimate, to the bit. */
     void refreshTail() noexcept
     {
         const double t   = (double) timeMs * 0.001;
         const double g   = (double) repeats;
         const double off = std::abs ((double) offsetMs) * 0.001;   // one side arrives this much later
 
+        const double a = headPeak_;
+
         tailSec_.store ((float) (off + (g <= 0.0 ? t
                                       : g >= 1.0 ? 1.0e6            // never decays; the caller caps it
-                                                 : t * (1.0 + core::det::log2 (0.001) / core::det::log2 (g)))),
+                                      : a > 0.001 ? t * (1.0 + core::det::log2 (0.001 / a) / core::det::log2 (g))
+                                                  : t)),            // the first echo is already under a thousandth
                         std::memory_order_relaxed);
     }
 
@@ -614,6 +1030,21 @@ private:
     bool  primed = false, cleared = true;
     bool  prepared_ = false;
     int   maxBlock_ = 0, maxCh_ = 0;
+
+    // The playback heads — RAW arrays, as the rest of the state is: the container type of an operand on the
+    // default path was measured to move FMA contraction under gcc (arm64, -ffp-contract=on).
+    TapeDelayHead headWant_[kMaxHeads] {};           // the targets, canonical: bounded and flushed by setHead
+    float  headGainWant_[kMaxHeads][2] {};           // each target's balance gains, level x the pan law
+    double headPos_[kMaxHeads] {};                   // the glided positions, in double like the motor
+    float  headGain_[kMaxHeads][2] {};               // the side gains as heard; side 0 is the mono gain in a mono call
+    float  headGainFrom_[kMaxHeads][2] {}, headGainTo_[kMaxHeads][2] {};   // each ramp's ends
+    int    headGainLeft_[kMaxHeads][2] {};           // samples left on each ramp; 0 = landed on headGainTo_
+    int    headRampLen_ = 1;
+    double headRampStep_ = 1.0;                      // 1 / headRampLen_
+    double headPeak_ = 0.0;                          // headPeakGain() as the tail last read it
+    bool   gainsPrimed_ = false;                     // false: the next call that carries a channel puts them on target
+    bool   headsMono_ = false;                       // the width the gains are aimed at: the last call that had one
+    std::atomic<float> shownHeadMs_[kMaxHeads] {};
 };
 
 } // namespace felitronics::delay
