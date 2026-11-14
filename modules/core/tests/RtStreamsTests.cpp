@@ -110,6 +110,7 @@ void audition()
             if (a.tryPublish (clip.data(), (std::size_t) lenFor (id))) ++landedWhileHeld; else ++forcedRefusals;
             hold.release.store (id, rlx);
         }
+        if (k % 50 == 49) while (! a.tryReserve (256)) ++refused;            // resize under a live reader
         while (! a.tryPublish (clip.data(), (std::size_t) lenFor (id))) ++refused;
     }
     hold.request.store (0, rlx);
@@ -170,6 +171,7 @@ void conv()
     for (long id = 1; id <= 3000; ++id) {
         const int n = lenFor (id) % 64 + 1;
         for (int i = 0; i < n; ++i) clip[(std::size_t) i] = (float) id;
+        if (id % 50 == 0) while (! c.tryReserve (64)) ++refused;             // resize under a live reader
         while (! c.tryRefill (clip.data(), (std::size_t) n)) ++refused;
         if (! c.trySetMode (C::kClip)) ++notGuaranteed;                      // right after a true refill: never refused
         if (id % 10 == 0) {                                                  // forced contention on the switch
@@ -227,6 +229,7 @@ void rec()
     float lastOfPrevious = 0.0f;
     std::vector<float> take;
     for (long k = 1; k <= 600; ++k) {
+        if (k % 50 == 0) while (! r.tryReserve (4096)) ++refusedStart;      // resize under a live pusher
         while (! r.tryStart()) ++refusedStart;
         if (! waitFor ([&] { return r.recorded() >= 64; })) ++timeouts;
         if (k % 2 == 0) {                                                    // restart at once, no harvest
@@ -267,6 +270,68 @@ void rec()
     std::printf ("    rec: %ld start / %ld harvest unforced refusals\n", refusedStart, refusedHarvest);
 }
 
+// ---- forced ABA on the admitting CAS --------------------------------------------------------------------
+// After the audio thread's load in enter() sees the mode up, the controller runs a WHOLE tryPublish (quiesce,
+// copy, arm) before the audio thread's CAS: the CAS then succeeds on a word that holds the same mode as the
+// load but belongs to a NEWER clip. That block must see the new clip whole, which only the CAS's acquire
+// gives it. A scheduler produces this rarely, so it is forced through the Atom seam (the hook is relaxed:
+// it supplies no edge of its own).
+std::atomic<long> abaWant { 0 }, abaDone { 0 };
+std::atomic<bool> abaGo { true };
+thread_local bool abaAudioThread = false;
+struct AbaU32 {
+    std::atomic<std::uint32_t> a;
+    AbaU32 (std::uint32_t v) noexcept : a (v) {}
+    std::uint32_t load (std::memory_order o) const noexcept {
+        const auto v = a.load (o);
+        if (abaAudioThread && (v & 0x7fffffffu) != 0u && (v & 0x80000000u) == 0u) {   // about to CAS
+            const long r = abaWant.load (rlx) + 1;
+            abaWant.store (r, rlx);
+            while (abaDone.load (rlx) < r && abaGo.load (rlx)) std::this_thread::yield();
+        }
+        return v;
+    }
+    bool compare_exchange_strong (std::uint32_t& e, std::uint32_t d, std::memory_order sc, std::memory_order f) noexcept {
+        return a.compare_exchange_strong (e, d, sc, f);
+    }
+    std::uint32_t fetch_and (std::uint32_t m, std::memory_order o) noexcept { return a.fetch_and (m, o); }
+};
+
+void forcedAba()
+{
+    group ("AuditionStream: the admitting CAS succeeds on a re-armed word (forced ABA)");
+    felitronics::core::BasicAuditionStream<AbaU32> s;
+    std::vector<float> clip (64, 8.0f);
+    ok (s.tryReserve (64) && s.tryPublish (clip.data(), 8), "reserve + first clip");
+    std::atomic<long> admitted { 0 }, torn { 0 }, aba { 0 };
+    std::thread audio ([&] {
+        abaAudioThread = true;
+        while (abaGo.load (rlx)) {
+            auto b = s.beginBlock();
+            if (! b) continue;
+            admitted.fetch_add (1, rlx);
+            const float m = b.data()[0];
+            if (b.len() != (int) m || b.pos != 0) torn.fetch_add (1, rlx);
+            for (int i = 0; i < b.len(); ++i) if (b.data()[i] != m) torn.fetch_add (1, rlx);
+            if (m > 8.0f) aba.fetch_add (1, rlx);                            // admitted on a clip newer than its load
+        }
+    });
+    long landed = 0, timeouts = 0;
+    constexpr long kRounds = 2000;
+    for (long r = 1; r <= kRounds; ++r) {
+        if (! waitFor ([&] { return abaWant.load (rlx) >= r; }, 10.0)) { ++timeouts; break; }
+        const int n = 9 + (int) (r % 50);
+        for (int i = 0; i < n; ++i) clip[(std::size_t) i] = (float) n;
+        if (s.tryPublish (clip.data(), (std::size_t) n)) ++landed;           // no block is open: the reader sits before its CAS
+        abaDone.store (r, rlx);
+    }
+    abaGo.store (false, rlx);
+    audio.join();
+    ok (timeouts == 0 && landed == kRounds, "every publish between the audio thread's load and its CAS landed");
+    ok (aba.load() >= kRounds - 1, "the blocks were admitted on the newer clip (" + std::to_string (aba.load()) + ")");
+    ok (torn.load() == 0, "…and saw it whole, from 0 (" + std::to_string (torn.load()) + ")");
+}
+
 // ---- the old reader's pointer --------------------------------------------------------------------------
 void storageStays()
 {
@@ -293,5 +358,6 @@ int main()
     audition();
     conv();
     rec();
+    forcedAba();
     return felitronics::test::report();
 }

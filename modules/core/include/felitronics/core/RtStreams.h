@@ -29,9 +29,10 @@
 //
 // THREADS. ONE controller thread calls every member that is not a Block's, tryReserve() included. ONE
 // audio thread opens Blocks. isPlaying(), isRecording(), mode(), recorded() and `loop` may be read from
-// any thread. A device's lifecycle callbacks (JUCE's audioDeviceAboutToStart / audioDeviceStopped) run
-// on the device's thread, not the controller's, so they are not the place to size a stream. And never
-// wait for a try inside them: JUCE holds its callback lock around them.
+// any thread. A device's lifecycle callbacks (JUCE's audioDeviceAboutToStart / audioDeviceStopped) are not
+// the controller: JUCE runs them on the thread that adds or removes the callback, or on the device's own
+// thread when the device restarts itself, so a call made there can overlap the controller's. Size the
+// streams from the controller.
 //
 // THE AUDIO THREAD'S RULES.
 //   • Open each stream's Block once per callback, read and write the stream only through it, and let it
@@ -62,12 +63,13 @@ static_assert (std::atomic<int>::is_always_lock_free && std::atomic<bool>::is_al
                "the streams' readings need lock-free atomics");
 
 // The guard itself, public so a product can gate its own swaps of plain memory the same way. `Atom` is the
-// test seam: any type with std::atomic<std::uint32_t>'s load / compare_exchange_strong / fetch_and /
-// fetch_or (with explicit orders) and a constructor from std::uint32_t. Products use `RtGate`.
+// test seam: any type with std::atomic<std::uint32_t>'s load / compare_exchange_strong / fetch_and (with
+// explicit orders) and a constructor from std::uint32_t. Products use `RtGate`.
 //
-// The controller's sequence is   if (gate.quiesce()) { mutate; (void) gate.arm (mode); }   — arm() lands
-// only on a word that is exactly 0 (down, no block open), which a true quiesce() guarantees until the
-// controller raises it, so an arm() without a true quiesce() before it is refused instead of racing.
+// The controller's sequence is   if (gate.quiesce()) { mutate; (void) gate.arm (mode); }   and a TRUE
+// quiesce() before the mutation is the caller's precondition: it is what orders the last block's accesses
+// before the controller's. arm() lands only on a word that is exactly 0 (down, no block open), so it refuses
+// an arm over a raised mode or an open block; it cannot tell whether the quiesce() before it was true.
 template <class Atom = std::atomic<std::uint32_t>>
 class BasicRtGate {
 public:
@@ -75,8 +77,8 @@ public:
     static constexpr std::uint32_t kModeMask = 0x7fffffffu;
 
     // AUDIO THREAD. Admits a block: returns the mode it was admitted at, or 0 (not admitted — the mode is
-    // down, or a block of this gate is already open). The CAS retries only when the controller changed the
-    // word in between, which it does at user rate.
+    // down, or a block of this gate is already open). Lock-free, not wait-free: the CAS retries only when the
+    // controller changed the word in between, which a product does at user rate.
     [[nodiscard]] std::uint32_t enter() noexcept {
         std::uint32_t v = s_.load (std::memory_order_acquire);
         while ((v & kModeMask) != 0u && (v & kBusy) == 0u)
@@ -133,8 +135,8 @@ public:
     [[nodiscard]] bool tryReserve (std::size_t capacity) {
         const std::size_t cap = rtstreams_detail::clampCapacity (capacity);
         if (! gate_.quiesce()) return false;
+        len_ = 0; pos_ = 0;                                // first: an assign that throws leaves an EMPTY clip
         buf_.assign (cap, 0.0f);
-        len_ = 0; pos_ = 0;
         return true;
     }
     // CONTROLLER. Stops: the stream goes down at once; a block already open finishes its loop.
@@ -201,8 +203,8 @@ public:
     [[nodiscard]] bool tryReserve (std::size_t capacity) {
         const std::size_t cap = rtstreams_detail::clampCapacity (capacity);
         if (! gate_.quiesce()) return false;
+        len_ = 0; pos_ = 0;                                // first: an assign that throws leaves an EMPTY clip
         buf_.assign (cap, 0.0f);
-        len_ = 0; pos_ = 0;
         return true;
     }
     // CONTROLLER. Stops, copies the clip (truncating to the storage), rewinds, and leaves the route OFF.
@@ -278,8 +280,8 @@ public:
     [[nodiscard]] bool tryReserve (std::size_t capacity) {
         const std::size_t cap = rtstreams_detail::clampCapacity (capacity);
         if (! gate_.quiesce()) return false;
+        n_ = 0; shown_.store (0, std::memory_order_relaxed); // first: an assign that throws leaves an EMPTY take
         buf_.assign (cap, 0.0f);
-        n_ = 0; shown_.store (0, std::memory_order_relaxed);
         return true;
     }
     // CONTROLLER. Rewinds and records. Refused while a block is open.

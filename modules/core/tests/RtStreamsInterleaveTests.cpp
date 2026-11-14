@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-core — see LICENSE.
 
-// RtStreams, deterministically: every interleaving of one controller call and one audio-thread block at
-// the granularity that matters, the gate's atomic operations. No threads (so it runs in the single-threaded
-// wasm tier too): the gate is instantiated on an atomic that calls a hook after each operation, and the hook
-// runs the OTHER side's whole call there. A dry run counts the victim's operations, then every injection
-// point 0 … K is tried on a fresh stream. What this proves is the protocol's LOGIC: no admitted block sees
+// RtStreams, deterministically, at the granularity that matters: the gate's atomic operations. No threads
+// (so it runs in the single-threaded wasm tier too): the gate is instantiated on an atomic that calls a hook
+// after each operation, and the hook runs the OTHER side's WHOLE call there. A dry run counts the victim's
+// operations, then every injection point 0 … K is tried on a fresh stream: a controller call at every
+// operation of an audio block, and an audio block at every operation of a publish, a refill and a start.
+// (A whole call at each point is a subset of all orders: two calls' operations are never interleaved finer
+// than that here — the threaded suite and TSan cover the rest.) What this proves is the protocol's LOGIC: no admitted block sees
 // a half-written clip, no store a block makes at its close survives a re-arm, a refusal is followed by a
 // retry that lands, and a rewind cannot be undone. The memory orders are the threaded suite's (TSan) job.
 
@@ -20,6 +22,8 @@
 #include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 
 #include <atomic>
+#include <climits>
+#include <new>
 #include <cstdint>
 #include <cstdio>
 #include <string>
@@ -82,12 +86,17 @@ bool whole (const float* d, int len, float marker, int wantLen) {
     return true;
 }
 
-std::string at (const char* what, int k, int variant = -1) {
+std::string at (const char* what, int k, int variant = -1);
+// The injection point must have been reached, or the case tested nothing.
+void reached (int k, int variant = -1);
+
+std::string at (const char* what, int k, int variant) {
     std::string s = what;
     s += "  [inject at op " + std::to_string (k);
     if (variant >= 0) s += ", variant " + std::to_string (variant);
     return s + "]";
 }
+void reached (int k, int variant) { ok (k == 0 || g.fired, at ("the injection point was reached", k, variant)); }
 
 // ---- the gate on its own -----------------------------------------------------------------------------
 void gateRules()
@@ -176,9 +185,24 @@ void convApi()
         ok (c.trySetMode (-3), "a negative mode stops too");
         ok (! c.tryRefill (di.data(), di.size()), "tryRefill is refused while a block is open");
     }
+    ok (c.trySetMode (Conv::kClip), "re-armed");
+    {
+        auto b = c.beginBlock();
+        ok ((bool) b && ! c.tryReserve (16) && c.capacity() == 4, "tryReserve is refused while a block is open, storage untouched");
+        ok ((bool) b && b.data()[0] == 7.0f && b.len() == 4, "…and the open block still reads its clip");
+    }
+    ok (c.tryReserve (4) && c.capacity() == 4 && c.mode() == 0, "tryReserve lands once the block closed, and leaves the route off");
+    { auto b = c.beginBlock(); ok (! b, "…so no block is admitted after it"); }
     ok (c.tryRefill (di.data(), 2) && c.trySetMode (Conv::kClip), "refill + switch land after it closed");
-    { auto b = c.beginBlock(); ok (b.pos == 0 && b.len() == 2, "a refill rewinds"); b.finish(); }
+    { auto b = c.beginBlock(); ok (b.pos == 0 && b.len() == 2, "a refill rewinds"); b.pos = -5; }
+    { auto b = c.beginBlock(); ok (b.pos == 0, "a negative position is clamped to 0 on close"); b.pos = 99; }
+    { auto b = c.beginBlock(); ok (b.pos == 2, "a position past the clip is clamped to its length on close"); b.finish(); }
     ok (c.mode() == 0, "finish() ends the route on close");
+    ok (c.tryReserve (2) && c.trySetMode (Conv::kClip), "reserve smaller, then raise the clip route without a refill");
+    { auto b = c.beginBlock(); ok ((bool) b && b.len() == 0 && b.pos == 0, "a reserve empties the clip: no length survives it"); }
+    ok (c.tryReserve (4) && c.tryRefill (nullptr, 3) && c.trySetMode (Conv::kClip), "a null refill lands");
+    { auto b = c.beginBlock(); ok ((bool) b && b.len() == 0, "…as an empty clip"); }
+    c.stop();
 
     const long long c0 = alloc::count.load();
     for (int k = 0; k < 64; ++k) {
@@ -189,6 +213,40 @@ void convApi()
     }
     const long long allocs = alloc::count.load() - c0;      // read BEFORE ok(): its message string allocates
     ok (allocs == 0, "blocks, refills, mode switches and stops never allocate");
+}
+
+void capacityAndHeap()
+{
+    group ("capacities: clamped to INT_MAX, and a reserve whose allocation fails");
+    namespace d = felitronics::core::rtstreams_detail;
+    ok (d::clampCapacity (0) == 0 && d::clampCapacity (1000) == 1000, "a capacity below INT_MAX is kept");
+    ok (d::clampCapacity ((std::size_t) INT_MAX) == (std::size_t) INT_MAX
+        && d::clampCapacity ((std::size_t) INT_MAX + 1u) == (std::size_t) INT_MAX
+        && d::clampCapacity ((std::size_t) -1) == (std::size_t) INT_MAX, "a larger one is clamped to INT_MAX, never refused");
+#if defined(__cpp_exceptions)
+    // The heap says no in the middle of a reserve: the stream must come out stopped AND empty — a length kept
+    // from before would be armed over storage the failed assign may have freed.
+    const auto di = clip (7.0f, 4);
+    Conv c; ok (c.tryReserve (8) && c.tryRefill (di.data(), di.size()), "conv: a clip of 4");
+    bool threw = false;
+    alloc::failNext.store (true);
+    try { (void) c.tryReserve (1u << 20); } catch (const std::bad_alloc&) { threw = true; }
+    alloc::failNext.store (false);
+    ok (threw, "conv: the injected allocation failure reached the reserve");
+    ok (c.trySetMode (Conv::kClip), "conv: the route can be raised after it");
+    { auto b = c.beginBlock(); ok (! b || (b.len() == 0 && b.pos == 0), "conv: …over an EMPTY clip, never the old length"); }
+    Rec r; ok (r.tryReserve (8) && r.tryStart(), "rec: a take");
+    { auto b = r.beginBlock(); for (int i = 0; i < 6; ++i) b.push (1.0f); }
+    threw = false;
+    alloc::failNext.store (true);
+    try { (void) r.tryReserve (1u << 20); } catch (const std::bad_alloc&) { threw = true; }
+    alloc::failNext.store (false);
+    ok (threw, "rec: the injected allocation failure reached the reserve");
+    std::vector<float> take { 42.0f };
+    ok (r.tryHarvest (take) && take.empty() && r.recorded() == 0, "rec: …and the take is EMPTY, never 6 samples of freed storage");
+#else
+    ok (true, "a failing allocation aborts in this tier (no exceptions): nothing to test");
+#endif
 }
 
 void recApi()
@@ -254,9 +312,8 @@ void auditionInterleave()
             auto inject = [&] { landed = a.tryPublish (newc.data(), newc.size()); };
             if (k == 0) inject(); else armAt (k, &inject);
             block (a, s);
-            const bool fired = k == 0 || g.fired;
+            reached (k, variant);
             disarm();
-            ok (fired, at ("the injection point was reached", k, variant));
             ok (s.admitted, at ("the armed clip was admitted", k, variant));
             ok (s.intact, at ("an admitted block reads ONE whole clip", k, variant));
             ok (s.startPos == 0, at ("…from its start", k, variant));
@@ -293,6 +350,7 @@ void auditionInterleave()
             auto inject = [&] { a.stop(); };
             if (k == 0) inject(); else armAt (k, &inject);
             block (a);
+            reached (k, variant);
             disarm();
             ok (! a.isPlaying(), at ("a stop is never undone by a block's close", k, variant));
             auto b = a.beginBlock();
@@ -317,6 +375,7 @@ void auditionInterleave()
             };
             if (k == 0) inject(); else armAt (k, &inject);
             const bool landed = a.tryPublish (newc.data(), newc.size());
+            reached (k);
             disarm();
             ok (landed, at ("a publish with no block open lands", k));
             ok (good, at ("a block admitted around a publish sees one whole clip from 0", k));
@@ -348,6 +407,7 @@ void convInterleave()
             auto inject = [&] { landed = c.trySetMode (Conv::kLive); };
             if (k == 0) inject(); else armAt (k, &inject);
             block (c);
+            reached (k);
             disarm();
             if (! landed) ok (c.trySetMode (Conv::kLive), at ("a refused switch lands on the retry", k));
             ok (c.mode() == Conv::kLive, at ("live monitoring survives the clip's end (the old block cannot take it down)", k));
@@ -372,6 +432,7 @@ void convInterleave()
             auto inject = [&] { refilled = c.tryRefill (newc.data(), newc.size()); if (refilled) switched = c.trySetMode (Conv::kClip); };
             if (k == 0) inject(); else armAt (k, &inject);
             play (c, sawOld, good);
+            reached (k);
             disarm();
             ok (good, at ("a clip block reads one whole clip from 0", k));
             if (refilled) ok (switched, at ("trySetMode right after a true tryRefill is never refused", k));
@@ -400,6 +461,7 @@ void convInterleave()
             };
             if (k == 0) inject(); else armAt (k, &inject);
             const bool landed = c.tryRefill (newc.data(), newc.size());
+            reached (k);
             disarm();
             ok (landed, at ("a refill with no block open lands", k));
             ok (good, at ("a block around a refill sees only the old clip, whole", k));
@@ -436,6 +498,7 @@ void recInterleave()
             };
             if (k == 0) inject(); else armAt (k, &inject);
             block (r, marker);     // the marker is read when the block runs: a block admitted after a start pushes 2
+            reached (k, what);
             disarm();
             std::vector<float> fin;
             ok (r.tryHarvest (fin), at ("a harvest with no block open lands", k, what));
@@ -473,6 +536,7 @@ void recInterleave()
             auto inject = [&] { auto b = r.beginBlock(); if (! b) return; admitted = true; b.push (2.f); };
             if (k == 0) inject(); else armAt (k, &inject);
             const bool landed = r.tryStart();
+            reached (k);
             disarm();
             ok (landed, at ("a start with no block open lands", k));
             ok (k == 0 || admitted == (k >= K), at ("a block is admitted inside a start only after its arm", k));
@@ -494,6 +558,7 @@ int main()
     auditionApi();
     convApi();
     recApi();
+    capacityAndHeap();
     auditionInterleave();
     convInterleave();
     recInterleave();
