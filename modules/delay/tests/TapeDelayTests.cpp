@@ -557,6 +557,82 @@ void feedDoor()
     }
 }
 
+bool sameFloat (float a, float b) { return std::memcmp (&a, &b, sizeof a) == 0; }
+
+void tailAndPictureFollowTargets()
+{
+    group ("the tail is the formula of the knobs as they stand; reset() shows the targets");
+    {
+        // REPEATS: a leftover of ~1e-38 (or a subnormal) followed by a request for exactly 0 — the 0 lands. With no
+        // feedback and no offset the tail is one TIME, spelt as the stage spells it.
+        const float oneTime = (float) ((double) 350.0f * 0.001);
+        bool lands = true;
+        for (float tiny : { 1.0e-38f, std::numeric_limits<float>::denorm_min(), -1.0e-38f })
+            for (float zero : { 0.0f, -0.0f })
+            {
+                delay::TapeDelay d;
+                d.setRepeats (tiny);
+                d.setRepeats (zero);
+                lands = lands && sameFloat (d.tailSeconds(), oneTime);
+            }
+        // Catches: setRepeats guarded by nearlyEqual alone (the tail keeps counting echoes that are not there).
+        ok (lands, "REPEATS ~1e-38, a subnormal or -1e-38, then exactly 0 (or -0): the tail is one TIME (0.35 s), not more");
+    }
+    {
+        // OFFSET: two thousand one-ulp moves — each one nearly the last — then the tail against a fresh stage given
+        // the final offset at once.
+        delay::TapeDelay d;
+        float off = 10.0f;
+        d.setOffsetMs (off);
+        for (int i = 0; i < 2000; ++i)
+        {
+            off = std::nextafter (off, 31.0f);
+            d.setOffsetMs (off);
+        }
+        delay::TapeDelay fresh;
+        fresh.setOffsetMs (off);
+        // Catches: a tail refreshed only when the offset moves past nearlyEqual (it stays on 10 ms of offset).
+        ok (sameFloat (d.tailSeconds(), fresh.tailSeconds()) && sameFloat (d.targets().offsetMs, off),
+            "2000 one-ulp OFFSET moves: the tail is a fresh stage's at the final offset, bit for bit");
+    }
+    {
+        // reset() mid-glide: the picture shows where the next call puts the heads, not where the stream stopped.
+        delay::TapeDelay d;
+        test::run (d.prepare (48000.0, 512, 2));
+        delay::TapeDelayParams p;
+        p.offsetMs = 20.0f;
+        p.heads[1] = { 0.5f, 1.0f, 0.0f };
+        d.setParams (p);
+        std::vector<float> l (512, 0.0f), r (512, 0.0f);
+        float* lr[2] = { l.data(), r.data() };
+        test::run (d.process (lr, 2, 512));
+        d.setTimeMs (2000.0f);
+        d.setOffsetMs (-15.0f);
+        for (int b = 0; b < 10; ++b)
+            test::run (d.process (lr, 2, 512));
+        const bool gliding = d.shownTimeMs() > 351.0f && d.shownTimeMs() < 1999.0f;
+        d.reset();
+        // Catches: a reset that leaves the stopped stream's glided taps up until the next call.
+        ok (gliding && sameFloat (d.shownTimeMs(), 2000.0f) && sameFloat (d.shownOffsetMs(), -15.0f)
+                && sameFloat (d.shownHeadMs (1), 1000.0f) && sameFloat (d.shownHeadMs (0), 2000.0f),
+            "reset() mid-glide: TIME 2000 ms, OFFSET -15 ms and the heads at 1000 and 2000 ms shown at once");
+
+        // ...and a reset after a re-prepare (the cheap one: the lines are clear already), and a prepare alone.
+        for (int b = 0; b < 10; ++b)
+            test::run (d.process (lr, 2, 512));
+        d.setTimeMs (600.0f);
+        for (int b = 0; b < 4; ++b)
+            test::run (d.process (lr, 2, 512));
+        const bool glidingAgain = d.shownTimeMs() < 1999.0f && d.shownTimeMs() > 601.0f;
+        test::run (d.prepare (48000.0, 512, 2));
+        const bool onPrepare = sameFloat (d.shownTimeMs(), 600.0f) && sameFloat (d.shownOffsetMs(), -15.0f);
+        d.reset();
+        // Catches: a prepare() that leaves the stopped stream's picture up (the reset after it is the cheap one).
+        ok (glidingAgain && onPrepare && sameFloat (d.shownTimeMs(), 600.0f) && sameFloat (d.shownHeadMs (1), 300.0f),
+            "prepare() mid-glide, then reset(): the targets shown on both (TIME 600 ms, a head at 300 ms)");
+    }
+}
+
 void noAllocation()
 {
     group ("RT: process, reset and the setters never allocate");
@@ -592,6 +668,7 @@ int main()
     detTanhAccuracy();
     poisonAndLaw8();
     feedDoor();
+    tailAndPictureFollowTargets();
     noAllocation();
     return felitronics::test::report();
 }

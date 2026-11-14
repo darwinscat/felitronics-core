@@ -60,7 +60,9 @@ namespace felitronics::delay
 //     when it returns. nch == 0 with n > 0 is a gap: the shared motor glides on through it as through
 //     silence (law 11c) and every channel's memory is dropped.
 //   · reset() is a stream RESTART: the lines cleared, the write clocks re-anchored at zero and the heads
-//     snapped to their targets on the next call — what follows a reset does not depend on what came before.
+//     snapped to their targets on the next call — what follows a reset does not depend on what came before. The
+//     picture's taps show those targets from the reset (or a prepare) on; a poison restart inside a call leaves
+//     the picture of the heads that call played, and the next call shows the snap.
 //   · FEED (process's last argument) is the insert's stand-by, and it is a DOOR, not a switch: what enters the
 //     record head is ramped linearly to nothing, or back, over kFeedRampSeconds — a flip on a loud note would
 //     otherwise be recorded as a step that every repeat replays as a tick. Only the input is ramped, never the
@@ -283,6 +285,8 @@ public:
         }
         gainsPrimed_ = false;
         headsMono_   = false;
+        shownTimeMs_.store (timeMs, std::memory_order_relaxed);   // a fresh line shows where its heads will start
+        shownOffsetMs_.store (offsetMs, std::memory_order_relaxed);
         publishHeadTargets();
 
         prepared_ = true;
@@ -299,6 +303,14 @@ public:
         runs once. */
     void reset() noexcept
     {
+        // The picture after a restart shows where the next call puts the heads — on their targets — instead of
+        // where the stopped stream left them. Before the cheap return: a poison restart inside process() leaves
+        // the lines clear but the picture of the heads that call played, and the reset after it must still show
+        // the targets.
+        shownTimeMs_.store (timeMs, std::memory_order_relaxed);
+        shownOffsetMs_.store (offsetMs, std::memory_order_relaxed);
+        publishHeadTargets();
+
         if (cleared)
             return;   // an off block calls this every block; the memset must not be per-block
 
@@ -406,7 +418,11 @@ public:
 
         const float want = detail::clampf (0.0f, 1.0f, amount);
 
-        if (detail::nearlyEqual (want, repeats))
+        // A request for exactly 0 always lands: nearlyEqual's absolute branch would take it for a leftover of
+        // ~1e-38 and keep that. The loop never hears the difference (what such a feedback adds is absorbed by,
+        // or flushed out of, the loop filter), but the tail would count echoes that are not there.
+        const bool toZero = detail::sameValue (want, 0.0f) && ! detail::sameValue (repeats, 0.0f);
+        if (detail::nearlyEqual (want, repeats) && ! toZero)
             return;
 
         repeats = want;
@@ -439,7 +455,9 @@ public:
         offsetMs = detail::clampf (-1000.0f * (float) kMaxOffsetSeconds, 1000.0f * (float) kMaxOffsetSeconds, ms);
         shownOffsetMs_.store (offsetMs, std::memory_order_relaxed);
 
-        if (! detail::nearlyEqual (before, offsetMs))
+        // The offset is stored on every call, so the tail follows every stored change: a guard looser than exact
+        // let a run of one-ulp moves walk the offset away from the tail that was last worked out.
+        if (! detail::sameValue (before, offsetMs))
             refreshTail();
     }
 
@@ -708,6 +726,17 @@ public:
     float shownHeadMs (int k) const noexcept
     {
         return k >= 0 && k < kMaxHeads ? shownHeadMs_[k].load (std::memory_order_relaxed) : 0.0f;
+    }
+
+    /** The knobs as the setters left them — canonical: bounded, and whatever a guard kept. The tests rebuild a
+        fresh stage from these to see that the tail is the formula of the targets as they stand, never of stale ones. */
+    TapeDelayParams targets() const noexcept
+    {
+        TapeDelayParams p;
+        p.timeMs = timeMs; p.repeats = repeats; p.darkHz = darkHz; p.offsetMs = offsetMs; p.mix = mix;
+        for (int k = 0; k < kMaxHeads; ++k)
+            p.heads[(std::size_t) k] = headWant_[k];
+        return p;
     }
 
     /** Where the heads stand, in samples — the motor's delay and channel `ch`'s offset (0 or 1). The tests read
