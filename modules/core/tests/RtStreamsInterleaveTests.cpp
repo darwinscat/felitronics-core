@@ -153,7 +153,8 @@ void auditionApi()
         (void) a.tryPublish (r2.data(), r2.size());
         a.stop();
     }
-    ok (alloc::count.load() == c0, "blocks, publishes and stops never allocate");
+    const long long allocs = alloc::count.load() - c0;      // read BEFORE ok(): its message string allocates
+    ok (allocs == 0, "blocks, publishes and stops never allocate");
 }
 
 void convApi()
@@ -186,7 +187,8 @@ void convApi()
         { auto b = c.beginBlock(); if (b) b.pos += 1; }
         c.stop();
     }
-    ok (alloc::count.load() == c0, "blocks, refills, mode switches and stops never allocate");
+    const long long allocs = alloc::count.load() - c0;      // read BEFORE ok(): its message string allocates
+    ok (allocs == 0, "blocks, refills, mode switches and stops never allocate");
 }
 
 void recApi()
@@ -219,8 +221,10 @@ void recApi()
     const long long c0 = alloc::count.load();
     for (int k = 0; k < 64; ++k) { auto b = r.beginBlock(); if (b) b.push ((float) k); }
     r.stop();
-    ok (r.tryStart(), "restart");
-    ok (alloc::count.load() == c0, "blocks, pushes, stop and start never allocate");
+    const bool restarted = r.tryStart();
+    const long long allocs = alloc::count.load() - c0;      // read BEFORE ok(): its message string allocates
+    ok (restarted, "restart");
+    ok (allocs == 0, "blocks, pushes, stop and start never allocate");
 }
 
 // ---- interleavings: AuditionStream -------------------------------------------------------------------
