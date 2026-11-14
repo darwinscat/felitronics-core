@@ -1097,6 +1097,10 @@ void suite (const char* backend)
     const long long a7 = belowThreshold<Fft> (backend);
 
     test::group ("the threshold's edge — one partition either side, Full and LRDiag (" + be + ")");
+    // The VALUE, pinned: the edge group follows the constant wherever it goes, and the release note, the comments and
+    // convburst quote 64 and its lengths (Full 34816 / 36864 taps). Moving it moves who spreads — lineareq's second
+    // quality sits one partition under it in Full — so moving it must be a decision that edits this line.
+    test::ok (convolution::MatrixConvolverNupc<>::kSpreadFromMacs == 64, be + " the shipping threshold is 64 MACs a hop");
     const long long a8 = thresholdEdge<Fft> (backend);
 
     test::group ("seeded random events — six geometries, aimed at the edges (" + be + ")");

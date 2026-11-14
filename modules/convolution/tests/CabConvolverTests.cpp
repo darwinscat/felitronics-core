@@ -1117,8 +1117,8 @@ int main()
     }
 
     // maxSwapSamples(): the 50 ms crossfade, plus one 2048-sample hop only where a two-bank IR at this cap could be
-    // spread (this class stages LRDiag only). A 1 s cap at 48 kHz cannot spread a two-bank IR (22 partitions in the
-    // last stage: 42 MACs a hop, under 64), so its swaps land in the fade; a 5 s cap can (232), and the bound adds the hop.
+    // spread (this class stages LRDiag only). A 1 s cap at 48 kHz cannot spread a two-bank IR (23 partitions in the
+    // last stage: 44 MACs a hop, under 64), so its swaps land in the fade; a 5 s cap can (232), and the bound adds the hop.
     test::group ("maxSwapSamples: the fade, plus a hop only where a two-bank IR can spread");
     {
         CabConvolver short48, long48;

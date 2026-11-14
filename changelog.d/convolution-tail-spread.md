@@ -16,12 +16,17 @@ topology reads — reaches `kSpreadFromMacs` (64 MACs a hop).
 - **Output.** A spread operator's sum is taken in another order, so its output differs from the unspread one by
   float noise (about 1e-7 of the peak). Below the threshold everything runs as before, to the bit and with an
   immediate fade: an operator under 17 partitions of that stage in Full (34816 taps), 33 in LRDiag or MSDiag
-  (67584 taps: a cabinet up to 1.41 s at 48 kHz, 0.70 s at 96 kHz), 65 mono. lineareq's two top qualities in Full
-  (65536 and 131072 taps) and its top one in LRDiag / MSDiag now spread: a band move lands a hop (43 ms at 48 kHz)
-  later, beside the 0.7–1.4 s of latency those qualities carry anyway.
+  (67584 taps: a cabinet up to 1.41 s at 48 kHz, 0.70 s at 96 kHz), 65 mono. lineareq's top quality (131073 taps)
+  now spreads in stereo, Full and LRDiag / MSDiag alike: a band move lands a hop (43 ms at 48 kHz) later, beside the
+  1.37 s of latency that quality carries. Its other qualities, its per-channel lanes on a bus wider than stereo
+  (63 MACs a hop at the top quality) and NaturalPhaseEq stay on the old path.
+- **A consumer that waits a fixed fade for a swap to land must ask `maxSwapSamples()` instead.** A cabinet IR longer
+  than 67584 taps now starts its fade a hop after the pickup. Core's `CabinetIr` asks; a copy that still waits 50 ms
+  (orbit-amp's own) comes back mid-fade after a handover made while it rested.
 - **Why 64.** Below it a stage's deferred work is too small to be worth a hop of delay. Just under it the old burst
-  stays, about 3 × 63 MACs in an unspread swap's first call — the worst call left in the tree, and a small one
-  (measured below).
+  stays, about 3 × 63 MACs in an unspread swap's first call — per convolver the worst call left in the tree, and a
+  small one (measured below). A composite that publishes several convolvers back to back (lineareq's lanes on a bus
+  wider than stereo) pays it once per lane in the same callback, as before.
 - **New API.**
   - `maxSwapSamples (numBanks = 4)` (and `CabConvolver::maxSwapSamples()`, which asks for its two banks): the most
     samples a swap can take, the crossfade plus a hop where an operator of that many banks could spread at this cap.

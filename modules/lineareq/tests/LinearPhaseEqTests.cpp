@@ -393,5 +393,45 @@ int main()
         }
     }
 
+    // --- How long a band move takes to land, by quality ---
+    // The convolver spreads its last stage for an operator whose deferred work there reaches 64 MACs a hop. Of this
+    // EQ's qualities only the top one (131073 taps) does, and its band moves land one 2048-sample hop after the pickup;
+    // the next one down (32769 taps, 60 MACs in Full) lands in the 20 ms fade, as every quality used to. Over a warm
+    // history (over a cold one every fade starts at once). In Full, the heaviest topology.
+    test::group ("LinearPhaseEq: a band move lands in the fade, a hop later only at the top quality");
+    {
+        auto bands = [] (eq::BandParams* b, double gain)
+        {
+            for (int k = 0; k < 2; ++k) { b[k] = eq::BandParams {}; b[k].on = true; b[k].type = eq::FilterType::Bell; b[k].lane (eq::Lane::Stereo).on = false; }
+            b[0].lane (eq::Lane::Left).on = true; b[0].lane (eq::Lane::Left).freq = 700.0; b[0].lane (eq::Lane::Left).Q = 1.0; b[0].lane (eq::Lane::Left).gainDb = gain;
+            b[1].lane (eq::Lane::Mid).on = true;  b[1].lane (eq::Lane::Mid).freq = 3000.0; b[1].lane (eq::Lane::Mid).Q = 1.0; b[1].lane (eq::Lane::Mid).gainDb = -gain;
+        };
+        const int fade = std::max (2 * 128, (int) std::lround (0.02 * sr));   // the EQ's own warm crossfade
+        for (int q : { 3, 4 })
+        {
+            LPE e; e.prepare (sr, 64, 2, q);
+            std::vector<float> l (64), r (64);
+            float* io[2] { l.data(), r.data() };
+            unsigned seed = 7;
+            auto block = [&]
+            {
+                for (int i = 0; i < 64; ++i) { seed = seed * 1664525u + 1013904223u; l[(std::size_t) i] = r[(std::size_t) i] = (float) ((seed >> 9) & 0xffff) / 65536.0f - 0.5f; }
+                felitronics::test::run (e.process (io, 2, 64));
+            };
+            eq::BandParams b[2];
+            bands (b, 6.0);
+            const bool first = e.setBands (b, 2);
+            for (int k = 0; k < 160; ++k) block();                 // the first fade over, every stage warm
+            bands (b, -4.0);
+            const bool second = ! e.isBusy() && e.setBands (b, 2);
+            int busy = 0;
+            while (e.isBusy() && busy < 20000) { block(); busy += 64; }
+            const int want = q == 4 ? fade + 2048 : fade;
+            test::ok (first && second && busy >= want && busy < want + 64,
+                      "quality " + std::to_string (q) + " (" + std::to_string (e.firSize() + 1) + " taps): a band move lands in " + std::to_string (busy)
+                      + " samples (want " + std::to_string (want) + ", to the block)");
+        }
+    }
+
     return test::report();
 }

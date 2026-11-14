@@ -78,7 +78,9 @@ public:
         // operator slots, so a swapped operator is response-correct immediately — only a short anti-click
         // fade is needed, ≥ the partition P). The engine derives its OWN long fade for the COLD first
         // activation, so an EQ band drag lands in ~tens of ms, not a full FIR. isBusy() is then true only
-        // for that short window → the host's coalescing rebuild stays responsive.
+        // for that short window → the host's coalescing rebuild stays responsive. At the top quality (131073
+        // taps) the convolver spreads its last stage, and a band move starts that fade one 2048-sample hop
+        // after the pickup: 20 + 43 ms at 48 kHz, still tens of ms (MatrixConvolverNupc's COST NOTE).
         const int warmXfade = std::max (2 * part, (int) std::lround (0.02 * fs_));   // ≥ 2P and ≥ ~20 ms
         chConv_.clear();
         if (channels_ > 2)                                      // non-stereo: per-channel mono ST-only operators
