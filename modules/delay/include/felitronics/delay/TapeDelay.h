@@ -45,7 +45,7 @@ namespace felitronics::delay
 // decays with REPEATS — heads at 1/3, 2/3 and 1 play a triplet, and the third echo can be the loudest. PAN is
 // a BALANCE on the head's own lines, at constant power with the centre at unity on both sides (+3 dB on its
 // side at hard pan); on dual mono — one guitar on both lines, as the amps feed it — heads panned apart are a
-// ping-pong. A mono call has no pan: every head plays at its level. The default layout, one head at 1x, level
+// ping-pong. A mono call aims every head at its level, pan aside. The default layout, one head at 1x, level
 // 1, centre, is the one-head stage to the bit (TapeDelayParityTests, against a frozen copy).
 //
 // CONTRACT (DSP-ARCHITECTURE.md §2).
@@ -73,8 +73,10 @@ namespace felitronics::delay
 //     sample, so the flush cannot depend on how the caller slices the stream. The motor and the offset heads
 //     glide in double and LAND: once an update no longer moves a head, it is put on its target (LAW8-AUDIT.md,
 //     item 6) — the app's float heads parked up to 1/(2·coeff) ulps short, 2.3 ms at 6 s. The playback heads'
-//     positions glide the same way (their floor is the smallest normal float, so no glide heads for zero), and
-//     every contribution a head scales on its way into the offset line is flushed like the loop filter.
+//     positions glide the same way (their floor is the smallest normal float, so no glide heads for zero),
+//     every contribution a head scales on its way into the offset line is flushed like the loop filter, and a
+//     gain's ramp value is floored at the smallest normal float (a ramp restarted again and again from where the
+//     last one stood shrinks geometrically, and nothing else would stop it).
 //   · THE HEADS' CONTROLS ARE SAMPLE-CLOCKED like the motor: a position glides once per sample, LEVEL and PAN
 //     reach the head as two side gains, each on a counted kHeadRampSeconds ramp that lands on its target, and a
 //     pause steps all of them as silence would. A head that is silent stands on its target, so turning one on
@@ -716,8 +718,9 @@ public:
         return k >= 0 && k < kMaxHeads && side >= 0 && side < 2 ? headGain_[k][side] : 0.0f;
     }
 
-    /** True when any state sits in the subnormal band — the law-8 witness for the tests: the lines, the loop
-        filters, every head and glide, and every gain. */
+    /** True when any state sits in the subnormal band — the law-8 witness for the tests: the lines and the offset
+        lines, the loop filters, the motor and the offset glides, and per playback head its position, its gains as
+        heard, both ends of each ramp and its balance targets. */
     bool anySubnormalState() const noexcept
     {
         const auto sub = [] (auto v) { return std::fpclassify (v) == FP_SUBNORMAL; };
@@ -733,8 +736,10 @@ public:
                     return true;
         }
         for (int k = 0; k < kMaxHeads; ++k)
-            if (sub (headPos_[k]) || sub (headGain_[k][0]) || sub (headGain_[k][1]))
-                return true;
+            for (int s = 0; s < 2; ++s)
+                if (sub (headPos_[k]) || sub (headGain_[k][s]) || sub (headGainFrom_[k][s]) || sub (headGainTo_[k][s])
+                    || sub (headGainWant_[k][s]))
+                    return true;
         return sub (currentDelay);
     }
 
@@ -765,7 +770,8 @@ private:
 
     void updateCoeffs() noexcept
     {
-        // The motor's inertia: ~150 ms to the new time — enough travel to hear the bend.
+        // The motor's inertia: a 150 ms time constant (37 % of the distance still to go after it; the landing
+        // comes much later, by glide()'s rule) — enough travel to hear the bend.
         glideCoeff    = 1.0 - detail::detExp (-1.0 / (0.15 * sampleRate));
         offGlideCoeff = 1.0 - detail::detExp (-1.0 / (0.03 * sampleRate));
         lpfCoeff      = 1.0f - (float) detail::detExp (-kTwoPi * (double) darkHz / sampleRate);
@@ -830,10 +836,20 @@ private:
                     continue;   // landed: the gain IS its target, no arithmetic
                 const int left = --headGainLeft_[k][s];
                 const double from = (double) headGainFrom_[k][s], to = (double) headGainTo_[k][s];
-                headGain_[k][s] = left == 0 ? headGainTo_[k][s]
-                                            : (float) core::det::mulAdd (to - from,
-                                                                         (double) (headRampLen_ - left) * headRampStep_,
-                                                                         from);
+                float g = left == 0 ? headGainTo_[k][s]
+                                    : (float) core::det::mulAdd (to - from,
+                                                                 (double) (headRampLen_ - left) * headRampStep_,
+                                                                 from);
+
+                // Law 8. One ramp never steps under target/N, and every target is zero or normal (a level of
+                // 1e-15 one float short of hard pan is ~4e-23, and must play). But a ramp restarted from where
+                // the last one stood — a level sent up and back down before every sample — shrinks the gain
+                // geometrically, and only this floor stops it at the edge of the subnormal band. Not the house
+                // 1e-15: that would silence gains the pan law makes on purpose. A gain this small plays nothing
+                // anyway: every scaled contribution is flushed.
+                if (std::fabs (g) < std::numeric_limits<float>::min())
+                    g = 0.0f;
+                headGain_[k][s] = g;
             }
         }
     }

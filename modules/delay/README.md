@@ -23,8 +23,9 @@ and bends that repeat — a LEVEL (0 … 1, 0 is off) and a PAN. The loop feeds 
 head, so the heads' figure repeats once per TIME and decays with REPEATS: heads at 1/3, 2/3 and 1 play a
 triplet, at 1/4 … 1 four on the beat, and the third echo can be louder than the second. PAN is a balance on the
 head's own lines at constant power, the centre at unity on both sides (+3 dB on its side at hard pan); on dual
-mono — one guitar on both lines, as the amps feed it — heads panned apart are a ping-pong. A mono call has no
-pan. Level and pan arrive over 20 ms ramps; a silent head stands where it was sent. The default layout, one head
+mono — one guitar on both lines, as the amps feed it — heads panned apart are a ping-pong. A mono call aims
+every head at its level, pan aside. Level and pan arrive over 20 ms ramps — linear in gain, so constant power is
+where they land and a jump across the field dips up to 3 dB on the way; a silent head stands where it was sent. The default layout, one head
 at 1x, level 1, centre, is the one-head stage byte for byte — every existing preset plays as it did.
 
 ```cpp
@@ -70,8 +71,8 @@ same number.
   never ramped, and a held `feed` is bit-identical to the old switch. A pause moves the ramp as silence would;
   after `prepare`/`reset` it starts settled on the next call's `feed` — a fresh stage does not fade in.
 - Law 8: the loop filter's state and the offset glide are flushed below 1e-15 per sample
-  (`core::flushDenormal`). Bit-identical under any re-slicing. The heads glide in double and land exactly
-  on their targets.
+  (`core::flushDenormal`). Bit-identical under any re-slicing while the state is finite (law 8a: a poison
+  restart keeps the call's clock). The heads glide in double and land exactly on their targets.
 - Knobs: a non-finite value is ignored, a finite one clamped (TIME 1 … 6100 ms, DARK 1 Hz … 100 kHz,
   OFFSET ±31 ms, REPEATS and MIX 0 … 1) — no knob can reach an index off the line. A head's three fields are
   bounded each on its own: POSITION to [smallest normal float, 1] (anything under one sample of delay plays at
@@ -80,7 +81,7 @@ same number.
   counted ramps that land on target, a pause steps them as silence would, and a silent head stands on its target.
   A mono call ramps each head's side 0 to its level (pan aside) and a stereo call back — no step at the width
   edge. After `prepare`/`reset` the positions snap with the motor, and the gains on the first call that carries a
-  channel. Bit-identical under any re-slicing, live head moves included.
+  channel. Bit-identical under any re-slicing, live head moves included, while the state is finite.
 - `tailSeconds()` counts the heads: stacked heads add and hard pan is +3 dB, so the first echo is taken at the sum
   of each head's level times its louder side; the default layout gives the one-head stage's estimate to the bit.
 - Threads: prepare, reset, the setters and process belong to one thread; the taps above may be read from any

@@ -119,7 +119,7 @@ void namedScenarios()
 struct Census
 {
     long long calls = 0, refusedCalls = 0, stereo = 0, narrower = 0, monoPrepared = 0, pauses = 0, zeroLength = 0;
-    long long longCalls = 0, poisonCalls = 0, subnormalInput = 0, feedFlips = 0, standByCalls = 0, resets = 0;
+    long long longCalls = 0, nonFiniteInput = 0, overflowInput = 0, subnormalInput = 0, feedFlips = 0, standByCalls = 0, resets = 0;
     long long prepares = 0, refusedPrepares = 0, setParams = 0, singleSetters = 0, absurdKnobs = 0, reSends = 0;
     long long ulpNudges = 0, samples = 0, mismatches = 0;
     long long headOps = 0, silentHeadMoves = 0, defaultReSends = 0;
@@ -156,8 +156,11 @@ float knobValue (Rng& r, float lo, float hi, bool logScale, float last, Census& 
     }
 }
 
-/** One input plane's worth of signal, of a kind drawn per call. */
-void fillInput (Rng& r, std::vector<float>& x, int kind, Census& n)
+/** One input plane's worth of signal, of a kind drawn per call. Kind 5 puts a NaN and an infinity in it — which
+    the record head REFUSES at its door, so it is input hygiene, not a restart; kind 6 puts a run of finite
+    ±FLT_MAX in it, which overflows the loop filter and makes the stage restart its line at the end of the call
+    (POISON in the contract). The census counts each kind per ACCEPTED call, not per plane drawn. */
+void fillInput (Rng& r, std::vector<float>& x, int kind)
 {
     const float amp = r.chance (20) ? 1.0f : 0.05f + 0.9f * r.unit();
     for (std::size_t i = 0; i < x.size(); ++i)
@@ -173,15 +176,18 @@ void fillInput (Rng& r, std::vector<float>& x, int kind, Census& n)
             default: x[i] = amp * r.signedUnit(); break;
         }
     }
-    if (kind == 5 && ! x.empty())   // poison: a NaN or an infinity somewhere in the call
+    if (kind == 5 && ! x.empty())   // non-finite input: a NaN and an infinity somewhere in the call
     {
         x[(std::size_t) r.below ((int) x.size())] = std::numeric_limits<float>::quiet_NaN();
         x[(std::size_t) r.below ((int) x.size())] = r.chance (50) ? std::numeric_limits<float>::infinity()
                                                                   : -std::numeric_limits<float>::infinity();
-        ++n.poisonCalls;
     }
-    if (kind == 4)
-        ++n.subnormalInput;
+    if (kind == 6 && x.size() >= 2)   // a finite overflow: ±FLT_MAX alternating over a run of the call
+    {
+        const int from = r.below ((int) x.size() - 1), run = std::min ((int) x.size() - from, 2 + r.below (15));
+        for (int i = 0; i < run; ++i)
+            x[(std::size_t) (from + i)] = (i % 2 == 0 ? 1.0f : -1.0f) * std::numeric_limits<float>::max();
+    }
 }
 
 /** Every public tap of the two, bit for bit. The subnormal witness walks both whole lines, so it is asked only
@@ -239,6 +245,11 @@ void headOp (Now& a, Rng& r, Census& n)
         case 4:  a.setHead (0, { 1.0f, std::numeric_limits<float>::infinity(), 0.0f }); break;   // inf level: ignored
         default:
         {
+            if (delay::kMaxHeads < 2)   // one head: there is no other head to keep silent
+            {
+                a.setHead (delay::kMaxHeads + r.below (3), { 0.5f, 1.0f, -1.0f });
+                break;
+            }
             const int k = 1 + r.below (delay::kMaxHeads - 1);
             const float level = r.chance (30) ? 1.0e-16f * r.unit() : 0.0f;   // under 1e-15: a head that is off
             a.setHead (k, { r.chance (10) ? -3.0f : r.unit(), level, 2.4f * r.signedUnit() });
@@ -353,11 +364,11 @@ int session (std::uint64_t seed, int ops, Census& n)
             else              len = -r.range (1, 64);         // refused: a negative extent
 
             const int planes = nch > 0 ? std::min (nch, 2) : 0;
-            const int kind = r.below (6);
+            const int kind = r.below (7);
             for (int ch = 0; ch < 2; ++ch)
             {
                 ia[ch].assign ((std::size_t) std::max (len, 0), 0.0f);
-                if (ch < planes) fillInput (r, ia[ch], kind, n);
+                if (ch < planes) fillInput (r, ia[ch], kind);
                 ib[ch] = ia[ch];
                 keep[ch] = ia[ch];
             }
@@ -380,6 +391,9 @@ int session (std::uint64_t seed, int ops, Census& n)
                 else if (nch == 2) ++n.stereo;
                 if (len > 1024) ++n.longCalls;
                 if (! feed) ++n.standByCalls;
+                if (nch > 0 && kind == 4) ++n.subnormalInput;
+                if (nch > 0 && kind == 5) ++n.nonFiniteInput;
+                if (nch > 0 && kind == 6 && feed && len >= 2) ++n.overflowInput;   // the door open: it reaches the loop
             }
             else if (len == 0) ++n.zeroLength;
         }
@@ -421,10 +435,11 @@ void sessions (int count, int ops)
                      + std::to_string (failed) + " parted from the frozen class");
 
     std::printf ("      [census: %lld calls (%lld refused), %lld stereo, %lld narrower, %lld pauses, %lld zero-length, "
-                 "%lld long, %lld poison, %lld subnormal-input, %lld stand-by, %lld feed flips, %lld resets, "
+                 "%lld long, %lld non-finite input, %lld overflow input, %lld subnormal-input, %lld stand-by, %lld feed flips, %lld resets, "
                  "%lld prepares (%lld refused, %lld mono), %lld setParams, %lld single setters, %lld absurd knobs, "
                  "%lld re-sends, %lld one-ulp nudges, %lld samples; %lld head calls (%lld silent moves, %lld default re-sends)]\n",
-                 n.calls, n.refusedCalls, n.stereo, n.narrower, n.pauses, n.zeroLength, n.longCalls, n.poisonCalls,
+                 n.calls, n.refusedCalls, n.stereo, n.narrower, n.pauses, n.zeroLength, n.longCalls, n.nonFiniteInput,
+                 n.overflowInput,
                  n.subnormalInput, n.standByCalls, n.feedFlips, n.resets, n.prepares, n.refusedPrepares, n.monoPrepared,
                  n.setParams, n.singleSetters, n.absurdKnobs, n.reSends, n.ulpNudges, n.samples, n.headOps,
                  n.silentHeadMoves, n.defaultReSends);
@@ -434,11 +449,13 @@ void sessions (int count, int ops)
         "the census: stereo, narrower mono calls, pauses, zero-length and long calls all reached");
     ok (n.refusedCalls >= 100 && n.refusedPrepares >= 10 && n.monoPrepared >= 20 && n.prepares >= 100,
         "the census: refused calls, refused prepares and mono preparations all reached");
-    ok (n.poisonCalls >= 50 && n.subnormalInput >= 50 && n.standByCalls >= 200 && n.feedFlips >= 100 && n.resets >= 100,
-        "the census: poison, subnormal input, stand-by, feed flips and resets all reached");
+    ok (n.nonFiniteInput >= 50 && n.overflowInput >= 50 && n.subnormalInput >= 50 && n.standByCalls >= 200
+            && n.feedFlips >= 100 && n.resets >= 100,
+        "the census: non-finite input (refused at the door), finite overflow (the line restarts), subnormal input, "
+        "stand-by, feed flips and resets all reached");
     ok (n.setParams >= 200 && n.singleSetters >= 200 && n.absurdKnobs >= 200 && n.reSends >= 100 && n.ulpNudges >= 100,
         "the census: whole and single knob sets, absurd values, re-sends and one-ulp nudges all reached");
-    ok (n.headOps >= 500 && n.silentHeadMoves >= 200 && n.defaultReSends >= 100,
+    ok (n.headOps >= 500 && (delay::kMaxHeads < 2 || n.silentHeadMoves >= 200) && n.defaultReSends >= 100,
         "the census: head calls that keep the default — silent heads moved, the default re-sent — all reached");
 }
 } // namespace

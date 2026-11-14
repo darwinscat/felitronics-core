@@ -585,6 +585,41 @@ void panLaw()
 }
 
 //==============================================================================
+// 4b · PAN-LAW ANCHORS — off-centre pans at levels other than 1, against bits computed OUTSIDE the class: the
+//      rational law evaluated to 60 digits and rounded to float once (Python's decimal; not the class's
+//      double arithmetic). The table is the oracle; a law rounded at a different step would miss it.
+//==============================================================================
+void panAnchors()
+{
+    group ("pan-law anchors: five off-centre pans at five levels, the gains' bits against a 60-digit evaluation");
+    struct Anchor { float pan, level; std::uint32_t left, right; };
+    const Anchor table[] = {
+        {  0.5f,  0.5f,  0x3e64f92eu, 0x3f2bbae3u },
+        { -0.25f, 0.8f,  0x3f785b43u, 0x3f15038eu },
+        {  0.75f, 1.0f,  0x3e4ccccdu, 0x3fb33333u },
+        { -0.9f,  0.3f,  0x3ed8ec48u, 0x3cb6ac0au },
+        {  0.1f,  0.65f, 0x3f15044bu, 0x3f3621b1u },
+    };
+    bool all = true;
+    for (const Anchor& a : table)
+    {
+        delay::TapeDelay d;
+        test::run (d.prepare (48000.0, 64, 2));
+        d.setParams (knobs (300.0f, 0.3f, 4000.0f, 0.0f, 1.0f, layout ({ { 1.0f, a.level, a.pan } })));
+        OneByOne s { d };
+        test::run (s.step (0.0f, 0.0f));   // the first carried call puts the gains on target
+        const bool here = bitsOf (d.headGain (0, 0)) == a.left && bitsOf (d.headGain (0, 1)) == a.right;
+        if (! here)
+            std::printf ("      [pan %g level %g: got 0x%08x 0x%08x]\n", (double) a.pan, (double) a.level,
+                         (unsigned) bitsOf (d.headGain (0, 0)), (unsigned) bitsOf (d.headGain (0, 1)));
+        all = all && here;
+    }
+    // Catches: the pan law rounded to float before the level multiplies it, a different law with the same centre
+    // and ends, the level applied in float.
+    ok (all, "every anchor's two gains, bit for bit");
+}
+
+//==============================================================================
 // 5 · RAMPS
 //==============================================================================
 void ramps()
@@ -1002,8 +1037,9 @@ void snapAfterRestart()
 //==============================================================================
 // 11 · RE-SLICING AT ABSOLUTE EVENT SAMPLES, AND THE HELD STATE RE-SENT EVERY BLOCK
 //==============================================================================
-enum class Kind { position, level, pan, time, offset, feed };
-constexpr int kKinds = 6;
+enum class Kind { position, level, pan, time, offset, feed, reset };
+constexpr int kKinds = 6;        // the kinds drawn in rotation; the restarts are placed by hand
+constexpr int kAllKinds = 7;
 
 struct Event
 {
@@ -1040,6 +1076,7 @@ Timeline makeTimeline()
             case Kind::time:     e.value = 80.0f + 500.0f * r.unit(); break;
             case Kind::offset:   e.value = 25.0f * r.signedUnit(); break;
             case Kind::feed:     break;
+            case Kind::reset:    break;   // never drawn: i % kKinds stops short of it; the restarts are placed below
         }
         tl.events.push_back (e);
     }
@@ -1050,6 +1087,11 @@ Timeline makeTimeline()
     tl.events.push_back ({ tl.pauseFrom + 500, Kind::position, kHeads - 1, 0.3f, false });
     tl.events.push_back ({ tl.pauseFrom + 700, Kind::time, 0, 450.0f, false });
     tl.events.push_back ({ tl.pauseTo, Kind::level, 0, 0.0f, true });
+    // Restarts at absolute samples: one in the open, one inside the mono stretch, one inside the pause (the gains
+    // then wait for the first call that carries a channel).
+    tl.events.push_back ({ 20011, Kind::reset, 0, 0.0f, false });
+    tl.events.push_back ({ tl.monoFrom + 2500, Kind::reset, 0, 0.0f, false });
+    tl.events.push_back ({ tl.pauseFrom + 1200, Kind::reset, 0, 0.0f, false });
     std::stable_sort (tl.events.begin(), tl.events.end(), [] (const Event& a, const Event& b) { return a.at < b.at; });
 
     Rng nz (99u);
@@ -1065,9 +1107,10 @@ Timeline makeTimeline()
 
 struct Census
 {
-    int kinds[kKinds] {};
+    int kinds[kAllKinds] {};
     int inMono = 0, inPause = 0, turnedOn = 0, turnedOff = 0;
-    long long monoCalls = 0, pauseCalls = 0;
+    long long monoCalls = 0, pauseCalls = 0, noOpCalls = 0;
+    bool noOpsAsSaid = true;   // every zero-length call accepted, every refused one refused
 };
 
 void apply (delay::TapeDelay& d, delay::TapeDelayParams& held, bool& feed, const Event& e, Census& c)
@@ -1082,6 +1125,7 @@ void apply (delay::TapeDelay& d, delay::TapeDelayParams& held, bool& feed, const
         case Kind::time:     held.timeMs = e.value; d.setTimeMs (e.value); break;
         case Kind::offset:   held.offsetMs = e.value; d.setOffsetMs (e.value); break;
         case Kind::feed:     feed = ! feed; break;
+        case Kind::reset:    d.reset(); break;
     }
     ++c.kinds[(int) e.kind];
     if (e.kind == Kind::level && ! (was > 0.0f) && e.value > 0.0f) ++c.turnedOn;
@@ -1090,7 +1134,7 @@ void apply (delay::TapeDelay& d, delay::TapeDelayParams& held, bool& feed, const
 
 /** Renders the timeline. Every block is cut at its slice edge, at the next event's sample and at the stretches' edges,
     so an event lands on its absolute sample in any slicing. `slice` 0 draws the slices from a seeded generator. */
-Planes renderTimeline (const Timeline& tl, int slice, bool heldEveryBlock, Census& c, Witness& w)
+Planes renderTimeline (const Timeline& tl, int slice, bool heldEveryBlock, Census& c, Witness& w, bool noOps = false)
 {
     delay::TapeDelay d;
     test::run (d.prepare (48000.0, 4096, 2));
@@ -1122,6 +1166,15 @@ Planes renderTimeline (const Timeline& tl, int slice, bool heldEveryBlock, Censu
         const bool pause = pos >= tl.pauseFrom && pos < tl.pauseTo;
         const int  nch   = pause ? 0 : (mono ? 1 : 2);
         float* p[2] = { io[0].data() + pos, io[1].data() + pos };
+        if (noOps)
+        {
+            // Calls that must move NOTHING, of every width: zero-length (accepted) and refused ones. A width
+            // aimed, a ramp stepped or a head snapped by any of them would show in the bytes.
+            const bool zeroes = d.process (p, 1, 0, ! feed) && d.process (nullptr, 0, 0, ! feed) && d.process (p, 2, 0, feed);
+            const bool refused = ! d.process (p, 3, 64, feed) && ! d.process (p, 1, -1, feed) && ! d.process (nullptr, 1, 64, feed);
+            c.noOpsAsSaid = c.noOpsAsSaid && zeroes && refused;
+            c.noOpCalls += 6;
+        }
         test::run (d.process (nch == 0 ? nullptr : p, nch, end - pos, feed));
         c.monoCalls  += mono ? 1 : 0;
         c.pauseCalls += pause ? 1 : 0;
@@ -1164,21 +1217,32 @@ void reslicing()
     // Catches: a re-send that restarts a ramp or a glide, a guard that is not exact.
     ok (heldSame, "the held knobs and layout re-sent at the top of EVERY block (setParams and setHeads): the same bytes");
 
+    Census nc;
+    Witness nw;
+    const Planes noOp = renderTimeline (tl, 333, false, nc, nw, true);
+    // Catches: the width aimed (or a head stepped) by a zero-length or a refused call — e.g. aimWidth() ahead of the
+    // n == 0 return: a zero-length MONO call would send side 0 toward the mono level.
+    ok (nc.noOpsAsSaid && nc.noOpCalls > 1000 && samePlanes (noOp, ref) && sameWitness (nw, w0),
+        "zero-length calls of width 0, 1 and 2 and refused calls before EVERY block (" + std::to_string (nc.noOpCalls)
+            + " of them): the same bytes and witnesses");
+
     for (const Event& e : tl.events)
     {
         if (e.at >= tl.monoFrom && e.at < tl.monoTo) ++first.inMono;
         if (e.at >= tl.pauseFrom && e.at < tl.pauseTo) ++first.inPause;
     }
-    std::printf ("      [timeline: %d position, %d level, %d pan, %d time, %d offset, %d feed events; %d heads turned on, "
-                 "%d off; %d in the mono stretch, %d in the pause; %lld mono and %lld pause calls]\n",
+    std::printf ("      [timeline: %d position, %d level, %d pan, %d time, %d offset, %d feed, %d restart events; %d heads "
+                 "turned on, %d off; %d in the mono stretch, %d in the pause; %lld mono and %lld pause calls]\n",
                  first.kinds[0], first.kinds[1], first.kinds[2], first.kinds[3], first.kinds[4], first.kinds[5],
-                 first.turnedOn, first.turnedOff, first.inMono, first.inPause, first.monoCalls, first.pauseCalls);
+                 first.kinds[6], first.turnedOn, first.turnedOff, first.inMono, first.inPause, first.monoCalls,
+                 first.pauseCalls);
     bool everyKind = true;
     for (int k = 0; k < kKinds; ++k)
         everyKind = everyKind && first.kinds[k] >= 10;
     ok (everyKind && first.turnedOn >= 2 && first.turnedOff >= 2 && first.inMono >= 2 && first.inPause >= 2
             && first.monoCalls >= 2 && first.pauseCalls >= 2,
         "the census: every kind of event at least 10 times, heads turned on and off, events inside both stretches");
+    ok (first.kinds[(int) Kind::reset] == 3, "the census: the three restarts were applied (in the open, in mono, in the pause)");
 }
 
 //==============================================================================
@@ -1680,6 +1744,90 @@ void shownHeads()
 }
 
 //==============================================================================
+// 15b · LAW 8 FOR A RAMP RESTARTED FROM WHERE IT STOOD — a level sent up and back down before every sample
+//==============================================================================
+void restartedRampFloor()
+{
+    group ("law 8: a level sent up and back down before every sample — each ramp restarted from where the last stood — "
+           "never parks a subnormal gain");
+    for (double sr : { 1000.0, 8000.0 })
+    {
+        delay::TapeDelay d;
+        test::run (d.prepare (sr, 1, 2));
+        OneByOne s { d };
+        test::run (s.step (0.0f, 0.0f));
+        const int n = (int) (2.0 * 87.4 / (1.0 / (double) rampLength (sr)));   // twice the samples to shrink 1 to 2^-126
+        bool anySub = false;
+        int zeroAt = -1;
+        for (int i = 0; i < n; ++i)
+        {
+            d.setHead (0, { 1.0f, 1.0f, 0.0f });
+            d.setHead (0, { 1.0f, 0.0f, 0.0f });
+            test::run (s.step (0.0f, 0.0f));
+            anySub = anySub || d.anySubnormalState() || isSub (d.headGain (0, 0)) || isSub (d.headGain (0, 1));
+            if (zeroAt < 0 && same (d.headGain (0, 0), 0.0f) && same (d.headGain (0, 1), 0.0f))
+                zeroAt = i;
+        }
+        // Catches: a ramp value stored without the floor at the subnormal edge (the gain then parks at ~2^-146).
+        ok (! anySub && zeroAt > 0, "at " + std::to_string ((int) sr) + " Hz: no subnormal in any state over "
+                                     + std::to_string (n) + " samples, and the gain reaches exactly 0 (at sample "
+                                     + std::to_string (zeroAt) + ")");
+
+        // ...and nothing small is left behind in the ramp's ends: send level 1, let it land.
+        d.setHead (0, { 1.0f, 1.0f, 0.0f });
+        for (int i = 0; i < rampLength (sr) + 2; ++i)
+            test::run (s.step (0.0f, 0.0f));
+        ok (same (d.headGain (0, 0), 1.0f) && same (d.headGain (0, 1), 1.0f) && ! d.anySubnormalState(),
+            "...then level 1 lands on exactly 1 and no state (ramp ends included) is subnormal");
+    }
+}
+
+//==============================================================================
+// 15c · A REAL POISON RESTART — a finite overflow, not a rejected NaN — with the heads moving
+//==============================================================================
+void poisonRestart()
+{
+    group ("poison: a finite overflow restarts the line at the call's end, with heads mid-ramp — what follows is a fresh "
+           "restart's bytes");
+    constexpr double sr = 48000.0;
+    const float big = std::numeric_limits<float>::max();
+    const delay::TapeDelayParams p = knobs (20.0f, 1.0f, 100000.0f, 9.0f, 1.0f,
+                                            layout ({ { 1.0f, 0.7f, -0.4f }, { 0.5f, 1.0f, 1.0f }, { 0.25f, 0.5f, 0.0f } }));
+    delay::TapeDelay a, b;
+    test::run (a.prepare (sr, 512, 2));
+    test::run (b.prepare (sr, 512, 2));
+    a.setParams (p);
+    b.setParams (p);
+
+    Planes warm = burst (4000, 4000, 7u, 0.5f, false);
+    test::run (renderBlocks (a, warm, 512));
+    a.setHead (0, { 0.6f, 0.2f, 0.9f });   // a head mid-glide and mid-ramp when the overflow lands
+
+    // Finite samples that overflow the loop filter: +FLT_MAX then -FLT_MAX, DARK wide open, REPEATS 1.
+    Planes boom (2, Plane (256, 0.0f));
+    for (int i = 0; i < 256; ++i)
+        cell (boom[0], i) = cell (boom[1], i) = (i % 2 == 0 ? big : -big);
+    float* q[2] = { boom[0].data(), boom[1].data() };
+    test::run (a.process (q, 2, 256));
+
+    // The twin restarts at the same call boundary by hand, with the same targets.
+    b.setHead (0, { 0.6f, 0.2f, 0.9f });
+    b.reset();
+
+    Planes after = burst (30000, 3000, 9u, 0.5f, false);
+    Planes ia = after, ib = after;
+    test::run (renderBlocks (a, ia, 300));
+    test::run (renderBlocks (b, ib, 300));
+    bool finite = true;
+    for (const auto& pl : ia)
+        for (float v : pl)
+            finite = finite && std::isfinite (v);
+    // Catches: no restart at the end of a call whose loop state went non-finite (the line would replay inf / NaN).
+    ok (finite && samePlanes (ia, ib) && sameWitness (witness (a), witness (b)),
+        "after the overflow call: every sample finite, and the bytes and witnesses of a twin reset at that boundary");
+}
+
+//==============================================================================
 // 20 · NO ALLOCATION
 //==============================================================================
 void noAllocation()
@@ -1722,6 +1870,7 @@ int main()
     tripletFigure();
     pingPong();
     panLaw();
+    panAnchors();
     ramps();
     positionGlide();
     bend();
@@ -1733,6 +1882,8 @@ int main()
     zeroSoundingHeads();
     awayAndBack();
     law8();
+    restartedRampFloor();
+    poisonRestart();
     tail();
     validation();
     underOneSample();

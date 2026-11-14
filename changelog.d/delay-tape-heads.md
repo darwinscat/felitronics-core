@@ -16,12 +16,14 @@ tape (#272).
   hard-panned head is +3 dB on its side. The law is rational — gL = (1 − p)/√(1 + p²), gR = (1 + p)/√(1 + p²),
   exact at the centre and the ends, the same bits on every row with no transcendental — and within 4.1° of the
   sine law. On dual mono (one guitar on both lines, as the amps and the demo feed it) heads panned apart are a
-  ping-pong; on a stereo input a hard-panned head plays its own side only. A mono call has no pan: every head plays
-  at its level.
+  ping-pong; on a stereo input a hard-panned head plays its own side only. A mono call aims every head at its level,
+  pan aside (a change of width ramps there). Constant power is the law the gains land on; the ramps between are
+  linear in gain, so a jump across the field dips up to 3 dB for those 20 ms.
 - **Moved live.** Level and pan reach a head as two side gains on counted 20 ms ramps that land exactly; a silent
   head stands where it was sent, so turning one on plays it there instead of sweeping it in; a change of call width
   ramps instead of stepping. All of it is sample-clocked: the same playing gives the same samples whatever the
-  host's blocks, live head moves included.
+  host's blocks, live head moves included, while the state stays finite (a poison restart keeps the call's clock,
+  as everywhere in core).
 - **API.** `TapeDelayParams` gains `heads` (a `std::array` of `kMaxHeads`), applied by `setParams` after the five
   knobs: the struct is the whole state, and one built without heads carries the default layout. `setHead (k, head)`
   and `setHeads (heads)` set them directly; each field is bounded on its own and an index off the array is ignored.
@@ -29,7 +31,7 @@ tape (#272).
 - **The default is today's sound, byte for byte**: one head at 1x, level 1, centre. Every existing preset, setter
   call and `setParams` without heads plays as before — held to a frozen copy of the one-head class by a parity
   test that compares the output and every tap as bytes through prepares, setters, every call width, stand-by,
-  resets and poison.
+  resets, non-finite input (refused at the record head) and finite overflows that restart the line.
 - **`tailSeconds()` counts the heads**: stacked heads add and hard pan is +3 dB, so the first echo is taken at the
   sum of each head's level times its louder side. The default layout reports exactly what it did.
 - **MIX** still adds the wet with the dry untouched; with several heads the wet is their sum, so at MIX 1 four

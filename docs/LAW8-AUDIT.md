@@ -267,16 +267,22 @@ of a 6 s target at 48 kHz, parked there for good. In double that distance is ~1e
 step is inaudible. The room's glides are linear and land by construction.
 **The playback heads.** A head's position glides in double like the motor and lands; its floor is the smallest
 normal float, so no position glide ever heads for zero. Its level and pan reach it as two side gains on counted
-linear ramps, which end exactly on target, and a level under 1e-15 is taken as 0 where it is set. What a head
-plays goes into the offset line, a pure delay: a contribution at a gain of exactly 1 is the line's own tap (zero
-or at least ~1e-15 times an interpolation fraction, as before), and every scaled contribution is flushed at the
-house 1e-15 before it is summed, so a tiny gain on a quiet tap cannot store a subnormal there. The law-8 witness
-(`anySubnormalState`) reads the offset lines and every head's position and gains too.
+linear ramps, which end exactly on target, and a level under 1e-15 is taken as 0 where it is set. One ramp never
+steps under its target over its length, and every target is zero or normal; but a ramp restarted from where the
+last one stood — a level sent up and back down before every sample — shrinks the gain geometrically, so the ramp's
+value is floored at the smallest normal float (not at 1e-15: the pan law makes gains near 4e-23 on purpose, and
+they must play). What a head plays goes into the offset line, a pure delay: a contribution at a gain of exactly 1
+is the line's own tap, as before — zero or normal: every stored sample is zero or at least ~1e-15 (2^-50, so its
+last bit is at least 2^-73) and an interpolation fraction's last bit is at least 2^-24, so even when two neighbours
+of opposite sign nearly cancel, the tap is zero or at least 2^-97 — far above the band at 2^-126. Every scaled contribution is
+flushed at the house 1e-15 before it is summed, so a tiny gain on a quiet tap cannot store a subnormal there. The
+law-8 witness (`anySubnormalState`) reads the offset lines and, per head, its position, its gains, both ends of
+each ramp and its balance targets.
 Tested in `modules/delay/tests/TapeDelayTests.cpp` (a minute of silence after a bloom with the offset gliding to
 zero: no subnormal in any state at any block, and the silence holds; the heads stand exactly on their targets),
 `modules/delay/tests/TapeDelayHeadsTests.cpp` (a level fading to nothing under a ringing loop with the offset
 on, tiny levels and subnormal input: no subnormal at any block end, and the gains land on their targets in a
-counted number of samples) and `modules/reverb/tests/AmpReverbTests.cpp` (three minutes after a HALL at DECAY ×2: no subnormal in the room,
+counted number of samples; a level sent up and down before every sample: no subnormal gain, and it reaches 0) and `modules/reverb/tests/AmpReverbTests.cpp` (three minutes after a HALL at DECAY ×2: no subnormal in the room,
 the predelay or the chorus line, and once exact zero is reached it holds).
 
 ### Added with the module: `envfilter::EnvelopeFilter` — gridded from the start
