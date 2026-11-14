@@ -2342,13 +2342,19 @@ void hairShortOfTheEnd()
         // A position whose distance sits a hair past a whole sample (which 0: the read before the write clock
         // reaches it rounds onto the line's length) or about half one (which 1: the read sits in the last slot).
         float pos = 0.5f, hd = 0.0f;
-        for (;; pos = std::nextafter (pos, 1.0f))
+        bool found = false;
+        for (int step = 0; step < 1000000 && ! found; ++step, pos = std::nextafter (pos, 1.0f))
         {
             hd = (float) ((double) pos * (double) D);
             const float frac = hd - std::floor (hd);
-            if (which == 0 ? (frac > 0.004f && frac < 0.012f) : (frac > 0.45f && frac < 0.55f))
+            found = which == 0 ? (frac > 0.004f && frac < 0.012f) : (frac > 0.45f && frac < 0.55f);
+            if (found)
                 break;
         }
+        ok (found, std::string ("the fixture: a position whose distance sits ") + (which == 0 ? "a hair" : "half a sample")
+                       + " past a whole sample was found");
+        if (! found)
+            continue;
         const int I = (int) std::floor (hd);
 
         delay::TapeDelay d;

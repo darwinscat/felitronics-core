@@ -36,3 +36,8 @@ tape (#272).
   sum of each head's level times its louder side. The default layout reports exactly what it did.
 - **MIX** still adds the wet with the dry untouched; with several heads the wet is their sum, so at MIX 1 four
   stacked unity heads play four times one.
+- **Cost** (deb, Intel i9-13900H, gcc 14, 48 kHz stereo, 64-sample calls; P-core / E-core). The default layout costs
+  0.265 / 0.593 % of real time, against the one-head class's 0.255 / 0.579: a call whose heads all stand on their
+  targets skips their step, and the default layout plays the loop's own tap. Four settled heads cost 0.367 / 0.872 %,
+  four heads retargeted every 512 samples 0.489 / 1.113 %. The 99.9th-percentile call stays under 9 µs on the P-core
+  and under 20 µs on the E-core.
