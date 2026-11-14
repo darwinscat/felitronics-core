@@ -20,7 +20,8 @@ namespace felitronics::convolution
 // non-uniform partition schedule (a time-domain head P0 + growing overlap-save stages) proven in
 // NonUniformConvolver. Drop-in for `MatrixConvolver<Fft>`: identical prepare/setOperator/stageOperator/
 // publishStaged/setIr/process/reset/isBusy/latencySamples()==0 signatures, so lineareq's
-// `using Conv = MatrixConvolver<AudioFft>` becomes `= MatrixConvolverNupc<AudioFft>` with no other change.
+// `using Conv = MatrixConvolver<AudioFft>` became `= MatrixConvolverNupc<AudioFft>` with no other change. (Since
+// then lineareq also calls reserve(), which MatrixConvolver lacks: a swap back would drop those calls.)
 //
 // COMPLETE. ALL topologies (mono / LRDiag / MSDiag / Full) + the CLICK-FREE 2-slot smoothstep WARM crossfade
 // swap — a full drop-in for MatrixConvolver.

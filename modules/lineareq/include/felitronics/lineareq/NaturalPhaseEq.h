@@ -90,15 +90,15 @@ public:
             for (int c = 0; c < channels_; ++c)
             {
                 chConv_.push_back (std::make_unique<Conv>());
-                if (! chConv_.back()->prepare (part, L_, warmXfade, 1)) return false;
-                (void) chConv_.back()->reserve (Conv::Topology::LRDiag, L_);   // every bank, now: setBands() allocates nothing
+                if (! chConv_.back()->prepare (part, L_, warmXfade, 1)
+                    || ! chConv_.back()->reserve (Conv::Topology::LRDiag, L_)) return false;   // every bank, now
             }
         }
-        else if (! conv_.prepare (part, L_, warmXfade, channels_ == 1 ? 1 : 2)) return false;
         // The convolver grows its banks to the IR it is handed; this EQ's IR is always L_ taps and any band
         // set may need the Full matrix, so every bank either slot can hold is grown HERE — setBands() then
         // allocates nothing, as it never has.
-        else (void) conv_.reserve (Conv::Topology::Full, L_);
+        else if (! conv_.prepare (part, L_, warmXfade, channels_ == 1 ? 1 : 2)
+                 || ! conv_.reserve (Conv::Topology::Full, L_)) return false;
         prepared_ = true;                                       // fully built — setBands()/buildFir() may now run
         return true;
     }

@@ -80,8 +80,9 @@ int banksOf (Topo t) { return t == Topo::Mono ? 1 : (t == Topo::Full ? 4 : 2); }
 
 enum class MidFade { None, TrySwap, Reset, Clear, StageLate, StageResetLate };
 
-// newCap >= 0 re-prepares both instances to that cap (same head, same width) before the swap.
-struct Step { Topo topo; int len; MidFade mid; int newCap = -1; };
+// newCap >= 0 re-prepares both instances to that cap (same head) before the swap; newCh > 0 re-prepares them to
+// that width as well (the cap stays where it is unless newCap says otherwise).
+struct Step { Topo topo; int len; MidFade mid; int newCap = -1; int newCh = 0; };
 
 struct Outcome
 {
@@ -93,13 +94,14 @@ struct Outcome
 };
 
 template <class Fft>
-Outcome lockstep (int nch, int head, int cap, int xfade, const std::vector<Step>& steps, int samplesPerStep,
+Outcome lockstep (int nch0, int head, int cap, int xfade, const std::vector<Step>& steps, int samplesPerStep,
                   int fixedBlock, unsigned long long seed)
 {
     using Now = convolution::MatrixConvolverNupc<Fft>;
     using Was = convolution::frozen::MatrixConvolverNupc<Fft>;
     Outcome r;
     Now now; Was was;
+    int nch = nch0, capNow = cap;
     if (! now.prepare (head, cap, xfade, nch) || ! was.prepare (head, cap, xfade, nch)) { r.callsDiffer = -1; return r; }
 
     Lcg rng { seed };
@@ -114,7 +116,12 @@ Outcome lockstep (int nch, int head, int cap, int xfade, const std::vector<Step>
         std::vector<float> irs[4];
         const float* banks[4] {};
         for (int b = 0; b < 4; ++b) { irs[b] = denseIr (st.len, seed * 977ULL + k * 31ULL + (unsigned long long) b); banks[b] = st.len > 0 ? irs[b].data() : nullptr; }
-        if (st.newCap >= 0 && (! now.prepare (head, st.newCap, xfade, nch) || ! was.prepare (head, st.newCap, xfade, nch))) ++r.callsDiffer;
+        if (st.newCap >= 0 || st.newCh > 0)
+        {
+            if (st.newCap >= 0) capNow = st.newCap;
+            if (st.newCh > 0)   nch = st.newCh;
+            if (! now.prepare (head, capNow, xfade, nch) || ! was.prepare (head, capNow, xfade, nch)) ++r.callsDiffer;
+        }
         const int nb = 4;   // always four bank pointers: a topology that reads fewer must ignore the rest
         const bool late = st.mid == MidFade::StageLate || st.mid == MidFade::StageResetLate;
         const bool a = late ? now.stageOperator (topologyOf<Now> (st.topo), banks, nb, st.len)
@@ -213,6 +220,16 @@ std::vector<Step> withReprepares (int cap)
              { Topo::Full, cap, MidFade::None } };
 }
 
+// Re-prepared across widths: stereo to mono and back, with and without a cap change — the path where a mono
+// re-prepare releases the right channel's history.
+std::vector<Step> withWidthChanges (int cap)
+{
+    return { { Topo::LR, 150, MidFade::None },                 { Topo::Full, cap, MidFade::None },
+             { Topo::LR, 700, MidFade::None, -1, 1 },          { Topo::LR, cap, MidFade::Reset },
+             { Topo::Full, cap, MidFade::None, -1, 2 },        { Topo::MS, 300, MidFade::Clear },
+             { Topo::LR, cap - 1, MidFade::None, cap / 2, 1 }, { Topo::Full, cap, MidFade::TrySwap, cap, 2 } };
+}
+
 template <class Fft>
 void checkLockstep (const char* backend, const std::string& what, int nch, const std::vector<Step>& steps, int fixedBlock,
                     unsigned long long seed, int head = 128, int cap = 12000)
@@ -220,7 +237,8 @@ void checkLockstep (const char* backend, const std::string& what, int nch, const
     constexpr int xfade = 400;
     const int perStep = 2 * cap + 3000;   // the fade, then every stage wraps at least once
     const Outcome r = lockstep<Fft> (nch, head, cap, xfade, steps, perStep, fixedBlock, seed);
-    const long long want = (long long) steps.size() * perStep * nch;
+    long long want = 0;
+    for (int width = nch; const Step& s : steps) { if (s.newCh > 0) width = s.newCh; want += (long long) perStep * width; }
     int wantMid = 0; for (const Step& s : steps) if (s.mid != MidFade::None) ++wantMid;
     const std::string tag = std::string (backend) + " " + what + (fixedBlock > 0 ? ", block " + std::to_string (fixedBlock) : ", uneven blocks");
     test::ok (r.callsDiffer == 0, tag + ": every call answered as the frozen class answered (" + std::to_string (r.callsDiffer) + " differ)");
@@ -576,7 +594,7 @@ void checkMemory (const char* backend)
             drains += dr2.drain (m, 2);
         }
         test::ok (accepted == 6 && later == 0 && drains == 0,
-                  be + " after reserve(), six swaps of every topology up to the cap allocate nothing (" + std::to_string (later) + ")");
+                  be + " after reserve(Full, cap), six swaps of every topology up to the cap allocate nothing (" + std::to_string (later) + ")");
 
         C mono;
         test::run (mono.prepare (P0, cap, xfade, 1));
@@ -824,6 +842,7 @@ void suite (const char* backend)
     checkLockstep<Fft> (backend, "mixed, head 512",     2, mixed (30000), 0, 23, 512, 30000);
     checkLockstep<Fft> (backend, "MSDiag, head 16 (pffft's smallest real FFT is 32)", 2, shortLong (Topo::MS, 3000), 0, 24, 16, 3000);
     checkLockstep<Fft> (backend, "through re-prepares", 2, withReprepares (12000), 0, 25);
+    checkLockstep<Fft> (backend, "through re-prepares across widths", 2, withWidthChanges (12000), 0, 26);
 
     test::group (std::string ("growth is complete — against a direct convolution (") + backend + ")");
     checkGrowth<Fft> (backend, Topo::Mono);
