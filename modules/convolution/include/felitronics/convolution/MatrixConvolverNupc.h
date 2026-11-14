@@ -57,6 +57,24 @@ namespace felitronics::convolution
 // A future "optimize short IRs" pass must NOT simply gate stages off — that would cold-start the FDL and break
 // warm swaps.
 //
+// THE WORST CALL, NOT THE MEAN. Every stage's boundary falls on a multiple of B_max, and the B_max stage holds
+// almost every partition of a long IR: done at its boundary, its MACs land in ONE process() call every B_max
+// samples (1872 of them for a 20 s Full IR at 48 kHz — over a 64-sample block's budget on an x86 laptop core), and a
+// swap's first call used to prime every stage of the incoming slot on top. So that stage is SPREAD for an operator
+// whose deferred work there, (P - 1) partitions times the banks its topology reads, is at least kSpreadFromMacs:
+//   • for the hop ahead, every term with j >= 1 reads a history row that is already final, so those products are
+//     accumulated through the hop, on a schedule of SAMPLE POSITIONS (an error term over B samples, exact at the
+//     boundary) — the units, and their order, never depend on how the host slices the stream. The boundary adds
+//     only j = 0 and inverts. The order of the sum differs from the unspread one, so a spread operator's output
+//     differs from it by float noise; below the threshold the stage runs as it always has, to the bit;
+//   • a spread operator picked up over a warm history is PREPARED for one hop — its tail for the hop its fade will
+//     start in accumulated at the same rate, the live operator playing alone — and its fade starts one hop after
+//     the pickup (2048 samples, 43 ms at 48 kHz), wherever in the hop that falls. Over a cold history (no boundary
+//     of that stage since prepare() or clearAudioState()) its rows are all zero, and the fade starts at once.
+// So for each sample it processes a call carries at most three sums' share of units (the live slot's; in a swap,
+// the incoming slot's first-hop and own sums too) plus, at a boundary, the j = 0 products and the inverses.
+// maxSwapSamples() says how long a swap can take.
+//
 // MEMORY NOTE. The same split. The shared FDL is sized to maxIrSamples at prepare(), because it is ONE history
 // that both slots read: a new operator answers the last maxIrSamples of input at once, which is what keeps a
 // swap click-free and bit-exact. The bank spectra follow the LOADED IR: stageOperator() grows each bank, per
@@ -67,10 +85,16 @@ namespace felitronics::convolution
 // per channel (~16 B stereo); a sample of loaded IR costs ~8 B per bank, in each slot that holds it.
 //
 // RT-safe: prepare()/setOperator() allocate (message thread); process() is alloc/lock/throw-free, zero latency.
-template <core::fft::RealFftBackend Fft = core::fft::DefaultRealFft>
+template <core::fft::RealFftBackend Fft = core::fft::DefaultRealFft, int SpreadFromMacs = 256>
 class MatrixConvolverNupc
 {
 public:
+    // The B_max stage is SPREAD for an operator whose deferred work there — (P - 1) partitions times the banks its
+    // topology reads — is at least this many spectral MACs per hop (see the COST NOTE). Below it the stage runs as
+    // it always has, to the bit and with an immediate fade. A template parameter so a test can lower it and reach
+    // the spread path with a short IR; products leave it alone.
+    static constexpr int kSpreadFromMacs = SpreadFromMacs;
+    static_assert (SpreadFromMacs >= 1, "a threshold of 0 would spread a stage with no deferred work");
     enum class Topology { MSDiag, LRDiag, Full };
 
     static constexpr int kMaxBanks  = 4;
@@ -163,6 +187,26 @@ public:
                 for (int ch = 0; ch < 2; ++ch) sl.tail[(std::size_t) st][(std::size_t) ch].assign ((std::size_t) spec_[st].B, 0.0f);
         }
 
+        // THE SPREAD STATE (the COST NOTE). Sized only when some operator could be spread at this cap: the last
+        // stage holds more than one partition and a cap-length operator of every bank would reach the threshold.
+        dst_ = (numStages_ > 0 && spec_[numStages_ - 1].C > 1) ? numStages_ - 1 : -1;
+        const bool canSpread = dst_ >= 0 && (spec_[dst_].C - 1) * (mono_ ? 1 : kMaxBanks) >= kSpreadFromMacs;
+        if (! canSpread) dst_ = -1;
+        const int nOut = mono_ ? 1 : 2;
+        for (int o = 0; o < 2; ++o)
+        {
+            for (int k = 0; k < 2; ++k)
+            {
+                core::fft::AlignedVector<float>().swap (pre_[k][o]);
+                if (dst_ >= 0 && o < nOut) pre_[k][o].assign ((std::size_t) spec_[dst_].specF, 0.0f);
+            }
+            core::fft::AlignedVector<float>().swap (boot_[o]);
+            if (dst_ >= 0 && o < nOut) boot_[o].assign ((std::size_t) spec_[dst_].specF, 0.0f);
+        }
+        for (int k = 0; k < 2; ++k) { units_[k] = 0; preDone_[k] = 0; preErr_[k] = 0; }
+        bootDone_ = 0; bootErr_ = 0; bootBase_ = 0; bootLeft_ = 0;
+        priming_ = false; incArmed_ = false; dstCold_ = true;
+
         cur_ = 0; xfadePos_ = 0; xfadeLen_ = warmXfade_;
         state_.store (0, std::memory_order_relaxed);
         prepared_ = true;
@@ -198,6 +242,16 @@ public:
         for (int k = 0; k < 2; ++k)
             for (int st = 0; st < numStages_; ++st)
                 for (int ch = 0; ch < 2; ++ch) std::fill (slot_[k].tail[(std::size_t) st][(std::size_t) ch].begin(), slot_[k].tail[(std::size_t) st][(std::size_t) ch].end(), 0.0f);
+        // The spread sums were of that history too, and of a zero history they are exactly zero: both slots'
+        // are complete as they stand once zeroed. An incoming operator being prepared (priming) is ready for the
+        // same reason — every tail it needs is zero — so its fade starts on the next sample.
+        for (int k = 0; k < 2; ++k)
+        {
+            for (auto& v : pre_[k]) std::fill (v.begin(), v.end(), 0.0f);
+            preDone_[k] = units_[k]; preErr_[k] = 0;
+        }
+        for (auto& v : boot_) std::fill (v.begin(), v.end(), 0.0f);
+        priming_ = false; incArmed_ = false; dstCold_ = true;
     }
 
     // Flush the running history and KEEP THE OPERATOR THE CALLER LAST PUBLISHED — including one still
@@ -216,6 +270,8 @@ public:
                                                                  // an unconditional store(0) would wipe a
                                                                  // publication landing between load and store
         cur_ = 1 - cur_;                                         // the published slot becomes the live one
+        units_[cur_] = spreadUnitsFor (slot_[cur_]);             // a publication not yet picked up has no count;
+        preDone_[cur_] = units_[cur_]; preErr_[cur_] = 0;        // of the zero history its sum is complete at zero
         xfadePos_ = 0;
         state_.store (0, std::memory_order_release);             // release: setOperator() reads `cur_` after
                                                                  // acquiring this store
@@ -223,11 +279,18 @@ public:
 
     static constexpr int latencySamples() noexcept { return 0; }
     bool isBusy() const noexcept { return state_.load (std::memory_order_acquire) != 0; }
+
+    // The most samples a published operator can take, from the process() call that picks it up to the end of its
+    // fade: the crossfade, plus one B_max hop when this geometry can spread (a spread operator's fade starts one
+    // hop after it is picked up — the COST NOTE). A caller that feeds silence until a swap has landed (a cabinet
+    // standing out of the path) must feed this long, not a fade's length.
+    int maxSwapSamples() const noexcept { return warmXfade_ + (dst_ >= 0 ? spec_[dst_].B : 0); }
     int  numChannels() const noexcept { return channels_; }
 
     // Message thread — single producer, must not race reset(). Stage a whole operator into the inactive slot,
     // then publish; the next process() picks it up and crossfades it in over `crossfadeSamples` (see the
-    // state 1 -> 2 handoff in process() below — the warm swap is implemented, not pending).
+    // state 1 -> 2 handoff in process() below — the warm swap is implemented, not pending). A spread operator's
+    // fade starts one B_max hop after the pickup (the COST NOTE); isBusy() is true from the publish to its end.
     bool setOperator (Topology topo, const float* const* banks, int numBanks, int len)
     {
         if (! stageOperator (topo, banks, numBanks, len)) return false;
@@ -306,14 +369,8 @@ public:
         int s = state_.load (std::memory_order_acquire);
         if (s == 1)   // begin the crossfade. A cold-started FDL already yields the EXACT causal convolution, so ONE
         {             // short smoothstep fade (warmXfade_) masks only the silence→convolution onset — no long cold prime.
-            xfadePos_ = 0;
-            xfadeLen_ = warmXfade_;
-            for (int st = 0; st < numStages_; ++st)         // prime the new slot's tails from the per-stage FDLs
-            {
-                int base = hist_[(std::size_t) st].fdlPos - 1; if (base < 0) base += spec_[st].C;
-                computeStageTails (slot_[1 - cur_], st, base);
-            }
-            state_.store (2, std::memory_order_relaxed);
+            beginSwap();                                    // primes now, or starts preparing a spread operator
+            state_.store (2, std::memory_order_relaxed);    // 2 = a swap in flight, priming included
             s = 2;
         }
 
@@ -515,11 +572,196 @@ private:
             h.fft.forward (h.frame[ch].data(), inputSpec_.data());
             std::memcpy (&h.fdl[ch][(std::size_t) h.fdlPos * (std::size_t) specF], inputSpec_.data(), (std::size_t) specF * sizeof (float));
         }
-        computeStageTails (slot_[cur_], st, h.fdlPos);
-        if (fading) computeStageTails (slot_[1 - cur_], st, h.fdlPos);   // keep the incoming operator's tail coherent through the fade
+        if (st == dst_)
+        {
+            boundaryTails (cur_, h.fdlPos);
+            if (fading) boundaryTails (1 - cur_, h.fdlPos);   // keep the incoming operator's tail coherent through the fade
+            dstCold_ = false;
+        }
+        else
+        {
+            computeStageTails (slot_[cur_], st, h.fdlPos);
+            if (fading) computeStageTails (slot_[1 - cur_], st, h.fdlPos);
+        }
         for (int ch = 0; ch < channels_; ++ch)
             for (int i = 0; i < B; ++i) h.frame[ch][(std::size_t) i] = h.frame[ch][(std::size_t) (B + i)];
         if (++h.fdlPos >= spec_[st].C) h.fdlPos = 0;
+        if (st == dst_)                                     // each spread slot's sum for the next boundary starts empty
+        {
+            if (units_[cur_] > 0) restartPre (cur_);
+            if (fading && units_[1 - cur_] > 0) restartPre (1 - cur_);
+        }
+    }
+
+    //==========================================================================
+    // THE SPREAD B_max STAGE (the COST NOTE). For the hop that starts at a boundary the stage's tail is
+    // Σ_j X[base - j] · H_j, `base` the row that boundary writes. Every term with j >= 1 reads a row that was final
+    // a hop earlier, so it is accumulated through that hop — one UNIT is partition j against every bank the slot's
+    // topology reads, in a fixed order — and the boundary adds only j = 0 and inverts. The units run on a schedule
+    // of SAMPLE POSITIONS (an error term over the hop, exact after B samples), so what is computed, and in which
+    // order, never depends on how the host slices the stream; only which call pays for it does. Audio thread only.
+
+    // The units a slot defers per hop: P - 1, or 0 when it is not spread (under the threshold, or nothing to defer).
+    // P is read from bank 0: every bank of a staged operator is built to the same length, and a bank the topology
+    // does not read may still hold an older operator's count.
+    int spreadUnitsFor (const Slot& sl) const noexcept
+    {
+        if (dst_ < 0) return 0;
+        const int nb = mono_ ? 1 : sl.numBanks;
+        const int P = sl.banks[0].activeParts[dst_];
+        return (nb > 0 && P >= 2 && (P - 1) * nb >= kSpreadFromMacs) ? P - 1 : 0;
+    }
+
+    int ringRow (int base, int j) const noexcept { int r = base - j; if (r < 0) r += spec_[dst_].C; return r; }
+
+    void restartPre (int k) noexcept
+    {
+        for (auto& v : pre_[k]) std::fill (v.begin(), v.end(), 0.0f);
+        preDone_[k] = 0; preErr_[k] = 0;
+    }
+
+    void buildView (const float* xl, const float* xr, float sign, int specF) noexcept
+    {
+        for (int i = 0; i < specF; ++i) viewSpec_[(std::size_t) i] = 0.5f * (xl[i] + sign * xr[i]);
+    }
+
+    // acc0/acc1 += partition j of every bank `sl` reads, against the history row `row` of the spread stage. The
+    // accumulators are the topology's own: L/R outputs for LRDiag and Full, the M and S views for MSDiag (decoded
+    // after the inverse, as computeStageTails does). acc1 is unused when prepared mono.
+    void spreadUnit (const Slot& sl, int j, int row, float* acc0, float* acc1) noexcept
+    {
+        const int st = dst_, specF = spec_[st].specF;
+        const std::size_t xo = (std::size_t) row * (std::size_t) specF, ho = (std::size_t) j * (std::size_t) specF;
+        Fft& f = hist_[(std::size_t) st].fft;
+        const float* xl = &hist_[(std::size_t) st].fdl[0][xo];
+        auto H = [&] (int b) { return &sl.banks[b].irSpec[(std::size_t) st][ho]; };
+        if (mono_) { f.spectralMultiplyAdd (xl, H (0), acc0); return; }
+        const float* xr = &hist_[(std::size_t) st].fdl[1][xo];
+        switch (sl.topo)
+        {
+            case Topology::LRDiag:
+                f.spectralMultiplyAdd (xl, H (0), acc0);
+                f.spectralMultiplyAdd (xr, H (1), acc1);
+                break;
+            case Topology::MSDiag:   // one shared view scratch: each view is built right before its own MAC
+                buildView (xl, xr, +1.0f, specF); f.spectralMultiplyAdd (viewSpec_.data(), H (0), acc0);
+                buildView (xl, xr, -1.0f, specF); f.spectralMultiplyAdd (viewSpec_.data(), H (1), acc1);
+                break;
+            case Topology::Full:
+                f.spectralMultiplyAdd (xl, H (0), acc0);   // LL
+                f.spectralMultiplyAdd (xr, H (1), acc0);   // LR
+                f.spectralMultiplyAdd (xl, H (2), acc1);   // RL
+                f.spectralMultiplyAdd (xr, H (3), acc1);   // RR
+                break;
+        }
+    }
+
+    // The units `m` more samples owe a sum of `U` units over one hop of B samples, given the error carried.
+    static int owed (int& err, int U, int m, int B) noexcept
+    {
+        const long long e = (long long) err + (long long) U * (long long) m;
+        err = (int) (e % B);
+        return (int) (e / B);
+    }
+
+    // Slot k's own sum, for the boundary ahead (rows base - j, base the row that boundary writes).
+    void spreadAdvance (int k, int m) noexcept
+    {
+        const int U = units_[k];
+        if (preDone_[k] >= U) return;
+        int n = std::min (owed (preErr_[k], U, m, spec_[dst_].B), U - preDone_[k]);
+        const int base = hist_[(std::size_t) dst_].fdlPos;
+        while (n-- > 0) { const int j = ++preDone_[k]; spreadUnit (slot_[k], j, ringRow (base, j), pre_[k][0].data(), pre_[k][1].data()); }
+    }
+
+    // The incoming operator's sum for the hop its fade starts in (rows bootBase_ - j, fixed at the pickup).
+    void bootAdvance (int m) noexcept
+    {
+        const int k = 1 - cur_, U = units_[k];
+        if (bootDone_ >= U) return;
+        int n = std::min (owed (bootErr_, U, m, spec_[dst_].B), U - bootDone_);
+        while (n-- > 0) { const int j = ++bootDone_; spreadUnit (slot_[k], j, ringRow (bootBase_, j), boot_[0].data(), boot_[1].data()); }
+    }
+
+    void invTo (const float* acc, float* tail, int st) noexcept
+    {
+        hist_[(std::size_t) st].fft.inverse (acc, ifftOut_.data());
+        const int B = spec_[st].B;
+        for (int i = 0; i < B; ++i) tail[i] = ifftOut_[(std::size_t) (B + i)];
+    }
+
+    // A spread slot's tail for the hop that starts at `row`'s boundary: its deferred sum (j >= 1, in acc0/acc1,
+    // consumed here) plus the j = 0 product of `row`, inverted per output.
+    void spreadTails (Slot& sl, float* acc0, float* acc1, int row) noexcept
+    {
+        const int st = dst_;
+        spreadUnit (sl, 0, row, acc0, acc1);
+        auto& tl = sl.tail[(std::size_t) st];
+        if (mono_) { invTo (acc0, tl[0].data(), st); return; }
+        if (sl.topo != Topology::MSDiag) { invTo (acc0, tl[0].data(), st); invTo (acc1, tl[1].data(), st); return; }
+        invTo (acc0, tmpTailA_.data(), st); invTo (acc1, tmpTailB_.data(), st);
+        for (int i = 0; i < spec_[st].B; ++i)
+        {
+            const float m = tmpTailA_[(std::size_t) i], sd = tmpTailB_[(std::size_t) i];   // decode yL = yM + yS, yR = yM - yS
+            tl[0][(std::size_t) i] = m + sd;
+            tl[1][(std::size_t) i] = m - sd;
+        }
+    }
+
+    void boundaryTails (int k, int row) noexcept
+    {
+        if (units_[k] > 0) spreadTails (slot_[k], pre_[k][0].data(), pre_[k][1].data(), row);
+        else               computeStageTails (slot_[k], dst_, row);
+    }
+
+    // State 1 seen: prime the incoming operator now, or start preparing it.
+    void beginSwap() noexcept
+    {
+        xfadePos_ = 0;
+        xfadeLen_ = warmXfade_;
+        const int inc = 1 - cur_;
+        units_[inc] = spreadUnitsFor (slot_[inc]);
+        priming_ = false; incArmed_ = false;
+        if (units_[inc] == 0 || dstCold_)
+        {
+            // Primed now from the per-stage FDLs, as every swap was before the spread existed. A spread operator gets
+            // the same when the B_max stage has had no boundary since the history was cleared: its rows are all
+            // zero, so that stage's tail is zero now and its first deferred sum is complete at zero.
+            for (int st = 0; st < numStages_; ++st)
+            {
+                if (st == dst_ && units_[inc] > 0)
+                {
+                    for (auto& v : slot_[inc].tail[(std::size_t) st]) std::fill (v.begin(), v.end(), 0.0f);
+                    continue;
+                }
+                int base = hist_[(std::size_t) st].fdlPos - 1; if (base < 0) base += spec_[st].C;
+                computeStageTails (slot_[inc], st, base);
+            }
+            if (units_[inc] > 0) { restartPre (inc); preDone_[inc] = units_[inc]; }
+            return;
+        }
+        // Spread, over a warm history: the fade starts ONE HOP from now. Through that hop the incoming operator's
+        // tail for the hop the fade will start in is accumulated (boot_, rows below the one the next boundary
+        // writes), and from that boundary on also its own sum for the boundary after (pre_) — each at the rate
+        // the live slot's own sum runs at, so no call carries more than three of them.
+        priming_ = true;
+        bootBase_ = hist_[(std::size_t) dst_].fdlPos;
+        bootDone_ = 0; bootErr_ = 0; bootLeft_ = spec_[dst_].B;
+        for (auto& v : boot_) std::fill (v.begin(), v.end(), 0.0f);
+    }
+
+    // One hop after the pickup: the incoming operator's tails for the current hop, every stage, and the fade starts.
+    void finishBoot() noexcept
+    {
+        Slot& sl = slot_[1 - cur_];
+        for (int st = 0; st < numStages_; ++st)
+        {
+            if (st == dst_) { spreadTails (sl, boot_[0].data(), boot_[1].data(), bootBase_); continue; }   // the row the boundary since the pickup wrote
+            int base = hist_[(std::size_t) st].fdlPos - 1; if (base < 0) base += spec_[st].C;
+            computeStageTails (sl, st, base);
+        }
+        priming_ = false;
+        xfadePos_ = 0;
     }
 
     // The FULL output (head + every stage's tail at its phase) for ONE slot, per the topology. Called once
@@ -603,12 +845,20 @@ private:
     void processRange (const float* const* in, float* const* out, int a, int b) noexcept
     {
         const Slot& sl = slot_[cur_];
-        for (int s = a; s < b; ++s)
+        const bool spread = units_[cur_] > 0;
+        for (int s = a; s < b; )
         {
-            writeInputs (in, s);
-            float oL = 0.0f, oR = 0.0f; computeSlotOutputs (sl, oL, oR);
-            out[0][s] = oL; if (! mono_) out[1][s] = oR;
-            advanceStages (false);
+            // A run ends at the spread stage's next boundary at the latest; the units its samples owe go first, in
+            // one batch (cheaper than one at a time, and the same units in the same order).
+            const int m = spread ? std::min (b - s, spec_[dst_].B - hist_[(std::size_t) dst_].phase) : b - s;
+            if (spread) spreadAdvance (cur_, m);
+            for (const int e = s + m; s < e; ++s)
+            {
+                writeInputs (in, s);
+                float oL = 0.0f, oR = 0.0f; computeSlotOutputs (sl, oL, oR);
+                out[0][s] = oL; if (! mono_) out[1][s] = oR;
+                advanceStages (false);
+            }
         }
     }
 
@@ -616,7 +866,24 @@ private:
     // from the SAME shared FDL — then finish the block on the single new operator once the fade ends.
     void processFade (const float* const* in, float* const* out, int n) noexcept
     {
-        for (int s = 0; s < n; ++s)
+        int s = 0;
+        // PRIMING: a spread incoming operator is being prepared, and the live one plays alone. Its fade starts on the
+        // sample one hop after the pickup, wherever in the hop that falls.
+        for (; priming_ && s < n; ++s)
+        {
+            if (bootLeft_ == 0) { finishBoot(); break; }
+            writeInputs (in, s);
+            float oL = 0.0f, oR = 0.0f; computeSlotOutputs (slot_[cur_], oL, oR);
+            out[0][s] = oL; if (! mono_) out[1][s] = oR;
+            if (units_[cur_] > 0) spreadAdvance (cur_, 1);
+            bootAdvance (1);
+            if (incArmed_) spreadAdvance (1 - cur_, 1);
+            const bool boundary = hist_[(std::size_t) dst_].phase + 1 == spec_[dst_].B;
+            advanceStages (false);
+            if (boundary) { restartPre (1 - cur_); incArmed_ = true; }   // from here its own sum for the next boundary
+            --bootLeft_;
+        }
+        for (; s < n; ++s)
         {
             const float t    = (float) xfadePos_ / (float) (xfadeLen_ > 1 ? xfadeLen_ - 1 : 1);   // 0→1, exactly 1 on the last sample
             const float wNew = t * t * (3.0f - 2.0f * t);   // smoothstep: zero slope at both ends (click-free)
@@ -627,6 +894,8 @@ private:
             computeSlotOutputs (slot_[1 - cur_], oLn, oRn);
             out[0][s] = oLo * wOld + oLn * wNew;
             if (! mono_) out[1][s] = oRo * wOld + oRn * wNew;
+            if (units_[cur_] > 0)     spreadAdvance (cur_, 1);
+            if (units_[1 - cur_] > 0) spreadAdvance (1 - cur_, 1);
             advanceStages (true);
             if (++xfadePos_ >= xfadeLen_)
             {
@@ -651,6 +920,18 @@ private:
     int P0_ = 0, headMask_ = 0, headPos_[2] { 0, 0 };
     int numStages_ = 0, channels_ = 2;
     int cur_ = 0, xfadePos_ = 0, xfadeLen_ = 1, warmXfade_ = 1;
+
+    // THE SPREAD STATE — audio thread only, sized in prepare() (the COST NOTE). Per SLOT, never per role, so the flip
+    // at a fade's end moves nothing; a slot that stopped playing is not touched again until it is picked up anew
+    // (after the release store of 0 the message thread may regrow its banks).
+    core::fft::AlignedVector<float> pre_[2][2];   // per slot, per output: its deferred sum for the boundary ahead
+    core::fft::AlignedVector<float> boot_[2];     // per output: the incoming operator's sum for the hop its fade starts in
+    int units_[2] { 0, 0 }, preDone_[2] { 0, 0 }, preErr_[2] { 0, 0 };   // per slot: units per hop (0 = not spread), done, error
+    int bootDone_ = 0, bootErr_ = 0, bootBase_ = 0, bootLeft_ = 0;
+    int dst_ = -1;             // the spread stage (the B_max one), or -1 when this geometry cannot spread
+    bool priming_ = false;     // a spread operator was picked up; its fade starts bootLeft_ samples on
+    bool incArmed_ = false;    // the incoming slot's own sum runs (from the first boundary after the pickup)
+    bool dstCold_ = true;      // no boundary of dst_ since prepare() or clearAudioState(): its rows are all zero
 };
 
 } // namespace felitronics::convolution

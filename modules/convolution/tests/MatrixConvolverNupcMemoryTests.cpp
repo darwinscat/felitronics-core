@@ -425,6 +425,16 @@ long long growthO (const std::vector<StageO>& s, int had, int len)
     return b;
 }
 
+// The spread state prepare() sizes for the B_max stage (MatrixConvolverNupc's COST NOTE): three deferred sums — one
+// per slot and one for an incoming operator's first hop — of one spectrum per output, when the last stage holds more
+// than one partition and a cap-length operator of every bank the width allows would reach the threshold.
+long long spreadStateO (const std::vector<StageO>& s, int nch, int threshold)
+{
+    if (s.empty() || s.back().C < 2) return 0;
+    if ((long long) (s.back().C - 1) * (nch == 1 ? 1 : 4) < threshold) return 0;
+    return 3LL * (nch == 1 ? 1 : 2) * s.back().specF * (long long) sizeof (float);
+}
+
 long long fullBanksO (const std::vector<StageO>& s)   // one bank at the cap
 {
     long long b = 0;
@@ -469,9 +479,10 @@ void checkMemory (const char* backend)
         const long long n0 = alloc::bytes.load();
         { C now; test::run (now.prepare (P0, cap, xfade, nch)); }
         const long long nowBytes = alloc::bytes.load() - n0;
-        const long long spectra = 2LL * (nch == 1 ? 1 : 4) * fullBanksO (sch);
-        test::ok (nowBytes == wasBytes - spectra, be + " " + std::to_string (nch) + "ch prepare() requests the frozen class's bytes minus the bank spectra ("
-                                                  + std::to_string (nowBytes) + " == " + std::to_string (wasBytes) + " - " + std::to_string (spectra) + ")");
+        const long long spectra = 2LL * (nch == 1 ? 1 : 4) * fullBanksO (sch), spread = spreadStateO (sch, nch, C::kSpreadFromMacs);
+        test::ok (nowBytes == wasBytes - spectra + spread,
+                  be + " " + std::to_string (nch) + "ch prepare() requests the frozen class's bytes minus the bank spectra, plus the spread state ("
+                  + std::to_string (nowBytes) + " == " + std::to_string (wasBytes) + " - " + std::to_string (spectra) + " + " + std::to_string (spread) + ")");
     }
 
     // The frozen class never allocates at a swap: the whole saving is the shipping class's.
@@ -564,8 +575,9 @@ void checkMemory (const char* backend)
         y0 = alloc::bytes.load();
         const bool ok2 = r.setOperator (C::Topology::Full, b4, 4, small);
         const long long swapDown = alloc::bytes.load() - y0;
-        test::ok (again == fdlO (sch, 2), be + " a re-prepare at the same geometry requests the whole history again (" + std::to_string (again)
-                                          + " B, oracle " + std::to_string (fdlO (sch, 2)) + ")");
+        const long long againO = fdlO (sch, 2) + spreadStateO (sch, 2, C::kSpreadFromMacs);
+        test::ok (again == againO, be + " a re-prepare at the same geometry requests the whole history and the spread state again (" + std::to_string (again)
+                                   + " B, oracle " + std::to_string (againO) + ")");
         test::ok (ok1 && swapAgain == 4 * growthO (sch, 0, cap), be + " ...and the next swap requests the bank bytes again (" + std::to_string (swapAgain) + " B)");
         test::ok (down == fdlO (schSmall, 2), be + " a re-prepare to a smaller cap requests the smaller history exactly (" + std::to_string (down) + " B)");
         test::ok (ok2 && swapDown == 4 * growthO (schSmall, 0, small), be + " ...and its first swap the smaller banks (" + std::to_string (swapDown) + " B)");
@@ -830,17 +842,19 @@ void memoryTable (const char* backend)
             const std::vector<float> ir = denseIr (len, 5);
             const long long was = frozenBytes<Fft> (cap, 2);
             const long long now = nowBytes<Fft> (cap, 2, c.topo, ir, len);
+            // The spread state (96 KiB at most) is the one thing a cell may hold beyond the frozen class's bytes.
+            const long long spread = spreadStateO (scheduleOracle<Fft> (128, cap), 2, convolution::MatrixConvolverNupc<Fft>::kSpreadFromMacs);
             if (now < 0) allMeasured = false;
-            if (now > was) neverMore = false;
-            if (c.topo == Topo::Full && len >= cap && now != was) sameAtCap = false;
+            if (now > was + spread) neverMore = false;
+            if (c.topo == Topo::Full && len >= cap && now != was + spread) sameAtCap = false;
             if (at > 0 && at < (int) sizeof line)
                 at += std::snprintf (line + at, sizeof line - (std::size_t) at, " %4.1f>%4.1f", (double) was / 1e6, (double) now / 1e6);
         }
         std::printf ("%s\n", line);
     }
     test::ok (allMeasured, std::string (backend) + " table: every cell's swaps accepted");
-    test::ok (neverMore, std::string (backend) + " table: no cell holds more than before");
-    test::ok (sameAtCap, std::string (backend) + " table: a Full IR at the cap holds exactly what the frozen class held");
+    test::ok (neverMore, std::string (backend) + " table: no cell holds more than before, beyond the spread state");
+    test::ok (sameAtCap, std::string (backend) + " table: a Full IR at the cap holds exactly what the frozen class held, plus the spread state");
 }
 
 template <class Fft>
