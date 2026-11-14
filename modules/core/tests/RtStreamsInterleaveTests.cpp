@@ -484,6 +484,7 @@ void recInterleave()
 
 int main()
 {
+    std::setvbuf (stdout, nullptr, _IONBF, 0);   // a protocol break can crash: keep every line printed before it
     std::printf ("felitronics::core rt-streams interleaving tests\n");
     gateRules();
     auditionApi();
