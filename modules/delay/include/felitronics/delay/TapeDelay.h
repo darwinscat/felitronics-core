@@ -82,8 +82,9 @@ namespace felitronics::delay
 //     pause steps all of them as silence would. A head that is silent stands on its target, so turning one on
 //     plays it where it was sent instead of sweeping it in. The gains are aimed at the call's width: a mono call
 //     ramps side 0 to the head's level, a stereo call back to its balance — at the edge, not as a switch. After
-//     prepare() or reset() the positions snap with the motor, and the gains on the first call that carries a
-//     channel (a pause has no width to aim them for).
+//     prepare() or reset() the positions snap with the motor, and the gains — with the positions again, since no
+//     head has been heard until then — on the first call that carries a channel (a pause has no width to aim
+//     them for).
 //   · POISON: a non-finite INPUT sample is not recorded (the dry keeps it — it is not this stage's to
 //     change); a non-finite loop state at the end of a call restarts the line from silence. Knob values are
 //     bounded before they reach any arithmetic: a non-finite one is ignored, a finite one is clamped. A head's
@@ -547,12 +548,6 @@ public:
             envIn_.store (pk, std::memory_order_relaxed);
         }
 
-        // Where each sounding head reads, refilled every sample for the heads that sound (a silent head's entries
-        // are never read): set once per call, not zeroed per sample.
-        int   h0[kMaxHeads] {}, h1[kMaxHeads] {};
-        float hf[kMaxHeads] {};
-        bool  hLoop[kMaxHeads] {};
-
         for (int i = 0; i < numSamples; ++i)
         {
             // The motor: one exponential glide shared by both channels, so the comb never splits while it
@@ -566,6 +561,11 @@ public:
             // like the motor, and reads with the loop tap's own arithmetic below.
             if (! atRest)
                 stepHeads();
+            // Per sample, as locals: measured faster with four heads than one set per call, and no slower on the
+            // default path.
+            int   h0[kMaxHeads] {}, h1[kMaxHeads] {};
+            float hf[kMaxHeads] {};
+            bool  hLoop[kMaxHeads] {};
             for (int k = 0; k < kMaxHeads && ! plain; ++k)
             {
                 hLoop[k] = headPos_[k] >= 1.0;   // the glide never overshoots its target, and no target is past 1
@@ -849,11 +849,11 @@ private:
                                                                  from);
 
                 // Law 8. One ramp never steps under target/N, and every target is zero or normal (a level of
-                // 1e-15 one float short of hard pan is ~4e-23, and must play). But a ramp restarted from where
-                // the last one stood — a level sent up and back down before every sample — shrinks the gain
-                // geometrically, and only this floor stops it at the edge of the subnormal band. Not the house
-                // 1e-15: that would silence gains the pan law makes on purpose. A gain this small plays nothing
-                // anyway: every scaled contribution is flushed.
+                // 1e-15 one float short of hard pan is ~4e-23). But a ramp restarted from where the last one
+                // stood — a level sent up and back down before every sample — shrinks the gain geometrically, and
+                // only this floor stops it at the edge of the subnormal band. Not the house 1e-15: the pan law
+                // makes gains that small on purpose, and a ramp must land on the law's bits. (A gain that small
+                // plays nothing either way — every scaled contribution is flushed at 1e-15.)
                 if (std::fabs (g) < std::numeric_limits<float>::min())
                     g = 0.0f;
                 headGain_[k][s] = g;

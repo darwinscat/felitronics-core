@@ -1234,7 +1234,8 @@ void reslicing()
             std::printf ("      [slicing %d differs from 4096]\n", slice);
         sameAll = sameAll && here;
     }
-    // Catches: anything that steps per block instead of per sample — a ramp, a glide, the mono edge, the pause.
+    // Catches: anything that steps per block instead of per sample — a ramp, a glide, the mono edge, the pause —
+    // from a layout off the plain path (the fast path's own per-call decision is plainPathReslicing's).
     ok (sameAll, "slicings 1, 64, 333, 517 and a seeded random one: the 4096 render's bytes and witnesses");
 
     bool heldSame = true;
@@ -1245,7 +1246,7 @@ void reslicing()
         const Planes out = renderTimeline (tl, slice, true, c, w);
         heldSame = heldSame && samePlanes (out, ref) && sameWitness (w, w0);
     }
-    // Catches: a re-send that restarts a ramp or a glide, a guard that is not exact.
+    // Catches: a re-send that restarts a ramp or a glide (a guard that is merely loose shows in exactGuard).
     ok (heldSame, "the held knobs and layout re-sent at the top of EVERY block (setParams and setHeads): the same bytes");
 
     Census nc;
@@ -2310,6 +2311,80 @@ void noAllocation()
     ok (delta == 0, "no allocation: the default layout's fast path (stereo, mono), setHead, setHeads, setParams with heads, "
                     "process (stereo, mono, pause, stand-by), reset (" + std::to_string (delta) + ")");
 }
+//==============================================================================
+// 22 · A HAIR SHORT OF THE END, IN A HEAD'S READ — no sanitizer needed
+//==============================================================================
+void hairShortOfTheEnd()
+{
+    group ("a head's read a hair short of the line's end is the line's first sample, and its last slot's neighbour is the "
+           "first — against the frozen class's line, read outside");
+    constexpr double sr = 48000.0;
+    constexpr int D = 14400;
+    const int lineN = lineLength (sr);
+
+    // The line from outside: the frozen class at 300 ms, REPEATS 0, an impulse at sample 0 — its output at D + s is
+    // what the line holds at s.
+    Plane line (400, 0.0f);
+    {
+        frz::TapeDelay then;
+        test::run (then.prepare (sr, 4096, 1));
+        then.setParams (frozenKnobs (300.0f, 0.0f, 16000.0f, 0.0f, 1.0f));
+        Plane io ((std::size_t) D + 400, 0.0f);
+        cell (io, 0) = 0.8f;
+        float* p[1] = { io.data() };
+        test::run (then.process (p, 1, D + 400));
+        for (int t = 0; t < 400; ++t)
+            cell (line, t) = get (io, D + t);
+    }
+
+    for (int which = 0; which < 2; ++which)
+    {
+        // A position whose distance sits a hair past a whole sample (which 0: the read before the write clock
+        // reaches it rounds onto the line's length) or about half one (which 1: the read sits in the last slot).
+        float pos = 0.5f, hd = 0.0f;
+        for (;; pos = std::nextafter (pos, 1.0f))
+        {
+            hd = (float) ((double) pos * (double) D);
+            const float frac = hd - std::floor (hd);
+            if (which == 0 ? (frac > 0.004f && frac < 0.012f) : (frac > 0.45f && frac < 0.55f))
+                break;
+        }
+        const int I = (int) std::floor (hd);
+
+        delay::TapeDelay d;
+        test::run (d.prepare (sr, 4096, 1));
+        d.setParams (knobs (300.0f, 0.0f, 16000.0f, 0.0f, 1.0f, layout ({ { pos, 1.0f, 0.0f } })));
+        Plane io ((std::size_t) I + 8, 0.0f);
+        cell (io, 0) = 0.8f;
+        float* q[1] = { io.data() };
+        test::run (d.process (q, 1, I + 8));
+
+        // The read at each sample around the head, outside: the class's float index arithmetic over the line as
+        // written up to that sample (nothing at or after it yet).
+        double worst = 0.0, reach = 0.0;
+        bool reached = false;
+        for (int t = I - 2; t < I + 6; ++t)
+        {
+            float hp = (float) t - hd;
+            if (hp < 0.0f)
+                hp += (float) lineN;
+            const int   whole = (int) hp;
+            const float f = hp - (float) whole;
+            const int   i0 = whole == lineN ? 0 : whole, i1 = i0 + 1 == lineN ? 0 : i0 + 1;
+            reached = reached || (which == 0 ? whole == lineN : whole == lineN - 1);
+            const auto at = [&] (int i) { return i < t && i < 400 ? (double) get (line, i) : 0.0; };
+            const double want = at (i0) * (1.0 - (double) f) + at (i1) * (double) f;
+            worst = std::max (worst, std::fabs ((double) get (io, t) - want));
+            reach = std::max (reach, std::fabs (want));
+        }
+        // Catches: the head's read without its hair-short rule (index lineN, one past the end) or without its second
+        // index's wrap (lineN again) — each reads past the line; the CI sanitizer row saw them, no other check did.
+        ok (reached && worst <= 1.0e-6 && reach > 0.05,
+            std::string (which == 0 ? "a read a hair short of the end" : "a read in the line's last slot")
+                + ": the line's own samples, eight around the head (worst " + std::to_string (worst) + ")");
+    }
+}
+
 } // namespace
 
 int main()
@@ -2339,6 +2414,7 @@ int main()
     underOneSample();
     shownHeads();
     wakeSnap();
+    hairShortOfTheEnd();
     plainPathReslicing();
     orderedSum();
     exactGuard();

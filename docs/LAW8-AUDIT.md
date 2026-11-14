@@ -270,8 +270,8 @@ normal float, so no position glide ever heads for zero. Its level and pan reach 
 linear ramps, which end exactly on target, and a level under 1e-15 is taken as 0 where it is set. One ramp never
 steps under its target over its length, and every target is zero or normal; but a ramp restarted from where the
 last one stood — a level sent up and back down before every sample — shrinks the gain geometrically, so the ramp's
-value is floored at the smallest normal float (not at 1e-15: the pan law makes gains near 4e-23 on purpose, and
-they must play). What a head plays goes into the offset line, a pure delay: a contribution at a gain of exactly 1
+value is floored at the smallest normal float (not at 1e-15: the pan law makes gains near 4e-23 on purpose, and a
+ramp must land on the law's bits; a gain that small plays nothing either way, its contribution is flushed). What a head plays goes into the offset line, a pure delay: a contribution at a gain of exactly 1
 is the line's own tap, as before — zero or normal: every stored sample is zero or at least ~1e-15 (2^-50, so its
 last bit is at least 2^-73) and an interpolation fraction's last bit is at least 2^-24, so even when two neighbours
 of opposite sign nearly cancel, the tap is zero or at least 2^-97 — far above the band at 2^-126. Every scaled contribution is

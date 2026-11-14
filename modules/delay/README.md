@@ -80,8 +80,8 @@ same number.
 - The heads' controls are sample-clocked like the motor: positions glide per sample and land, the gains ride
   counted ramps that land on target, a pause steps them as silence would, and a silent head stands on its target.
   A mono call ramps each head's side 0 to its level (pan aside) and a stereo call back — no step at the width
-  edge. After `prepare`/`reset` the positions snap with the motor, and the gains on the first call that carries a
-  channel. Bit-identical under any re-slicing, live head moves included, while the state is finite.
+  edge. After `prepare`/`reset` the positions snap with the motor, and the gains — and the positions again, no head
+  having been heard yet — on the first call that carries a channel. Bit-identical under any re-slicing, live head moves included, while the state is finite.
 - `tailSeconds()` counts the heads: stacked heads add and hard pan is +3 dB, so the first echo is taken at the sum
   of each head's level times its louder side; the default layout gives the one-head stage's estimate to the bit.
 - Threads: prepare, reset, the setters and process belong to one thread; the taps above may be read from any
