@@ -1,8 +1,8 @@
 ### convolution — `MatrixConvolverNupc`'s memory follows the loaded IR
 
 `prepare()` used to size every bank spectrum to the cap, for four banks in each of the two slots whatever the
-topology: about 80 bytes per sample of cap in stereo, most of it never read by a short IR, and half of it never read
-by LRDiag or MSDiag. The bank spectra now follow the IR: `stageOperator()` (and `setOperator()` / `setIr()` through
+topology: about 80 bytes per sample of cap in stereo, most of it never read by a short IR, and half of the spectra
+never read by LRDiag or MSDiag. The bank spectra now follow the IR: `stageOperator()` (and `setOperator()` / `setIr()` through
 it) grows each bank, stage by stage, to the partitions the IR it is handed reaches, and only the banks the topology
 reads (mono 1, LRDiag and MSDiag 2, Full 4). They grow only — a shorter IR reuses what a longer one left — so each
 slot holds its own high-water mark until the next `prepare()`, which releases it. A re-prepare to a smaller cap (a

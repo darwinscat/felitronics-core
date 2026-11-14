@@ -80,7 +80,8 @@ int banksOf (Topo t) { return t == Topo::Mono ? 1 : (t == Topo::Full ? 4 : 2); }
 
 enum class MidFade { None, TrySwap, Reset, Clear, StageLate, StageResetLate };
 
-struct Step { Topo topo; int len; MidFade mid; };
+// newCap >= 0 re-prepares both instances to that cap (same head, same width) before the swap.
+struct Step { Topo topo; int len; MidFade mid; int newCap = -1; };
 
 struct Outcome
 {
@@ -92,14 +93,14 @@ struct Outcome
 };
 
 template <class Fft>
-Outcome lockstep (int nch, int cap, int xfade, const std::vector<Step>& steps, int samplesPerStep,
+Outcome lockstep (int nch, int head, int cap, int xfade, const std::vector<Step>& steps, int samplesPerStep,
                   int fixedBlock, unsigned long long seed)
 {
     using Now = convolution::MatrixConvolverNupc<Fft>;
     using Was = convolution::frozen::MatrixConvolverNupc<Fft>;
     Outcome r;
     Now now; Was was;
-    if (! now.prepare (128, cap, xfade, nch) || ! was.prepare (128, cap, xfade, nch)) { r.callsDiffer = -1; return r; }
+    if (! now.prepare (head, cap, xfade, nch) || ! was.prepare (head, cap, xfade, nch)) { r.callsDiffer = -1; return r; }
 
     Lcg rng { seed };
     constexpr int kMaxChunk = 4096;
@@ -113,7 +114,8 @@ Outcome lockstep (int nch, int cap, int xfade, const std::vector<Step>& steps, i
         std::vector<float> irs[4];
         const float* banks[4] {};
         for (int b = 0; b < 4; ++b) { irs[b] = denseIr (st.len, seed * 977ULL + k * 31ULL + (unsigned long long) b); banks[b] = st.len > 0 ? irs[b].data() : nullptr; }
-        const int nb = nch == 1 ? 1 : banksOf (st.topo);
+        if (st.newCap >= 0 && (! now.prepare (head, st.newCap, xfade, nch) || ! was.prepare (head, st.newCap, xfade, nch))) ++r.callsDiffer;
+        const int nb = 4;   // always four bank pointers: a topology that reads fewer must ignore the rest
         const bool late = st.mid == MidFade::StageLate || st.mid == MidFade::StageResetLate;
         const bool a = late ? now.stageOperator (topologyOf<Now> (st.topo), banks, nb, st.len)
                             : now.setOperator   (topologyOf<Now> (st.topo), banks, nb, st.len);
@@ -201,13 +203,23 @@ std::vector<Step> mixed (int cap)
              { Topo::Full, 1, MidFade::TrySwap },     { Topo::MS, cap, MidFade::None },           { Topo::Full, cap / 3, MidFade::None } };
 }
 
+// Re-prepared in the middle — to half the cap, to twice it, back, and to no tail at all — between swaps.
+std::vector<Step> withReprepares (int cap)
+{
+    return { { Topo::LR, 150, MidFade::None },             { Topo::Full, cap, MidFade::None },
+             { Topo::MS, 700, MidFade::None, cap / 2 },    { Topo::Full, cap, MidFade::Reset },
+             { Topo::Full, 2 * cap, MidFade::None, 2 * cap }, { Topo::LR, 300, MidFade::Clear, cap },
+             { Topo::Full, cap - 1, MidFade::None, 0 },    { Topo::LR, 129, MidFade::TrySwap, cap },
+             { Topo::Full, cap, MidFade::None } };
+}
+
 template <class Fft>
 void checkLockstep (const char* backend, const std::string& what, int nch, const std::vector<Step>& steps, int fixedBlock,
-                    unsigned long long seed)
+                    unsigned long long seed, int head = 128, int cap = 12000)
 {
-    constexpr int cap = 12000, xfade = 400;
+    constexpr int xfade = 400;
     const int perStep = 2 * cap + 3000;   // the fade, then every stage wraps at least once
-    const Outcome r = lockstep<Fft> (nch, cap, xfade, steps, perStep, fixedBlock, seed);
+    const Outcome r = lockstep<Fft> (nch, head, cap, xfade, steps, perStep, fixedBlock, seed);
     const long long want = (long long) steps.size() * perStep * nch;
     int wantMid = 0; for (const Step& s : steps) if (s.mid != MidFade::None) ++wantMid;
     const std::string tag = std::string (backend) + " " + what + (fixedBlock > 0 ? ", block " + std::to_string (fixedBlock) : ", uneven blocks");
@@ -344,12 +356,12 @@ void checkGrowth (const char* backend, Topo topo)
         }
     const char* name = topo == Topo::Mono ? "mono" : topo == Topo::LR ? "LRDiag" : topo == Topo::MS ? "MSDiag" : "Full";
     std::printf ("      %s %s growth: max error %.3e against a direct convolution (peak %.3e)\n", backend, name, err, ref);
-    test::ok (ref > 0.1 && err < 1e-4 * ref, std::string (backend) + " " + name + ": a cap-length IR after a short one is the direct convolution of the whole input");
+    test::ok (ref > 0.1 && err < 5e-6 * ref, std::string (backend) + " " + name + ": a cap-length IR after a short one is the direct convolution of the whole input");
 
     // The last tap answers the impulse: a partition missing from the grown bank would leave this at zero.
     const long long at = impulseAt + cap - 1;
     const double lastWant = want (0, at), lastGot = (double) y[0][(std::size_t) at];
-    test::ok (std::fabs (lastWant) > 0.3 && std::fabs (lastGot - lastWant) < 1e-4,
+    test::ok (std::fabs (lastWant) > 0.3 && std::fabs (lastGot - lastWant) < 5e-6,
               std::string (backend) + " " + name + ": the IR's last tap answers an impulse (" + std::to_string (lastGot) + ", want "
               + std::to_string (lastWant) + ")");
 }
@@ -502,6 +514,43 @@ void checkMemory (const char* backend)
         const bool ok = m.setIr (ir.data(), 61440);
         const long long got = alloc::bytes.load() - y0;
         test::ok (ok && got == growthO (sch, 0, 61440), be + " mono: one bank, the oracle's size (" + std::to_string (got) + " B)");
+    }
+
+    // prepare() releases what the previous run held. A request counter cannot see a free, but it can see what a
+    // release makes necessary: re-prepared at the same geometry, the instance requests its whole history again
+    // (assign() alone would reuse the old storage and request nothing), and the next swap requests the oracle's
+    // bank bytes again. Re-prepared to a smaller cap, it requests the smaller history exactly.
+    {
+        auto fdlO = [] (const std::vector<StageO>& s, int nch)
+        {
+            long long b = 0;
+            for (const StageO& st : s) b += (long long) nch * st.C * st.specF * (long long) sizeof (float);
+            return b;
+        };
+        const int small = 48000;
+        const std::vector<StageO> schSmall = scheduleOracle<Fft> (P0, small);
+        C r;
+        test::run (r.prepare (P0, cap, xfade, 2));
+        Drainer dr3 (xfade + 1);
+        for (int i = 0; i < 2; ++i) { test::run (r.setOperator (C::Topology::Full, b4, 4, cap)); (void) dr3.drain (r, 2); }
+        long long y0 = alloc::bytes.load();
+        test::run (r.prepare (P0, cap, xfade, 2));
+        const long long again = alloc::bytes.load() - y0;
+        y0 = alloc::bytes.load();
+        const bool ok1 = r.setOperator (C::Topology::Full, b4, 4, cap);
+        const long long swapAgain = alloc::bytes.load() - y0;
+        (void) dr3.drain (r, 2);
+        y0 = alloc::bytes.load();
+        test::run (r.prepare (P0, small, xfade, 2));
+        const long long down = alloc::bytes.load() - y0;
+        y0 = alloc::bytes.load();
+        const bool ok2 = r.setOperator (C::Topology::Full, b4, 4, small);
+        const long long swapDown = alloc::bytes.load() - y0;
+        test::ok (again == fdlO (sch, 2), be + " a re-prepare at the same geometry requests the whole history again (" + std::to_string (again)
+                                          + " B, oracle " + std::to_string (fdlO (sch, 2)) + ")");
+        test::ok (ok1 && swapAgain == 4 * growthO (sch, 0, cap), be + " ...and the next swap requests the bank bytes again (" + std::to_string (swapAgain) + " B)");
+        test::ok (down == fdlO (schSmall, 2), be + " a re-prepare to a smaller cap requests the smaller history exactly (" + std::to_string (down) + " B)");
+        test::ok (ok2 && swapDown == 4 * growthO (schSmall, 0, small), be + " ...and its first swap the smaller banks (" + std::to_string (swapDown) + " B)");
     }
 
     // reserve(): both slots' banks for a topology, now — and then no swap up to that length allocates, whatever
@@ -768,6 +817,13 @@ void suite (const char* backend)
     checkLockstep<Fft> (backend, "mixed topologies", 2, mixed (12000), 64,   16);
     checkLockstep<Fft> (backend, "mixed topologies", 2, mixed (12000), 4096, 17);
     checkLockstep<Fft> (backend, "mixed topologies", 2, mixed (12000), 1,    18);
+    checkLockstep<Fft> (backend, "Full, cap 2049 (the first with a B_max stage)", 2, shortLong (Topo::Full, 2049), 0, 19, 128, 2049);
+    checkLockstep<Fft> (backend, "LRDiag, cap 129",     2, shortLong (Topo::LR, 129), 0, 20, 128, 129);
+    checkLockstep<Fft> (backend, "mono, cap 0 (a head and no stage)", 1, shortLong (Topo::Mono, 0), 0, 21, 128, 0);
+    checkLockstep<Fft> (backend, "Full, head 64",       2, shortLong (Topo::Full, 7000), 0, 22, 64, 7000);
+    checkLockstep<Fft> (backend, "mixed, head 512",     2, mixed (30000), 0, 23, 512, 30000);
+    checkLockstep<Fft> (backend, "MSDiag, head 16 (pffft's smallest real FFT is 32)", 2, shortLong (Topo::MS, 3000), 0, 24, 16, 3000);
+    checkLockstep<Fft> (backend, "through re-prepares", 2, withReprepares (12000), 0, 25);
 
     test::group (std::string ("growth is complete — against a direct convolution (") + backend + ")");
     checkGrowth<Fft> (backend, Topo::Mono);

@@ -339,7 +339,7 @@ private:
     struct Bank
     {
         std::vector<float> h0;                                                   // P0 head taps (time domain)
-        std::array<core::fft::AlignedVector<float>, kMaxStages> irSpec;          // per stage: C_s×specF_s
+        std::array<core::fft::AlignedVector<float>, kMaxStages> irSpec;          // per stage: up to C_s×specF_s, grown to the loaded IR
         int activeParts[kMaxStages] {};
     };
 

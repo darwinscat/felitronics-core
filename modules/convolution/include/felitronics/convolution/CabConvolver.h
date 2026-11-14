@@ -30,8 +30,10 @@
 //
 // IR-LENGTH CAP: unlike juce (which sized its partitions per-IR), NUPC builds a FIXED schedule from
 // maxIrSamples at prepare() time. We cap at maxIrSeconds of taps (kNupcHeadPartition head + one uniform
-// tail stage): covers every real cabinet IR with headroom while keeping RAM sane. An IR longer than the cap
-// convolves only its first maxIrSeconds — a deliberate product cap (cab IRs are <1 s; longer is off-label).
+// tail stage): covers every real cabinet IR with headroom while keeping RAM sane — the shared history is sized
+// to the cap, the IR's partition spectra only to the IR loaded. An IR longer than the cap convolves only what
+// the schedule covers (the cap, rounded up to whole partitions) — a deliberate product cap (cab IRs are <1 s;
+// longer is off-label).
 //
 // LOUDNESS: every IR is normalized AT LOAD to reference-unity — unity RMS gain for a guitar-band
 // reference signal (white noise through a one-pole low-pass at kIrRefShapeHz), computed in the
@@ -105,8 +107,9 @@ public:
 
     // The IR budget prepare() will ask the backend for, as a pure function of the two arguments that
     // decide it — PUBLIC because it is the only way to pin the saturation without building the thing it
-    // sizes: a budget of kMaxIrSamples is a 1.34 GB partition schedule (measured), which no test tier
-    // should allocate to prove an arithmetic clamp. CLAMPED IN DOUBLE, BEFORE THE CAST — the ceiling used
+    // sizes: a budget of kMaxIrSamples is a 0.27 GB history at prepare(), and 0.81 GB once a stereo IR that
+    // long sits in both slots (counted; 1.34 GB at prepare() before the bank spectra followed the loaded IR),
+    // which no test tier should allocate to prove an arithmetic clamp. CLAMPED IN DOUBLE, BEFORE THE CAST — the ceiling used
     // to be applied to the result of `(long long) std::ceil(...)`, one step too late, since the conversion
     // is undefined for an argument outside long long's range: on arm64 a `maxIrSeconds` of +inf produced
     // LLONG_MAX and a one-sample crossfade (a hard switch, not a fade), on x86-64 it saturates the other
