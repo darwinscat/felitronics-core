@@ -791,6 +791,70 @@ long long belowThreshold (const char* be)
 
 //==============================================================================
 
+// THE THRESHOLD'S EDGE, at the shipping value: one partition below it runs the old path (the burst at the boundary,
+// an immediate fade), one partition more spreads (no burst, the fade a hop later). Full: (P-1)*4 = 252 against 256;
+// LRDiag: (P-1)*2 = 254 against 256 — the 264192 taps CabConvolver's comment states. A new operator published
+// while the spread one is being prepared is refused, and the convolver says it is busy.
+template <class Fft>
+long long thresholdEdge (const char* be)
+{
+    using C = convolution::MatrixConvolverNupc<CountingFft<Fft>>;
+    constexpr int xfade = 64;
+    long long allocs = 0;
+    struct Edge { Topo topo; int cap, below, at; };
+    const Edge edges[] { { Topo::Full, kB + 65 * kB, kB + 64 * kB, kB + 65 * kB },
+                         { Topo::LR,   kB + 129 * kB, kB + 128 * kB, kB + 129 * kB } };
+    for (const Edge& e : edges)
+        for (int len : { e.below, e.at })
+        {
+            const bool spread = len == e.at;
+            const int nb = banksOf (e.topo), P = partsOf (len, e.cap);
+            const std::string tag = std::string (be) + " " + nameOf (e.topo) + ", P " + std::to_string (P) + " ((P-1)*" + std::to_string (nb)
+                                    + " = " + std::to_string ((P - 1) * nb) + ")";
+            test::ok (spreads (len, nb, e.cap, C::kSpreadFromMacs) == spread, tag + ": the oracle puts it on the side the class must");
+            C mc;
+            test::run (mc.prepare (kHead, e.cap, xfade, 2));
+            const Op a = makeOp (e.topo, len, 77), b = makeOp (e.topo, len, 78);
+            test::run (load (mc, a));
+            const Signal x = noise (9LL * kB, 79);   // warm 3 hops, steady 2, then room for a swap of a fade and a hop
+            std::vector<float> yl ((std::size_t) kB), yr ((std::size_t) kB);
+            long long pos = 0, maxMacs = 0;
+            auto call = [&] (int n)
+            {
+                const float* in[2] { &x.x[0][(std::size_t) pos], &x.x[1][(std::size_t) pos] };
+                float* out[2] { yl.data(), yr.data() };
+                const long long m0 = CountingFft<Fft>::counts.mac[kLgN], c0 = alloc::count.load();
+                test::run (mc.process (in, out, 2, n));
+                allocs += alloc::count.load() - c0;
+                maxMacs = std::max (maxMacs, CountingFft<Fft>::counts.mac[kLgN] - m0);
+                pos += n;
+            };
+            while (pos < 3LL * kB) call (64);                      // warm: the first fade over, the history full
+            maxMacs = 0;
+            while (pos < 5LL * kB) call (64);                      // steady: two whole hops
+            const long long bound = callBound (64, P - 1, nb);
+            if (spread) test::ok (maxMacs <= bound, tag + ": spread, no call above the bound (" + std::to_string (maxMacs) + " <= " + std::to_string (bound) + ")");
+            else        test::ok (maxMacs >= (long long) P * nb, tag + ": not spread, the boundary does the whole stage (" + std::to_string (maxMacs) + ")");
+            test::run (load (mc, b));
+            long long busy = 0;
+            bool refused = true;
+            do
+            {
+                call (1); ++busy;
+                if (busy == 1 || busy == kB / 2)                   // just after the pickup, and mid-preparation
+                {
+                    const bool busyNow = mc.isBusy();
+                    refused = refused && busyNow && ! load (mc, a);
+                }
+            } while (mc.isBusy() && pos < 9LL * kB);
+            test::ok (! mc.isBusy(), tag + ": the swap ended inside the signal");
+            const long long want = spread ? xfade + kB : xfade;
+            test::ok (busy == want, tag + ": the swap is busy " + std::to_string (busy) + " samples (want " + std::to_string (want) + ")");
+            test::ok (refused, tag + ": a publish while the swap is in flight is refused, and isBusy() says so");
+        }
+    return allocs;
+}
+
 template <class Fft>
 void suite (const char* backend)
 {
@@ -815,7 +879,11 @@ void suite (const char* backend)
     test::group ("below the threshold — the frozen class, to the bit and to the call (" + be + ")");
     const long long a7 = belowThreshold<Fft> (backend);
 
+    test::group ("the threshold's edge — one partition either side, Full and LRDiag (" + be + ")");
+    const long long a8 = thresholdEdge<Fft> (backend);
+
     test::group ("process() allocates nothing (" + be + ")");
+    test::okNoAlloc (a8 == 0, be + " threshold-edge runs (" + std::to_string (a8) + ")");
     test::okNoAlloc (a2 == 0, be + " frozen burst run (" + std::to_string (a2) + ")");
     test::okNoAlloc (a3 == 0, be + " spread bound runs (" + std::to_string (a3) + ")");
     test::okNoAlloc (a4 == 0, be + " null runs (" + std::to_string (a4) + ")");

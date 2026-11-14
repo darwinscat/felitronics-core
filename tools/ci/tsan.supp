@@ -1,0 +1,7 @@
+# ThreadSanitizer suppressions for the `tsan` CI job. A line belongs here only for a race the code ALREADY
+# documents as known, with the issue that will remove it — never to quiet a report nobody has explained.
+#
+# core::AuditionStream: a publish() that lands while an admitted reader block is still streaming is a formal race on
+# the sample memory (RtStreams.h, "KNOWN, DELIBERATE GAP"). The reader-acknowledged epoch that removes it is #273;
+# drop this line when it lands.
+race:felitronics::core::AuditionStream::publish

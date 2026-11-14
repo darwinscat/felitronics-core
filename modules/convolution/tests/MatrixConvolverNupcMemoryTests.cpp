@@ -583,23 +583,29 @@ void checkMemory (const char* backend)
         test::ok (ok2 && swapDown == 4 * growthO (schSmall, 0, small), be + " ...and its first swap the smaller banks (" + std::to_string (swapDown) + " B)");
     }
 
-    // A mono re-prepare releases the right channel. A request count cannot see a buffer KEPT, so this reads the
-    // releases: re-preparing a stereo instance mono frees at least the right channel's FDL and frame in every
-    // stage and its head ring (2 * stages + 1 blocks) more than re-preparing a mono instance mono does.
+    // A mono re-prepare releases the right channel. A request count cannot see a buffer KEPT, so this counts the
+    // releases: re-preparing a stereo instance mono must free exactly what a mono instance re-prepared mono does not
+    // hold — the right channel's FDL and frame in every stage, its head ring, and in each of the two slots the head
+    // taps of the three banks a mono instance never reads. At a cap where neither width has a spread state (whose sizes differ by width), so
+    // nothing else differs between the two re-prepares; at a larger cap the spread state's own releases covered a
+    // kept right channel (found in review).
     {
+        const int capNoSpread = 48000;
+        const std::vector<StageO> schNo = scheduleOracle<Fft> (P0, capNoSpread);
+        test::ok (spreadStateO (schNo, 2, C::kSpreadFromMacs) == 0, be + " the release fixture's cap has no spread state");
         C fromStereo;
-        test::run (fromStereo.prepare (P0, cap, xfade, 2));
+        test::run (fromStereo.prepare (P0, capNoSpread, xfade, 2));
         long long f0 = alloc::frees.load();
-        test::run (fromStereo.prepare (P0, cap, xfade, 1));
+        test::run (fromStereo.prepare (P0, capNoSpread, xfade, 1));
         const long long stereoToMono = alloc::frees.load() - f0;
         C fromMono;
-        test::run (fromMono.prepare (P0, cap, xfade, 1));
+        test::run (fromMono.prepare (P0, capNoSpread, xfade, 1));
         f0 = alloc::frees.load();
-        test::run (fromMono.prepare (P0, cap, xfade, 1));
+        test::run (fromMono.prepare (P0, capNoSpread, xfade, 1));
         const long long monoToMono = alloc::frees.load() - f0;
-        const long long want = 2LL * (long long) sch.size() + 1;
-        test::ok (stereoToMono - monoToMono >= want, be + " a mono re-prepare releases the right channel's history ("
-                                                     + std::to_string (stereoToMono - monoToMono) + " more blocks freed, at least "
+        const long long want = 2LL * (long long) schNo.size() + 1 + 2 * 3;
+        test::ok (stereoToMono - monoToMono == want, be + " a mono re-prepare releases the right channel's history ("
+                                                     + std::to_string (stereoToMono - monoToMono) + " more blocks freed, want "
                                                      + std::to_string (want) + ")");
     }
 

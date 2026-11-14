@@ -233,7 +233,8 @@ jobs:
         run: cmake --build build-tsan -j "$(nproc)" --target felitronics_convolution_restart_race_tests felitronics_convolution_spread_race_tests felitronics_core_rtstreams_tests
       - name: Test
         env:
-          TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+          # tools/ci/tsan.supp names the one race the code documents as known (#273); nothing else is suppressed.
+          TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1:suppressions=${{ github.workspace }}/tools/ci/tsan.supp
         run: |
           found=$(ctest --test-dir build-tsan -N -R 'restart_race|spread_race|rtstreams' | sed -n 's/^Total Tests: *//p')
           [ "${found:-0}" -ge 3 ] || { echo "expected at least 3 threaded suites, found ${found:-0}"; exit 1; }

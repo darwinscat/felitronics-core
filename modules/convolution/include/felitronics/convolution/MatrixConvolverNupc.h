@@ -9,6 +9,7 @@
 #include <array>
 #include <atomic>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 namespace felitronics::convolution
@@ -57,8 +58,8 @@ namespace felitronics::convolution
 // A future "optimize short IRs" pass must NOT simply gate stages off — that would cold-start the FDL and break
 // warm swaps.
 //
-// THE WORST CALL, NOT THE MEAN. Every stage's boundary falls on a multiple of B_max, and the B_max stage holds
-// almost every partition of a long IR: done at its boundary, its MACs land in ONE process() call every B_max
+// THE WORST CALL, NOT THE MEAN. Every stage has a boundary at each multiple of B_max — they all coincide there — and
+// the B_max stage holds almost every partition of a long IR: done at its boundary, its MACs land in ONE process() call every B_max
 // samples (1872 of them for a 20 s Full IR at 48 kHz — over a 64-sample block's budget on an x86 laptop core), and a
 // swap's first call used to prime every stage of the incoming slot on top. So that stage is SPREAD for an operator
 // whose deferred work there, (P - 1) partitions times the banks its topology reads, is at least kSpreadFromMacs:
@@ -284,7 +285,12 @@ public:
     // fade: the crossfade, plus one B_max hop when this geometry can spread (a spread operator's fade starts one
     // hop after it is picked up — the COST NOTE). A caller that feeds silence until a swap has landed (a cabinet
     // standing out of the path) must feed this long, not a fade's length.
-    int maxSwapSamples() const noexcept { return warmXfade_ + (dst_ >= 0 ? spec_[dst_].B : 0); }
+    // Saturates: prepare() takes any positive crossfade, and one near INT_MAX plus a hop does not fit an int.
+    int maxSwapSamples() const noexcept
+    {
+        const long long v = (long long) warmXfade_ + (dst_ >= 0 ? spec_[dst_].B : 0);
+        return (int) std::min<long long> (v, std::numeric_limits<int>::max());
+    }
     int  numChannels() const noexcept { return channels_; }
 
     // Message thread — single producer, must not race reset(). Stage a whole operator into the inactive slot,
