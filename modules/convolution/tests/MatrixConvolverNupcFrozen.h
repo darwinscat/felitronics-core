@@ -3,8 +3,9 @@
 
 // FROZEN MatrixConvolverNupc — a verbatim copy of the class as it stood at b45c3cf, BEFORE its bank spectra
 // followed the loaded IR (every slot then held kMaxBanks banks sized to maxIrSamples at prepare()). Only the
-// namespace differs. It is the reference "as before" is measured against: the shipping class must reproduce
-// it to the bit through any sequence of operators, and the memory table prints the two side by side. Never
+// namespace differs, and two internal task references in comments are dropped. It is the reference "as before"
+// is measured against: the shipping class must reproduce it to the bit through any sequence of operators, and
+// the memory table prints the two side by side. Never
 // edit the arithmetic below; a test that needs a different engine needs a different reference.
 
 #pragma once
@@ -152,7 +153,7 @@ public:
     // restart before the 50 ms crossfade ends. reset() below used to drop the incoming operator on the
     // floor there — `cur_` stayed on the OLD one and `CabConvolver::pendingRetry_` is already false after
     // a successful publish, so nothing ever re-staged it, and the knob move was lost until the next knob
-    // move. P88 closed that at the source: reset() now ADOPTS the publication. This verb remains the half
+    // move. That was closed at the source: reset() now ADOPTS the publication. This verb remains the half
     // that decides nothing and leaves a fade running — which is also why it does NOT give law 11a
     // independence mid-fade (CabConvolver::clearAudioState(), which forwards here, has the number); a
     // restart that owes independence calls reset().
@@ -245,7 +246,7 @@ public:
         // the caller its geometry is fine right up until the first non-empty block. Law 11's check order.
         // LAW 11(b)+(c): the matrix width is EXACT. A NARROW call is refused because a 2x2 matrix needs
         // BOTH input planes to compute either output — refused OBSERVABLY now, where it used to return
-        // void, so a caller that pre-zeroed `out` got DIGITAL SILENCE and no way to find out (P18 F35,
+        // void, so a caller that pre-zeroed `out` got DIGITAL SILENCE and no way to find out (
         // measured through CabConvolver as a 9.12e-02 "leak" that was really forty unprocessed blocks
         // and a tail). A WIDER call is refused for the ordinary reason: the planes past `channels_` have
         // no operator to run and would have gone out DRY while the first two were convolved.
