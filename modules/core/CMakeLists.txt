@@ -121,7 +121,16 @@ if(FELITRONICS_BUILD_TESTS)
         add_test(NAME felitronics_core_wasm_sse_tests COMMAND felitronics_core_wasm_sse_tests)
     endif()
 
-    # RT swap-discipline types — a suite that needs REAL threads (convolution's restart race is the other), so
+    # RT swap-discipline types, deterministically: every interleaving of a controller call and an audio block at
+    # the gate's atomic operations, on ONE thread (the gate runs on a hooked atomic). No threads, so it runs in
+    # every tier, the single-threaded wasm-audio one included.
+    add_executable(felitronics_core_rtstreams_interleave_tests tests/RtStreamsInterleaveTests.cpp)
+    target_link_libraries(felitronics_core_rtstreams_interleave_tests PRIVATE felitronics::core)
+    target_include_directories(felitronics_core_rtstreams_interleave_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_core_rtstreams_interleave_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_core_rtstreams_interleave_tests COMMAND felitronics_core_rtstreams_interleave_tests)
+
+    # RT swap-discipline types under REAL threads (convolution's restart race is the other such suite), so
     # it is outside the `wasm-audio` tier by construction: that tier is single-threaded by contract (no
     # pthreads, no SharedArrayBuffer, no COOP/COEP). Emscripten does NOT refuse this build without -pthread — it
     # links pthread stubs whose pthread_create returns ENOTSUP, so the target would compile, link, and abort at

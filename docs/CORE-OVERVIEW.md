@@ -14,7 +14,7 @@ same audit had been started three times.
 
 | Module | What | Key types |
 |---|---|---|
-| `core` | maths, smoothing, delay, RT FFT seam + offline double FFT, denormal flush | `Math`, `Smoother` + `LinearSmoother`, `DelayLine`, `Fft`, `offline::` (`convolve`/`magSpectrum`), `FlushToZero`, `RtStreams` (Audition/Conv/Rec — the RT swap discipline as types) |
+| `core` | maths, smoothing, delay, RT FFT seam + offline double FFT, denormal flush | `Math`, `Smoother` + `LinearSmoother`, `DelayLine`, `Fft`, `offline::` (`convolve`/`magSpectrum`), `FlushToZero`, `RtStreams` (`RtGate` + Audition/Conv/Rec — the RT swap discipline as types: a reader-held busy bit, try-forms that refuse instead of racing) |
 | `eq` | filters + the EQ engine + the multiband split | `Svf` (Cytomic), `MatchedBiquad` (Vicanek), `EqEngine`, `Crossover2` (LR4), `MultibandSplitter` |
 | `dynamics` | the detector/gain toolkit + compressor (with an external key) + gate + transient | `EnvelopeFollower`, `LinkedDetector`, `GainComputer`, `Compressor`, `NoiseGate`, `TransientShaper`, `ChannelLinker` |
 | `oversampling` | polyphase windowed-sinc up/down (alias-free / true-peak); a strict cascade flat to 20 kHz; the `Topology` switch the nonlinear stages offer | `PolyphaseOversampler`, `CascadeOversampler`, `Oversampler` |

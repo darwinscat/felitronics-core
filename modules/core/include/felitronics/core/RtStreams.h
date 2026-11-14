@@ -5,131 +5,341 @@
 
 //==============================================================================
 // felitronics::core — the RT buffer-swap discipline, made a type. PROMOTED from OrbitCapture
-// (audio/RtStreams.h, de-monolith step 8) when a second capture product needed the same plumbing,
-// then hardened behind an adversarial review (codex + deepseek): zero-length publishes no longer
-// arm an empty looping buffer, the recorder's length is release-published so a harvest never reads
-// an unsynchronized sample, the audition buffer is FIXED-SIZE (no reliance on assign-not-
-// reallocating), and int lengths are guarded at reserve time.
+// (audio/RtStreams.h) when a second capture product needed the same plumbing. Three streams share one
+// guard: AuditionStream (a pre-rendered clip the audio thread plays), ConvStream (the clip or the live
+// input fed to a convolver) and RecStream (the audio thread records, the controller harvests).
 //
-// The audio thread streams these buffers while a mode/playing atomic is up. The load-bearing rule:
+// THE GATE. Each stream is guarded by one atomic word, `RtGate`: the MODE in the low 31 bits (0 = down)
+// and a BUSY bit the audio thread holds while it is inside a block it was admitted to. The word changes
+// ONLY by read-modify-write, so it has one modification order and every change continues the release
+// sequence of the change before it.
 //
-//     flag DOWN  →  mutate the buffer WITHIN its fixed/reserved storage  →  flag UP
+//   audio thread   a Block opens:   admitted only by a CAS that sees the mode up and sets BUSY (acquire)
+//                  a Block closes:  stores what it advanced (position, length), then clears BUSY, and the
+//                                   mode too when the clip ended, in one release RMW
+//   controller     try…():          takes the mode down and learns, in that same RMW, whether a block is
+//                                   open. Open: refuse and mutate nothing. Closed: mutate, then raise the
+//                                   mode (release).
 //
-// SINGLE-WRITER contract (all three types): exactly ONE message-thread writer and ONE RT reader
-// (RecStream: one RT writer, one message-thread harvester). These are not general SPSC queues —
-// they are the family's capture-app swap discipline with its exact semantics.
+// So no sample the controller writes is in use by an admitted block, no store a block makes at its close
+// lands after a re-arm, and a block admitted after the re-arm sees the whole new content. There is no
+// counter and no wait. A stopped device holds no block, so every try lands at once. A try refused because
+// a block was open lands on a retry after that block closes: nothing can open a block while the mode is
+// down.
 //
-// READER RULES (the product's audio callback):
-//   • Gate every read on the flag with memory_order_acquire — a relaxed gate can observe the flag
-//     up while missing the writer's len/pos resets (a real head-drop on ARM, found by the crew).
-//   • Re-load the flag each BLOCK (not each sample); never cache buf.data() across blocks.
+// THREADS. ONE controller thread calls every member that is not a Block's, tryReserve() included. ONE
+// audio thread opens Blocks. isPlaying(), isRecording(), mode(), recorded() and `loop` may be read from
+// any thread. A device's lifecycle callbacks (JUCE's audioDeviceAboutToStart / audioDeviceStopped) run
+// on the device's thread, not the controller's, so they are not the place to size a stream. And never
+// wait for a try inside them: JUCE holds its callback lock around them.
 //
-// KNOWN, DELIBERATE GAP (crew consensus, fix deferred): a publish()/refill() that lands while an
-// already-admitted callback block is still streaming is a formal data race on the sample memory —
-// the flag went down after the reader's block-start check. In practice the window is one audio
-// block (~10 ms) hit only by user-action-rate publishes, and every float is written/read whole;
-// but it is UB by the letter, so treat it as a bound to engineer away, not a licence: the planned
-// fix is a reader-acknowledged epoch (the reader bumps a counter when it observes the flag down;
-// the writer waits for the bump before mutating). That needs reader cooperation and lands as its
-// own change; until then, writers SHOULD leave a block-length pause between flag-down and mutate
-// where the product allows it.
+// THE AUDIO THREAD'S RULES.
+//   • Open each stream's Block once per callback, read and write the stream only through it, and let it
+//     close (leave its scope) before the callback returns. Never keep its pointer past it.
+//   • Keep a Block's scope to the loop that needs it. BUSY lasts as long as the scope, and every try made
+//     meanwhile is refused and must be retried.
+//
+// THE CONTROLLER'S RULES.
+//   • Every try…() is [[nodiscard]]. A refusal mutated nothing and left the stream stopped; keep what
+//     you meant to publish and try again from a timer (the house's ConvolutionEngine::setIr + isBusy()
+//     pattern).
+//
+// FAILURE IS VISIBLE, NEVER A RACE. A Block that never closes (a thread killed inside a callback) keeps
+// BUSY set: every later try is refused and every later Block is empty. Silence, not torn audio.
 //==============================================================================
 
 #include <atomic>
-#include <cassert>
-#include <cstddef>
 #include <climits>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <vector>
 
 namespace felitronics::core {
 
-// A pre-rendered audition clip: the message thread publishes a whole render, the RT callback
-// streams buf[0..len) (loop-aware). The buffer is FIXED-SIZE from reserve() on — publish() copies
-// into it and never touches the vector's shape, so the RT pointer is valid by construction (no
-// reliance on assign()-within-capacity implementation behaviour). The reader must use `len`,
-// never buf.size().
-struct AuditionStream {
-    std::vector<float> buf;
-    std::atomic<bool> playing { false }, loop { false };
-    std::atomic<int>  pos { 0 }, len { 0 };
+static_assert (std::atomic<std::uint32_t>::is_always_lock_free, "RtGate needs a lock-free 32-bit atomic");
+static_assert (std::atomic<int>::is_always_lock_free && std::atomic<bool>::is_always_lock_free,
+               "the streams' readings need lock-free atomics");
 
-    void reserve(std::size_t cap) {
-        assert(cap <= (std::size_t)INT_MAX);                // len/pos are int (crew: overflow guard)
-        buf.assign(cap, 0.0f);                              // fixed storage; size() stays == cap
-    }
-    void stop() { playing.store(false, std::memory_order_release); }
-
-    // stop → copy within the fixed storage (truncating) → start. A ZERO-length render never arms:
-    // the reader's loop path resets pos to 0 and reads buf[0] — on an armed empty clip that is an
-    // out-of-bounds read (crew finding, pinned in the tests).
-    void publish(const float* data, std::size_t n) {
-        playing.store(false, std::memory_order_release);
-        const std::size_t nn = n < buf.size() ? n : buf.size();
-        if (nn > 0) std::memcpy(buf.data(), data, nn * sizeof(float));
-        len.store((int)nn); pos.store(0);
-        if (nn > 0) playing.store(true, std::memory_order_release);
-    }
-};
-
-// The live-convolver input stream. mode: 0 off · 1 DI clip through the IR · 2 live input
-// through the IR. `buf`/`pos` are only read in mode 1; the mode atomic also gates the
-// convolver + live-input path, so it stays the single flag for the whole conv route.
-// NB the reader takes the clip LENGTH from buf.size(), so this type keeps assign() semantics —
-// the no-reallocation-within-capacity reliance is implementation behaviour (universal in
-// libc++/libstdc++/MSVC), documented here rather than assumed silently.
-struct ConvStream {
-    std::vector<float> buf;
-    std::atomic<int> mode { 0 };
-    std::atomic<int> pos { 0 };
-
-    void reserve(std::size_t cap) {
-        assert(cap <= (std::size_t)INT_MAX);                // pos is int (crew: overflow guard)
-        buf.reserve(cap);
-    }
-    void setMode(int m) { mode.store(m, std::memory_order_release); }
-    void stop() { setMode(0); }
-
-    // Refill the DI clip. The caller must have taken the mode DOWN first (stop()) — the RT
-    // side may otherwise stream the buffer mid-assign. Truncates to the reserved capacity.
-    void refill(const float* data, std::size_t n) {
-        assert(mode.load(std::memory_order_acquire) == 0);  // never mutate under a live reader
-        const std::size_t nn = n < buf.capacity() ? n : buf.capacity();
-        buf.assign(data, data + (std::ptrdiff_t)nn);
-        pos.store(0);
-    }
-};
-
-// The live-input recorder: the RT callback appends dry input samples while `recording` is up;
-// the message thread harvests buf[0..len) only after taking it down. `reserve` RESIZES (the RT
-// side writes by index), so it must run while the device is stopped (audioDeviceAboutToStart).
+// The guard itself, public so a product can gate its own swaps of plain memory the same way. `Atom` is the
+// test seam: any type with std::atomic<std::uint32_t>'s load / compare_exchange_strong / fetch_and /
+// fetch_or (with explicit orders) and a constructor from std::uint32_t. Products use `RtGate`.
 //
-// Harvest pattern (message thread):  stop();  n = len.load();  read buf[0..n).
-// push() release-stores len, so the harvester's load (seq_cst ⊇ acquire) synchronizes with the
-// last push and every harvested sample is visible — a relaxed len would let len=i+1 become
-// visible before buf[i] on ARM (crew finding). The RT gate on `recording` must be ACQUIRE: it
-// pairs with start()'s release so the len=0 rewind is seen before the first push (a relaxed gate
-// can drop the head of a take by seeing its own stale full length).
-struct RecStream {
-    std::vector<float> buf;
-    std::atomic<bool> recording { false };
-    std::atomic<int>  len { 0 };
+// The controller's sequence is   if (gate.quiesce()) { mutate; (void) gate.arm (mode); }   — arm() lands
+// only on a word that is exactly 0 (down, no block open), which a true quiesce() guarantees until the
+// controller raises it, so an arm() without a true quiesce() before it is refused instead of racing.
+template <class Atom = std::atomic<std::uint32_t>>
+class BasicRtGate {
+public:
+    static constexpr std::uint32_t kBusy     = 0x80000000u;
+    static constexpr std::uint32_t kModeMask = 0x7fffffffu;
 
-    void reserve(std::size_t cap) {
-        assert(cap <= (std::size_t)INT_MAX);                // len is int (crew: overflow guard)
-        buf.assign(cap, 0.0f);
+    // AUDIO THREAD. Admits a block: returns the mode it was admitted at, or 0 (not admitted — the mode is
+    // down, or a block of this gate is already open). The CAS retries only when the controller changed the
+    // word in between, which it does at user rate.
+    [[nodiscard]] std::uint32_t enter() noexcept {
+        std::uint32_t v = s_.load (std::memory_order_acquire);
+        while ((v & kModeMask) != 0u && (v & kBusy) == 0u)
+            if (s_.compare_exchange_strong (v, v | kBusy, std::memory_order_acq_rel, std::memory_order_acquire))
+                return v & kModeMask;
+        return 0u;
     }
-    void start() { len.store(0); recording.store(true, std::memory_order_release); }
-    void stop()  { recording.store(false, std::memory_order_release); }
-    bool full() const { return (std::size_t)len.load() >= buf.size(); }
+    // AUDIO THREAD. Closes an admitted block: clears BUSY, and the mode too when `down` (the clip ended).
+    // Everything the block stored before this call is published by it.
+    void leave (bool down) noexcept {
+        (void) s_.fetch_and (down ? 0u : kModeMask, std::memory_order_release);
+    }
 
-    inline void push(float s) {                          // RT side: append while space remains
-        const int i = len.load(std::memory_order_relaxed);
-        if ((std::size_t)i < buf.size()) {
-            buf[(std::size_t)i] = s;
-            len.store(i + 1, std::memory_order_release); // publish the sample WITH the new length
-        }
+    // CONTROLLER. Takes the mode down. True when no block is open: from here until arm(), the guarded
+    // memory belongs to the controller alone. False when a block is open: mutate nothing, retry later.
+    [[nodiscard]] bool quiesce() noexcept {
+        return (s_.fetch_and (kBusy, std::memory_order_acq_rel) & kBusy) == 0u;
     }
+    // CONTROLLER. Raises the mode (low 31 bits; 0 raises nothing). Lands only on a word that is exactly 0.
+    [[nodiscard]] bool arm (std::uint32_t mode) noexcept {
+        std::uint32_t expected = 0u;
+        const std::uint32_t m = mode & kModeMask;
+        return m != 0u && s_.compare_exchange_strong (expected, m, std::memory_order_release,
+                                                      std::memory_order_relaxed);
+    }
+
+    // ANY THREAD: readings.
+    [[nodiscard]] std::uint32_t mode() const noexcept { return s_.load (std::memory_order_acquire) & kModeMask; }
+    [[nodiscard]] bool busy() const noexcept { return (s_.load (std::memory_order_acquire) & kBusy) != 0u; }
+
+private:
+    Atom s_ { 0u };
 };
+using RtGate = BasicRtGate<>;
+
+namespace rtstreams_detail {
+    // Capacities are int on the audio thread's side; a larger request is clamped, never refused, so a false
+    // from a try always means "a block was open".
+    inline std::size_t clampCapacity (std::size_t cap) noexcept {
+        return cap < (std::size_t) INT_MAX ? cap : (std::size_t) INT_MAX;
+    }
+    inline int clampPos (int pos, int len) noexcept { return pos < 0 ? 0 : (pos > len ? len : pos); }
+}
+
+// A pre-rendered audition clip. The controller publishes a whole render into FIXED storage (sized by
+// tryReserve, never reshaped by a publish); the audio thread streams data()[pos, len()) through a Block,
+// looping when `loop` is set, and calls finish() when a one-shot clip has ended.
+template <class Atom = std::atomic<std::uint32_t>>
+class BasicAuditionStream {
+public:
+    std::atomic<bool> loop { false };                     // any thread; the audio thread reads it per block
+
+    // CONTROLLER. Sizes the storage (allocates), stops, empties. Refused while a block is open.
+    [[nodiscard]] bool tryReserve (std::size_t capacity) {
+        const std::size_t cap = rtstreams_detail::clampCapacity (capacity);
+        if (! gate_.quiesce()) return false;
+        buf_.assign (cap, 0.0f);
+        len_ = 0; pos_ = 0;
+        return true;
+    }
+    // CONTROLLER. Stops: the stream goes down at once; a block already open finishes its loop.
+    void stop() noexcept { (void) gate_.quiesce(); }
+    // CONTROLLER. Copies a render into the storage (truncating to it), rewinds and plays it. A ZERO-length
+    // render (or a null pointer) leaves the stream stopped and empty: an armed empty clip would let a loop
+    // path read data()[0] out of bounds. Refused, with nothing changed but the stop, while a block is open.
+    [[nodiscard]] bool tryPublish (const float* data, std::size_t n) noexcept {
+        if (! gate_.quiesce()) return false;
+        const std::size_t nn = data == nullptr ? 0 : (n < buf_.size() ? n : buf_.size());
+        if (nn > 0) std::memcpy (buf_.data(), data, nn * sizeof (float));
+        len_ = (int) nn; pos_ = 0;
+        if (nn > 0) (void) gate_.arm (1u);
+        return true;
+    }
+    [[nodiscard]] bool isPlaying() const noexcept { return gate_.mode() != 0u; }  // any thread
+    [[nodiscard]] std::size_t capacity() const noexcept { return buf_.size(); }   // controller
+
+    // AUDIO THREAD. Empty (false) unless the clip plays. While it is open, data()[0, len()) is the clip and
+    // `pos` the read position to advance; on close the stream keeps pos, clamped to [0, len()].
+    class Block {
+    public:
+        int pos = 0;
+        explicit operator bool() const noexcept { return s_ != nullptr; }
+        [[nodiscard]] const float* data() const noexcept { return data_; }
+        [[nodiscard]] int len() const noexcept { return len_; }
+        void finish() noexcept { ended_ = true; }         // the clip ended: the stream goes down on close
+        Block (const Block&) = delete;
+        Block& operator= (const Block&) = delete;
+        ~Block() {
+            if (s_ == nullptr) return;
+            s_->pos_ = rtstreams_detail::clampPos (pos, len_);
+            s_->gate_.leave (ended_);
+        }
+    private:
+        friend class BasicAuditionStream;
+        explicit Block (BasicAuditionStream* s) noexcept : s_ (s) {
+            if (s_ == nullptr) return;
+            pos = s_->pos_; len_ = s_->len_; data_ = s_->buf_.data();
+        }
+        BasicAuditionStream* s_;
+        const float* data_ = nullptr;
+        int len_ = 0;
+        bool ended_ = false;
+    };
+    [[nodiscard]] Block beginBlock() noexcept { return Block (gate_.enter() != 0u ? this : nullptr); }
+
+private:
+    std::vector<float> buf_;
+    int len_ = 0, pos_ = 0;                                // guarded by the gate, so plain
+    BasicRtGate<Atom> gate_;
+};
+
+// The live-convolver input. mode: 0 off · kClip (1) the clip through the convolver · kLive (2) the live
+// input through it — any positive mode is accepted, the meaning is the product's. data()/len()/pos are
+// the clip's, used in kClip. The storage is FIXED (sized by tryReserve); len() is the clip, never the
+// storage.
+template <class Atom = std::atomic<std::uint32_t>>
+class BasicConvStream {
+public:
+    static constexpr int kOff = 0, kClip = 1, kLive = 2;
+
+    // CONTROLLER. Sizes the clip storage (allocates), stops, empties. Refused while a block is open.
+    [[nodiscard]] bool tryReserve (std::size_t capacity) {
+        const std::size_t cap = rtstreams_detail::clampCapacity (capacity);
+        if (! gate_.quiesce()) return false;
+        buf_.assign (cap, 0.0f);
+        len_ = 0; pos_ = 0;
+        return true;
+    }
+    // CONTROLLER. Stops, copies the clip (truncating to the storage), rewinds, and leaves the route OFF.
+    // Raise it with trySetMode, which cannot be refused right after a true tryRefill: no block can open
+    // while the mode is down. Refused while a block is open.
+    [[nodiscard]] bool tryRefill (const float* data, std::size_t n) noexcept {
+        if (! gate_.quiesce()) return false;
+        const std::size_t nn = data == nullptr ? 0 : (n < buf_.size() ? n : buf_.size());
+        if (nn > 0) std::memcpy (buf_.data(), data, nn * sizeof (float));
+        len_ = (int) nn; pos_ = 0;
+        return true;
+    }
+    // CONTROLLER. A positive mode switches the route through a quiesce, so a block that ends the clip cannot
+    // take the new mode down behind it; the clip position is kept. A mode <= 0 stops, and is never refused.
+    [[nodiscard]] bool trySetMode (int m) noexcept {
+        if (m <= 0) { stop(); return true; }
+        if (! gate_.quiesce()) return false;
+        (void) gate_.arm ((std::uint32_t) m);
+        return true;
+    }
+    void stop() noexcept { (void) gate_.quiesce(); }                               // controller
+    [[nodiscard]] int mode() const noexcept { return (int) gate_.mode(); }       // any thread
+    [[nodiscard]] std::size_t capacity() const noexcept { return buf_.size(); }   // controller
+
+    // AUDIO THREAD. Empty unless the route is up; mode() is the mode it was admitted at. Close it before the
+    // convolver runs: BUSY should span the copy loop only.
+    class Block {
+    public:
+        int pos = 0;
+        explicit operator bool() const noexcept { return s_ != nullptr; }
+        [[nodiscard]] int mode() const noexcept { return mode_; }
+        [[nodiscard]] const float* data() const noexcept { return data_; }
+        [[nodiscard]] int len() const noexcept { return len_; }
+        void finish() noexcept { ended_ = true; }         // the route ends: the stream goes down on close
+        Block (const Block&) = delete;
+        Block& operator= (const Block&) = delete;
+        ~Block() {
+            if (s_ == nullptr) return;
+            s_->pos_ = rtstreams_detail::clampPos (pos, len_);
+            s_->gate_.leave (ended_);
+        }
+    private:
+        friend class BasicConvStream;
+        Block (BasicConvStream* s, int mode) noexcept : s_ (s), mode_ (mode) {
+            if (s_ == nullptr) return;
+            pos = s_->pos_; len_ = s_->len_; data_ = s_->buf_.data();
+        }
+        BasicConvStream* s_;
+        int mode_ = 0;
+        const float* data_ = nullptr;
+        int len_ = 0;
+        bool ended_ = false;
+    };
+    [[nodiscard]] Block beginBlock() noexcept {
+        const int m = (int) gate_.enter();
+        return Block (m != 0 ? this : nullptr, m);
+    }
+
+private:
+    std::vector<float> buf_;
+    int len_ = 0, pos_ = 0;                                // guarded by the gate, so plain
+    BasicRtGate<Atom> gate_;
+};
+
+// The live-input recorder: the audio thread appends through a Block while recording is up; the controller
+// harvests the take. tryHarvest stops and copies buf[0, n) only once no block is open, so n is FINAL; a
+// tryStart rewinds only then, so a block of the old take can neither write into the new one nor undo its
+// rewind.
+template <class Atom = std::atomic<std::uint32_t>>
+class BasicRecStream {
+public:
+    // CONTROLLER. Sizes the storage (allocates), stops, discards the take. Refused while a block is open.
+    [[nodiscard]] bool tryReserve (std::size_t capacity) {
+        const std::size_t cap = rtstreams_detail::clampCapacity (capacity);
+        if (! gate_.quiesce()) return false;
+        buf_.assign (cap, 0.0f);
+        n_ = 0; shown_.store (0, std::memory_order_relaxed);
+        return true;
+    }
+    // CONTROLLER. Rewinds and records. Refused while a block is open.
+    [[nodiscard]] bool tryStart() noexcept {
+        if (! gate_.quiesce()) return false;
+        n_ = 0; shown_.store (0, std::memory_order_relaxed);
+        (void) gate_.arm (1u);
+        return true;
+    }
+    void stop() noexcept { (void) gate_.quiesce(); }                               // controller
+    // CONTROLLER (allocates `take`). Stops; once no block is open, copies the whole take into `take` and
+    // returns true. Refused, with `take` untouched, while a block is open: that block may still append.
+    [[nodiscard]] bool tryHarvest (std::vector<float>& take) {
+        if (! gate_.quiesce()) return false;
+        take.assign (buf_.begin(), buf_.begin() + n_);
+        return true;
+    }
+    [[nodiscard]] bool isRecording() const noexcept { return gate_.mode() != 0u; } // any thread
+    // ANY THREAD: the length recorded as of the last closed block, a reading for display only.
+    [[nodiscard]] std::size_t recorded() const noexcept {
+        return (std::size_t) shown_.load (std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::size_t capacity() const noexcept { return buf_.size(); }   // controller
+    [[nodiscard]] bool full() const noexcept { return recorded() >= buf_.size(); } // controller
+
+    // AUDIO THREAD. Empty unless recording. push() appends while space remains.
+    class Block {
+    public:
+        explicit operator bool() const noexcept { return s_ != nullptr; }
+        void push (float v) noexcept { if (i_ < cap_) d_[i_++] = v; }
+        [[nodiscard]] bool full() const noexcept { return i_ >= cap_; }
+        Block (const Block&) = delete;
+        Block& operator= (const Block&) = delete;
+        ~Block() {
+            if (s_ == nullptr) return;
+            s_->n_ = i_;
+            s_->shown_.store (i_, std::memory_order_relaxed);
+            s_->gate_.leave (false);
+        }
+    private:
+        friend class BasicRecStream;
+        explicit Block (BasicRecStream* s) noexcept : s_ (s) {
+            if (s_ == nullptr) return;
+            i_ = s_->n_; cap_ = (int) s_->buf_.size(); d_ = s_->buf_.data();
+        }
+        BasicRecStream* s_;
+        float* d_ = nullptr;
+        int i_ = 0, cap_ = 0;
+    };
+    [[nodiscard]] Block beginBlock() noexcept { return Block (gate_.enter() != 0u ? this : nullptr); }
+
+private:
+    std::vector<float> buf_;
+    int n_ = 0;                                            // guarded by the gate, so plain
+    std::atomic<int> shown_ { 0 };                         // the display's copy of n_
+    BasicRtGate<Atom> gate_;
+};
+
+using AuditionStream = BasicAuditionStream<>;
+using ConvStream     = BasicConvStream<>;
+using RecStream      = BasicRecStream<>;
 
 } // namespace felitronics::core
