@@ -61,9 +61,9 @@ namespace felitronics::convolution
 // swap click-free and bit-exact. The bank spectra follow the LOADED IR: stageOperator() grows each bank, per
 // stage, to the partitions the IR reaches, and allocates only the banks the topology reads (mono 1, LRDiag and
 // MSDiag 2, Full 4). They GROW ONLY: a shorter IR reuses the storage a longer one left, so each slot holds its
-// own high-water mark until the next prepare(), which releases it. With the default schedule a sample of cap
-// costs channels × 4 B × ~2 in FDL (~16 B stereo); a sample of loaded IR costs 4 B × ~2 per bank in each slot
-// that holds it.
+// own high-water mark until the next prepare(), which releases it. A caller that must not allocate after its
+// prepare() reserves up front instead (reserve()). With the default schedule a sample of cap costs ~8 B of FDL
+// per channel (~16 B stereo); a sample of loaded IR costs ~8 B per bank, in each slot that holds it.
 //
 // RT-safe: prepare()/setOperator() allocate (message thread); process() is alloc/lock/throw-free, zero latency.
 template <core::fft::RealFftBackend Fft = core::fft::DefaultRealFft>
@@ -130,8 +130,15 @@ public:
             }
             h.phase = 0; h.fdlPos = 0;
         }
-        for (int st = numStages_; st < kMaxStages; ++st)               // a stage the new schedule dropped
-            for (int ch = 0; ch < 2; ++ch) core::fft::AlignedVector<float>().swap (hist_[(std::size_t) st].fdl[ch]);
+        // What the new geometry no longer reads is released too: a stage the new schedule dropped, and a channel
+        // a mono re-prepare dropped (a stereo history at the old cap would otherwise stay held beside it).
+        for (int st = 0; st < kMaxStages; ++st)
+            for (int ch = (st < numStages_ ? channels_ : 0); ch < 2; ++ch)
+            {
+                core::fft::AlignedVector<float>().swap (hist_[(std::size_t) st].fdl[ch]);
+                core::fft::AlignedVector<float>().swap (hist_[(std::size_t) st].frame[ch]);
+            }
+        for (int ch = channels_; ch < 2; ++ch) std::vector<float>().swap (headHist_[ch]);
 
         // The head taps of every bank a slot can hold (a few hundred bytes each): a slot nothing was staged
         // into still runs its head dot. The bank SPECTRA start empty and are grown by stageOperator() to the IR
@@ -255,6 +262,21 @@ public:
 
     void publishStaged() noexcept { state_.store (1, std::memory_order_release); }
 
+    // Grow BOTH slots' banks for `topo` (prepared mono: the one bank) to an IR of `len` taps NOW, so that no later
+    // swap up to that length and topology allocates. For a caller whose own contract is that its prepare()
+    // allocates everything — lineareq's EQs, whose IR is always the cap's length and which promise a setBands()
+    // that allocates nothing. The same thread contract as prepare(): no process() may run concurrently, because
+    // this grows the LIVE slot too. Grow-only, like stageOperator(); exhaustion throws (law 11d). False when
+    // unprepared.
+    bool reserve (Topology topo, int len)
+    {
+        if (! prepared_) return false;
+        const int nb = mono_ ? 1 : numBanksFor (topo);
+        for (int k = 0; k < 2; ++k)
+            for (int b = 0; b < nb; ++b) growBank (slot_[k].banks[b], len);
+        return true;
+    }
+
     // Mono convenience: broadcast a single IR onto both output channels (or the one bank when prepared mono).
     bool setIr (const float* ir, int len)
     {
@@ -352,7 +374,8 @@ private:
     }
 
     // How many of stage `st`'s partitions a `len`-tap IR reaches: those whose first tap lies inside the IR,
-    // never more than the stage holds (an IR past maxIrSamples convolves only its first maxIrSamples).
+    // never more than the stage holds. So an IR longer than the schedule convolves only what the schedule covers:
+    // maxIrSamples rounded up to whole partitions of the last stage, exactly as before.
     int partsFor (int st, int len) const noexcept
     {
         const long long rem = (long long) len - spec_[st].offset;

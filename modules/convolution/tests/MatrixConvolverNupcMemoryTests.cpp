@@ -188,7 +188,8 @@ std::vector<Step> shortLong (Topo t, int cap)
     return { { t, 150, MidFade::None },          { t, cap - 1000, MidFade::TrySwap }, { t, 700, MidFade::Reset },
              { t, cap, MidFade::Clear },         { t, 90, MidFade::StageLate },       { t, cap + 9000, MidFade::None },
              { t, 0, MidFade::TrySwap },         { t, 4097, MidFade::StageResetLate },{ t, 2049, MidFade::None },
-             { t, cap / 2, MidFade::Reset } };
+             { t, cap / 2, MidFade::Reset },     { t, -7, MidFade::None },            { t, 128, MidFade::TrySwap },
+             { t, 129, MidFade::None },          { t, 2048, MidFade::Clear },         { t, cap - 2048, MidFade::None } };
 }
 
 // Every topology in one instance, so a Full operator lands on banks a LRDiag one never grew, and back.
@@ -503,6 +504,45 @@ void checkMemory (const char* backend)
         test::ok (ok && got == growthO (sch, 0, 61440), be + " mono: one bank, the oracle's size (" + std::to_string (got) + " B)");
     }
 
+    // reserve(): both slots' banks for a topology, now — and then no swap up to that length allocates, whatever
+    // its topology. This is what lineareq's EQs call in their prepare().
+    {
+        C m;
+        test::run (m.prepare (P0, cap, xfade, 2));
+        long long y0 = alloc::bytes.load();
+        const bool ok = m.reserve (C::Topology::Full, cap);
+        const long long got = alloc::bytes.load() - y0, want = 2LL * 4 * growthO (sch, 0, cap);
+        test::ok (ok && got == want, be + " reserve(Full, cap): both slots' four banks, the oracle's size (" + std::to_string (got) + " B, oracle "
+                                     + std::to_string (want) + ")");
+        Drainer dr2 (xfade + 1);
+        const Topo ts[] { Topo::LR, Topo::Full, Topo::MS, Topo::Full, Topo::LR, Topo::MS };
+        const int lens[] { 61440, cap, 1000, cap + 5000, cap, 0 };
+        long long later = 0, drains = 0;
+        int accepted = 0;
+        for (int i = 0; i < 6; ++i)
+        {
+            const long long c0 = alloc::count.load();
+            accepted += m.setOperator (topologyOf<C> (ts[i]), b4, banksOf (ts[i]), lens[i]) ? 1 : 0;
+            later += alloc::count.load() - c0;
+            drains += dr2.drain (m, 2);
+        }
+        test::ok (accepted == 6 && later == 0 && drains == 0,
+                  be + " after reserve(), six swaps of every topology up to the cap allocate nothing (" + std::to_string (later) + ")");
+
+        C mono;
+        test::run (mono.prepare (P0, cap, xfade, 1));
+        y0 = alloc::bytes.load();
+        const bool okMono = mono.reserve (C::Topology::Full, cap);
+        const long long gotMono = alloc::bytes.load() - y0, wantMono = 2LL * growthO (sch, 0, cap);
+        test::ok (okMono && gotMono == wantMono, be + " reserve() on a mono instance: one bank in each slot (" + std::to_string (gotMono) + " B)");
+
+        C unprepared;
+        const long long c0 = alloc::count.load();
+        const bool refused = ! unprepared.reserve (C::Topology::Full, cap);
+        const long long calls = alloc::count.load() - c0;
+        test::ok (refused && calls == 0, be + " reserve() before prepare() is refused and requests nothing");
+    }
+
     // A refused swap touches no storage: a null bank with taps to read is refused before anything grows.
     {
         C m;
@@ -559,46 +599,81 @@ void checkExhaustion (const char* backend)
         requests = (int) (alloc::count.load() - c0);
     }
 
+    // Two ways on from a failed growth, each swept over every request:
+    //   RETRY — the instance plays on (a third of the run) before the swap is tried again, then the whole run is
+    //           compared with a frozen instance that only ever made the successful swap;
+    //   PUBLISH THE STAGED ONE — an operator staged (not published) before the failed swap is published after it:
+    //           the failed growth must have left that staging intact — its banks AND its topology label.
+    // The staged IR is as long as what the slot held (500 taps), so staging it grows nothing and the failed swap
+    // after it makes exactly the requests counted above; its taps differ, so a slot it did not survive in shows.
+    const std::vector<float> stagedIr = denseIr (500, 44);
+    const float* tb[4] { stagedIr.data(), stagedIr.data(), stagedIr.data(), stagedIr.data() };
     int thrown = 0, recovered = 0;
-    long long mismatches = 0;
+    long long mismatches = 0, stagedMismatches = 0;
     std::vector<float> x[2], yNow[2], yWas[2];
     constexpr int run = 3 * cap;
     Lcg rng { 43 };
     for (int c = 0; c < 2; ++c) { x[c].resize (run); yNow[c].assign (run, 0.0f); yWas[c].assign (run, 0.0f); for (float& v : x[c]) v = 0.5f * rng.bipolar(); }
-    for (int k = 0; k < requests; ++k)
+    auto play = [&] (C& now, W& was, int from, int to)
     {
-        C now; W was;
-        test::run (now.prepare (128, cap, xfade, 2)); test::run (was.prepare (128, cap, xfade, 2));
-        Drainer dr (xfade + 1);
-        for (int i = 0; i < 2; ++i)
+        for (int i = from; i < to; i += 512)
         {
-            test::run (now.setOperator (C::Topology::LRDiag, sb, 2, 500)); (void) dr.drain (now, 2);
-            test::run (was.setOperator (W::Topology::LRDiag, sb, 2, 500)); (void) dr.drain (was, 2);
-        }
-        failAllocation (k);
-        try { (void) now.setOperator (C::Topology::Full, lb, 4, cap); }
-        catch (const std::bad_alloc&) { ++thrown; }
-        alloc::failNext.store (false); alloc::onNext.store (nullptr);
-        const bool a = now.setOperator (C::Topology::Full, lb, 4, cap);
-        const bool b = was.setOperator (W::Topology::Full, lb, 4, cap);
-        if (a && b) ++recovered;
-        for (int i = 0; i < run; i += 512)
-        {
+            const int m = std::min (512, to - i);
             const float* in[2] { &x[0][(std::size_t) i], &x[1][(std::size_t) i] };
             float* on[2] { &yNow[0][(std::size_t) i], &yNow[1][(std::size_t) i] };
             float* ow[2] { &yWas[0][(std::size_t) i], &yWas[1][(std::size_t) i] };
-            test::run (now.process (in, on, 2, std::min (512, run - i))); test::run (was.process (in, ow, 2, std::min (512, run - i)));
+            test::run (now.process (in, on, 2, m)); test::run (was.process (in, ow, 2, m));
         }
-        for (int c = 0; c < 2; ++c) for (int i = 0; i < run; ++i) if (! core::sameBits (yNow[c][(std::size_t) i], yWas[c][(std::size_t) i])) ++mismatches;
-    }
+    };
+    auto differ = [&]
+    {
+        long long d = 0;
+        for (int c = 0; c < 2; ++c) for (int i = 0; i < run; ++i) if (! core::sameBits (yNow[c][(std::size_t) i], yWas[c][(std::size_t) i])) ++d;
+        return d;
+    };
+    for (int variant = 0; variant < 2; ++variant)
+        for (int k = 0; k < requests; ++k)
+        {
+            C now; W was;
+            test::run (now.prepare (128, cap, xfade, 2)); test::run (was.prepare (128, cap, xfade, 2));
+            Drainer dr (xfade + 1);
+            for (int i = 0; i < 2; ++i)
+            {
+                test::run (now.setOperator (C::Topology::LRDiag, sb, 2, 500)); (void) dr.drain (now, 2);
+                test::run (was.setOperator (W::Topology::LRDiag, sb, 2, 500)); (void) dr.drain (was, 2);
+            }
+            if (variant == 1) { test::run (now.stageOperator (C::Topology::LRDiag, tb, 2, 500)); test::run (was.stageOperator (W::Topology::LRDiag, tb, 2, 500)); }
+            failAllocation (k);
+            try { (void) now.setOperator (C::Topology::Full, lb, 4, cap); }
+            catch (const std::bad_alloc&) { ++thrown; }
+            alloc::failNext.store (false); alloc::onNext.store (nullptr);
+            if (variant == 0)
+            {
+                play (now, was, 0, run / 3);                                     // plays on after the failure
+                const bool a = now.setOperator (C::Topology::Full, lb, 4, cap);
+                const bool b = was.setOperator (W::Topology::Full, lb, 4, cap);
+                if (a && b) ++recovered;
+                play (now, was, run / 3, run);
+                mismatches += differ();
+            }
+            else
+            {
+                now.publishStaged(); was.publishStaged();
+                play (now, was, 0, run);
+                stagedMismatches += differ();
+            }
+        }
     const std::string be (backend);
-    std::printf ("      %s exhaustion: %d requests in the growth, each failed in turn: %d thrown, %d recovered, %lld samples differ\n",
-                 backend, requests, thrown, recovered, mismatches);
+    std::printf ("      %s exhaustion: %d requests in the growth, each failed in turn twice: %d thrown, %d recovered, %lld + %lld samples differ\n",
+                 backend, requests, thrown, recovered, mismatches, stagedMismatches);
     test::ok (requests >= 8, be + " exhaustion: the growth makes the requests the sweep walks (" + std::to_string (requests) + ")");
-    test::ok (thrown == requests, be + " exhaustion: every failed request leaves the call as bad_alloc (" + std::to_string (thrown) + " of " + std::to_string (requests) + ")");
+    test::ok (thrown == 2 * requests, be + " exhaustion: every failed request leaves the call as bad_alloc (" + std::to_string (thrown) + " of " + std::to_string (2 * requests) + ")");
     test::ok (recovered == requests && mismatches == 0,
-              be + " exhaustion: the next swap is accepted and the run is bit-exact against a frozen instance that never failed ("
+              be + " exhaustion: the instance plays on, the next swap is accepted, and the run is bit-exact against a frozen instance that never failed ("
               + std::to_string (mismatches) + " samples differ)");
+    test::ok (stagedMismatches == 0,
+              be + " exhaustion: an operator staged before the failed swap publishes intact, bit-exact against the frozen class ("
+              + std::to_string (stagedMismatches) + " samples differ)");
 }
 #endif
 
