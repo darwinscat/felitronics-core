@@ -75,12 +75,22 @@ public:
     {
         side_.reset(); audio_.reset(); env_.reset(); gr_.reset();
         ksamp_ = 0; curGainDb_ = params_.staticGainDb; updateAudio();
+        levelDb_ = levelDbOf (0.0f);   // what a cold envelope hands the curve: the floor, exactly -180 dB
         ranNc_ = 0;   // nothing has run, so nothing can be stopping (see dropStoppedChannels)
     }
 
     void setParams (const DynamicEqBandParams& p) noexcept { params_ = p; apply (p); }
     static constexpr int latencySamples() noexcept { return 0; }
     double dynamicDeltaDb() const noexcept { return curGainDb_ - params_.staticGainDb; }   // for metering
+
+    // THE LEVEL THE DETECTOR SEES, in dB of the linked sidechain envelope: the exact number the gain
+    // computer was last handed, so feeding it to the same curve gives the delta this band is following.
+    // Written by every step that advances the envelope — the audio loop and a pause alike — and set by
+    // reset() to the floor, -180 dB exactly (20 log10 of the 1e-9 level floor, narrowed to float as the
+    // curve receives it). Always finite: the sidechain input is gated (non-finite -> 0, |x| <= 1e6), so
+    // the envelope is bounded, and the floor keeps log10 away from zero. Like dynamicDeltaDb(), a plain
+    // member read — no allocation, no lock.
+    double detectorLevelDb() const noexcept { return (double) levelDb_; }
 
     // Law 11 (DSP-ARCHITECTURE.md §2).
     [[nodiscard]] bool process (float* const* io, int numChannels, int n) noexcept
@@ -166,7 +176,8 @@ private:
     void sharedStep (float linked) noexcept
     {
         const float lvl   = env_.process (linked);
-        const float lvlDb = (float) core::gainToDb ((double) std::max (lvl, 1.0e-9f));
+        const float lvlDb = levelDbOf (lvl);
+        levelDb_ = lvlDb;                    // the readout IS the curve's argument, recorded where it is made
         const float delta = sign_ * (float) gc_.deltaDb ((double) lvlDb);
         const float smooth = gr_.process (delta);
         if (ksamp_ == 0) { curGainDb_ = (double) params_.staticGainDb + (double) smooth; updateAudio(); }
@@ -183,6 +194,10 @@ private:
         for (int c = nc; c < ranNc_; ++c) { side_.resetChannel (c); audio_.resetChannel (c); }
         ranNc_ = nc;
     }
+
+    // The envelope level as the curve receives it — floored, in dB, narrowed to float. One spelling, used
+    // by the shared step and by reset(), so the readout's floor cannot drift from the step's.
+    static float levelDbOf (float lvl) noexcept { return (float) core::gainToDb ((double) std::max (lvl, 1.0e-9f)); }
 
     void updateAudio() noexcept { audio_.setParams (params_.type, params_.freq, params_.Q, curGainDb_); }
 
@@ -226,6 +241,7 @@ private:
     dynamics::LinkMode link_ = dynamics::LinkMode::Max;
     float  sign_ = 1.0f;
     double curGainDb_ = 0.0;
+    float  levelDb_ = levelDbOf (0.0f);  // detectorLevelDb(): the curve's last argument
     int    ksamp_ = 0, K_ = 16;
 };
 
