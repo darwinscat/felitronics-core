@@ -23,3 +23,12 @@ if(FELITRONICS_BUILD_TESTS)
     target_compile_features(felitronics_deesser_gatestate_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_deesser_gatestate_tests COMMAND felitronics_deesser_gatestate_tests)
 endif()
+
+if(FELITRONICS_BUILD_TESTS)
+    # detectorLevelDb(): the level the active detector hands the curve, pinned against an independent curve.
+    add_executable(felitronics_deesser_readout_tests tests/DeEsserReadoutTests.cpp)
+    target_link_libraries(felitronics_deesser_readout_tests PRIVATE felitronics::deesser)
+    target_include_directories(felitronics_deesser_readout_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_deesser_readout_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_deesser_readout_tests COMMAND felitronics_deesser_readout_tests)
+endif()

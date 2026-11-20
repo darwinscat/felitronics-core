@@ -68,6 +68,7 @@ public:
     void reset() noexcept
     {
         side_.reset(); xover_.reset(); env_.reset(); gr_.reset(); deq_.reset(); grDb_ = 0.0f;
+        levelDb_ = levelDbOf (0.0f);   // the split-band detector's floor; deq_ set its own just above
         ranNc_ = 0;   // nothing has run, so nothing can be stopping (see dropStoppedChannels)
     }
     void setParams (const DeEsserParams& p) noexcept
@@ -78,6 +79,16 @@ public:
     }
     static constexpr int latencySamples() noexcept { return 0; }
     double gainReductionDb() const noexcept { return grDb_; }
+
+    // THE LEVEL THE ACTIVE DETECTOR SEES, in dB of the linked sidechain envelope: the exact number the
+    // gain computer that is in the signal path was last handed. In DynamicEq mode (listen off) that is
+    // the delegate's — `DynamicEqBand::detectorLevelDb()` — and in SplitBand or with listen on it is the
+    // local detector's, written by the shared step on both the audio loop and a pause. After reset()
+    // both read the 1e-9 level floor: -180 dB from the delegate, which narrows to float before the
+    // curve, and -180.00000025 dB from the local stage, which does not (see sharedStep). Always finite:
+    // the sidechain input is gated before the band-pass, so the envelope is bounded. A plain member
+    // read like gainReductionDb() — no allocation, no lock.
+    double detectorLevelDb() const noexcept { return delegates() ? deq_.detectorLevelDb() : levelDb_; }
 
     // Law 11 (DSP-ARCHITECTURE.md §2) — see the law for what each refusal means.
     [[nodiscard]] bool process (float* const* io, int numChannels, int n) noexcept
@@ -103,7 +114,7 @@ public:
         // the same defect one storey up.
         if (nc == 0)
         {
-            if (params_.mode == DeEsserMode::DynamicEq && ! params_.listen)
+            if (delegates())
             {
                 const bool ok = deq_.process (io, 0, n);
                 grDb_ = (float) deq_.dynamicDeltaDb();
@@ -114,7 +125,7 @@ public:
         }
 
         // DynamicEq mode = the surgical dynamic-EQ band (no split, no listen detour).
-        if (params_.mode == DeEsserMode::DynamicEq && ! params_.listen)
+        if (delegates())
         {
             const bool ok = deq_.process (io, numChannels, n);
             grDb_ = (float) deq_.dynamicDeltaDb();
@@ -153,6 +164,11 @@ public:
     }
 
 private:
+    // The route test, written once: the process() branches and the readout must agree on which detector
+    // is live. setParams() resets both whenever this flips (a mode or listen change), so neither readout
+    // ever carries a value across the switch.
+    bool delegates() const noexcept { return params_.mode == DeEsserMode::DynamicEq && ! params_.listen; }
+
     // LAW 11c — `n` samples of DIGITAL SILENCE through the SplitBand/listen detector. The per-channel
     // sidechain columns were dropped by `dropStoppedChannels(0)` just above, so the linked level of a
     // silent band is exactly +0.0f; it is PINNED rather than run through the loop's own link, whose
@@ -180,11 +196,17 @@ private:
     // reuses this one instead of growing a fourth.
     float sharedStep (float linked) noexcept
     {
-        const float lvl = env_.process (linked);
-        const float gr  = gr_.process ((float) gc_.deltaDb ((double) core::gainToDb ((double) std::max (lvl, 1.0e-9f))));   // ≤ 0 (cut)
+        const float  lvl   = env_.process (linked);
+        const double lvlDb = levelDbOf (lvl);
+        levelDb_ = lvlDb;                                        // the readout IS the curve's argument
+        const float gr  = gr_.process ((float) gc_.deltaDb (lvlDb));   // ≤ 0 (cut)
         grDb_ = gr;
         return (float) core::dbToGain ((double) gr);
     }
+
+    // The envelope level as the curve receives it — floored, in dB, NOT narrowed. One spelling, shared by
+    // sharedStep and reset(), so the readout's floor cannot drift from the step's.
+    static double levelDbOf (float lvl) noexcept { return core::gainToDb ((double) std::max (lvl, 1.0e-9f)); }
 
     static double finite (double v, double fallback) noexcept { return std::isfinite (v) ? v : fallback; }
 
@@ -239,6 +261,7 @@ private:
 
     dynamics::LinkMode link_ = dynamics::LinkMode::Max;
     float grDb_ = 0.0f;
+    double levelDb_ = levelDbOf (0.0f);          // detectorLevelDb() on the split-band / listen route
 };
 
 } // namespace felitronics::deesser
